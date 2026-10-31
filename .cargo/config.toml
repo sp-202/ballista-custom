@@ -1,0 +1,45 @@
+# Build Ballista (and the spark/ workspace, which reads this file too) against the
+# DataFusion 55.2.0 fork with grace-hash-join spilling:
+#   ~/Documents/datafusion, branch df-55.2.0-ballista
+# Paths are relative to this directory's parent (the repository root).
+# Every DataFusion crate in the dependency graph must be listed: a crate left on
+# crates.io would put two incompatible copies of DataFusion in one build.
+[patch.crates-io]
+datafusion = { path = "../../datafusion/datafusion/core" }
+datafusion-catalog = { path = "../../datafusion/datafusion/catalog" }
+datafusion-catalog-listing = { path = "../../datafusion/datafusion/catalog-listing" }
+datafusion-cli = { path = "../../datafusion/datafusion-cli" }
+datafusion-common = { path = "../../datafusion/datafusion/common" }
+datafusion-common-runtime = { path = "../../datafusion/datafusion/common-runtime" }
+datafusion-datasource = { path = "../../datafusion/datafusion/datasource" }
+datafusion-datasource-arrow = { path = "../../datafusion/datafusion/datasource-arrow" }
+datafusion-datasource-avro = { path = "../../datafusion/datafusion/datasource-avro" }
+datafusion-datasource-csv = { path = "../../datafusion/datafusion/datasource-csv" }
+datafusion-datasource-json = { path = "../../datafusion/datafusion/datasource-json" }
+datafusion-datasource-parquet = { path = "../../datafusion/datafusion/datasource-parquet" }
+datafusion-doc = { path = "../../datafusion/datafusion/doc" }
+datafusion-execution = { path = "../../datafusion/datafusion/execution" }
+datafusion-expr = { path = "../../datafusion/datafusion/expr" }
+datafusion-expr-common = { path = "../../datafusion/datafusion/expr-common" }
+datafusion-functions = { path = "../../datafusion/datafusion/functions" }
+datafusion-functions-aggregate = { path = "../../datafusion/datafusion/functions-aggregate" }
+datafusion-functions-aggregate-common = { path = "../../datafusion/datafusion/functions-aggregate-common" }
+datafusion-functions-nested = { path = "../../datafusion/datafusion/functions-nested" }
+datafusion-functions-table = { path = "../../datafusion/datafusion/functions-table" }
+datafusion-functions-window = { path = "../../datafusion/datafusion/functions-window" }
+datafusion-functions-window-common = { path = "../../datafusion/datafusion/functions-window-common" }
+datafusion-macros = { path = "../../datafusion/datafusion/macros" }
+datafusion-optimizer = { path = "../../datafusion/datafusion/optimizer" }
+datafusion-physical-expr = { path = "../../datafusion/datafusion/physical-expr" }
+datafusion-physical-expr-adapter = { path = "../../datafusion/datafusion/physical-expr-adapter" }
+datafusion-physical-expr-common = { path = "../../datafusion/datafusion/physical-expr-common" }
+datafusion-physical-optimizer = { path = "../../datafusion/datafusion/physical-optimizer" }
+datafusion-physical-plan = { path = "../../datafusion/datafusion/physical-plan" }
+datafusion-proto = { path = "../../datafusion/datafusion/proto" }
+datafusion-proto-common = { path = "../../datafusion/datafusion/proto-common" }
+datafusion-proto-models = { path = "../../datafusion/datafusion/proto-models" }
+datafusion-pruning = { path = "../../datafusion/datafusion/pruning" }
+datafusion-session = { path = "../../datafusion/datafusion/session" }
+datafusion-spark = { path = "../../datafusion/datafusion/spark" }
+datafusion-sql = { path = "../../datafusion/datafusion/sql" }
+datafusion-substrait = { path = "../../datafusion/datafusion/substrait" }
