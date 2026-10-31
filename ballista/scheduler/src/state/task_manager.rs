@@ -329,10 +329,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     )?) as ExecutionGraphBox
                 }
             }
+            SubmitPlan::Physical(physical_plan)
+                if session_config.ballista_adaptive_query_planner_enabled()
+                    && session_config.ballista_adaptive_physical_plans_enabled() =>
+            {
+                debug!("Using adaptive query planner (AQE) for physical-plan job submission");
+                Box::new(AdaptiveExecutionGraph::try_new_from_physical(
+                    &self.scheduler_id,
+                    job_id,
+                    job_name,
+                    &ctx,
+                    physical_plan.clone(),
+                    queued_at,
+                )?) as ExecutionGraphBox
+            }
             SubmitPlan::Physical(physical_plan) => {
-                // AQE plans from the logical plan, so an already-built
-                // physical plan always uses the static planner, including when
-                // AQE is on (the default).
+                // Unless `ballista.planner.adaptive.physical_plans.enabled` is
+                // set, an already-built physical plan uses the static planner.
                 debug!("Using static query planner for physical-plan job submission");
                 let session_config = Arc::new(ctx.copied_config());
 

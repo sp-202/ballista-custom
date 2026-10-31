@@ -27,6 +27,8 @@ mod job_failure;
 mod join_selection;
 /// Tests if plan is going to be split to stages correctly
 mod plan_to_stages;
+/// AQE for jobs submitted as already-built physical plans
+mod physical_submission;
 /// Regression tests for range-repartition planning end-to-end
 /// through `AdaptivePlanner` (DER → routing park → filter injection).
 mod range_repartition;

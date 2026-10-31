@@ -154,13 +154,43 @@ impl AdaptiveExecutionGraph {
         logical_plan: &LogicalPlan,
         queued_at: u64,
     ) -> ballista_core::error::Result<Self> {
+        let planner = AdaptivePlanner::try_new(ctx, logical_plan, job_id.clone()).await?;
+        Self::from_planner(
+            scheduler_id,
+            job_id,
+            job_name,
+            ctx,
+            planner,
+            Some(logical_plan.display_indent().to_string()),
+            queued_at,
+        )
+    }
+
+    /// Creates a new `ExecutionGraph` from an already-built physical plan
+    /// (see [`AdaptivePlanner::try_new_from_physical`]).
+    pub fn try_new_from_physical(
+        scheduler_id: &str,
+        job_id: &JobId,
+        job_name: &str,
+        ctx: &SessionContext,
+        physical_plan: Arc<dyn ExecutionPlan>,
+        queued_at: u64,
+    ) -> ballista_core::error::Result<Self> {
+        let planner =
+            AdaptivePlanner::try_new_from_physical(ctx, physical_plan, job_id.clone())?;
+        Self::from_planner(scheduler_id, job_id, job_name, ctx, planner, None, queued_at)
+    }
+
+    fn from_planner(
+        scheduler_id: &str,
+        job_id: &JobId,
+        job_name: &str,
+        ctx: &SessionContext,
+        mut planner: AdaptivePlanner,
+        logical_plan: Option<String>,
+        queued_at: u64,
+    ) -> ballista_core::error::Result<Self> {
         let session_id = ctx.session_id();
-
-        let mut planner =
-            AdaptivePlanner::try_new(ctx, logical_plan, job_id.clone()).await?;
-
-        let logical_plan = Some(logical_plan.display_indent().to_string());
-
         let session_config = Arc::new(ctx.copied_config());
         let started_at = timestamp_millis();
 

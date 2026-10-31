@@ -30,7 +30,7 @@ mod physical_plan_submission_tests {
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::common::test_util::batches_to_sort_string;
+    use datafusion::common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion::datasource::MemTable;
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::repartition::RepartitionExec;
@@ -128,5 +128,92 @@ mod physical_plan_submission_tests {
             batches_to_sort_string(&expected),
             batches_to_sort_string(&actual)
         );
+    }
+
+    /// Builds an optimized physical plan for a join + aggregate + ORDER BY
+    /// over two in-memory tables, under Ballista's restricted configuration.
+    async fn build_join_plan() -> (Arc<dyn ExecutionPlan>, SessionContext) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = |ids: Vec<i32>, values: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
+            )
+            .unwrap()
+        };
+        let left = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40])],
+                vec![batch(vec![5, 6, 7, 8], vec![50, 60, 70, 80])],
+            ],
+        )
+        .unwrap();
+        let right = MemTable::try_new(
+            schema.clone(),
+            vec![
+                vec![batch(vec![1, 2, 3, 4], vec![1, 1, 2, 2])],
+                vec![batch(vec![5, 6, 7, 8], vec![3, 3, 1, 2])],
+            ],
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new_with_ballista());
+        ctx.register_table("l", Arc::new(left)).unwrap();
+        ctx.register_table("r", Arc::new(right)).unwrap();
+
+        let plan = ctx
+            .sql(
+                "select r.value as k, sum(l.value) as s, count(*) as n \
+                 from l join r on l.id = r.id \
+                 group by r.value order by s desc",
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        (plan, ctx)
+    }
+
+    /// With `ballista.planner.adaptive.physical_plans.enabled`, a submitted
+    /// physical plan runs through the adaptive planner. Its answer, including
+    /// the ORDER BY order, must equal local execution of the same plan.
+    #[tokio::test]
+    async fn should_execute_physical_plan_adaptively_with_same_ordered_result() {
+        let (host, port) = setup_test_cluster().await;
+        let scheduler_url = format!("http://{host}:{port}");
+
+        let (plan, ctx) = build_join_plan().await;
+        let expected = physical_plan::collect(plan.clone(), ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let session_config =
+            SessionConfig::new_with_ballista().with_ballista_adaptive_physical_plans(true);
+        assert!(session_config.ballista_adaptive_physical_plans_enabled());
+        let codec = session_config.ballista_physical_extension_codec();
+
+        let stream = execute_physical_plan::<PhysicalPlanNode>(
+            scheduler_url,
+            &BallistaConfig::default(),
+            plan,
+            codec.as_ref(),
+            uuid::Uuid::new_v4().to_string(),
+            session_config,
+        )
+        .await
+        .expect("physical plan job should run with AQE");
+        let actual = physical_plan::common::collect(stream)
+            .await
+            .expect("collecting results from the adaptive physical plan job");
+
+        assert_eq!(batches_to_string(&expected), batches_to_string(&actual));
     }
 }

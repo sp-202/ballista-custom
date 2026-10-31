@@ -161,6 +161,47 @@ impl AdaptivePlanner {
             Self::default_optimizers(plan_id_generator),
         )
     }
+    /// Creates a new `AdaptivePlanner` for a job submitted as a physical plan.
+    ///
+    /// The logical-plan path ([`Self::try_new`]) plans with only the
+    /// plan-preparation rules and leaves distribution decisions to the
+    /// adaptive rules. A submitted physical plan is usually already optimized
+    /// (e.g. by the Spark Connect front end), so the same preparation rules are
+    /// applied to it as-is; the adaptive chain then re-plans it like any other
+    /// job. Its repartitions and sorts are kept, so a plan's global ordering
+    /// (e.g. a final `SortPreservingMergeExec`) is never lost; DataFusion's
+    /// distribution and sorting rules accept their own output.
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - The session context
+    /// * `plan` - The submitted physical plan.
+    /// * `job_id` - The unique identifier for the job.
+    pub fn try_new_from_physical(
+        ctx: &SessionContext,
+        plan: Arc<dyn ExecutionPlan>,
+        job_id: JobId,
+    ) -> common::Result<Self> {
+        let plan_id_generator = Arc::new(AtomicUsize::new(0));
+
+        let plan_preparation_state = Self::create_session_state(
+            SessionStateBuilder::from(ctx.state()),
+            Self::plan_preparation_optimizers(plan_id_generator.clone()),
+        );
+        let plan = DefaultPhysicalPlanner::default().optimize_physical_plan(
+            plan,
+            &plan_preparation_state,
+            |_, _| {},
+        )?;
+
+        Self::try_new_with_optimizers(
+            SessionStateBuilder::from(ctx.state()),
+            plan,
+            job_id,
+            Self::default_optimizers(plan_id_generator),
+        )
+    }
+
     /// Cancels a stage by its ID.
     ///
     /// # Arguments

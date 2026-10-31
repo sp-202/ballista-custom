@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::config::{
-    BALLISTA_ADAPTIVE_PLANNER_ENABLED, BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES,
+    BALLISTA_ADAPTIVE_PLANNER_ENABLED, BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED,
+    BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES,
     BALLISTA_BROADCAST_JOIN_THRESHOLD_ROWS, BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE,
     BALLISTA_CLIENT_USE_TLS, BALLISTA_COALESCE_ENABLED,
     BALLISTA_COALESCE_MERGED_PARTITION_FACTOR, BALLISTA_COALESCE_SMALL_PARTITION_FACTOR,
@@ -224,6 +225,13 @@ pub trait SessionConfigExt {
 
     /// Enables or disables adaptive query planning (enabled by default).
     fn with_ballista_adaptive_query_planner(self, enabled: bool) -> Self;
+
+    /// Is adaptive query planning enabled for jobs submitted as physical plans
+    fn ballista_adaptive_physical_plans_enabled(&self) -> bool;
+
+    /// Enables or disables adaptive query planning for jobs submitted as
+    /// physical plans (disabled by default).
+    fn with_ballista_adaptive_physical_plans(self, enabled: bool) -> Self;
 
     /// Set user defined metadata keys in Ballista gRPC requests
     fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
@@ -596,6 +604,12 @@ impl SessionConfigExt for SessionConfig {
         bool,
         adaptive_query_planner_enabled as with_ballista_adaptive_query_planner,
         BALLISTA_ADAPTIVE_PLANNER_ENABLED
+    );
+
+    ballista_config_option!(
+        bool,
+        adaptive_physical_plans_enabled as with_ballista_adaptive_physical_plans,
+        BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED
     );
 
     ballista_config_option!(bool, use_tls, BALLISTA_CLIENT_USE_TLS);

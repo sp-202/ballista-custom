@@ -87,6 +87,9 @@ pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
     "ballista.client.io_retry_wait_time_ms";
 /// Enables adaptive query planning
 pub const BALLISTA_ADAPTIVE_PLANNER_ENABLED: &str = "ballista.planner.adaptive.enabled";
+/// Enables adaptive query planning for jobs submitted as physical plans
+pub const BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED: &str =
+    "ballista.planner.adaptive.physical_plans.enabled";
 /// Configuration key for sort shuffle target batch size in rows.
 pub const BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE: &str =
     "ballista.shuffle.sort_based.batch_size";
@@ -320,6 +323,13 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          estimates. Set to false to use the static distributed planner.".to_string(),
                          DataType::Boolean,
                          Some(true.to_string())),
+        ConfigEntry::new(BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED.to_string(),
+                         "Also use Adaptive Query Planning for jobs submitted as an already-built \
+                         physical plan (e.g. by the Spark Connect front end). Requires \
+                         ballista.planner.adaptive.enabled. When false such jobs use the static \
+                         distributed planner.".to_string(),
+                         DataType::Boolean,
+                         Some(false.to_string())),
         ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BATCH_SIZE.to_string(),
                          "Target batch size in rows for coalescing small batches in sort shuffle".to_string(),
                          DataType::UInt64,
@@ -859,6 +869,11 @@ impl BallistaConfig {
     /// Is Adaptive Query Planner enabled
     pub fn adaptive_query_planner_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_ADAPTIVE_PLANNER_ENABLED)
+    }
+
+    /// Is Adaptive Query Planner enabled for jobs submitted as physical plans
+    pub fn adaptive_physical_plans_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED)
     }
 
     /// Returns the target batch size for sort-based shuffle.
