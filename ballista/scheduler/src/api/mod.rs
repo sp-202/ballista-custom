@@ -21,11 +21,13 @@ mod health;
 pub mod openapi;
 #[cfg(feature = "rest-api")]
 mod routes;
+#[cfg(feature = "rest-api")]
+mod ui;
 pub(super) use health::health_routes;
 #[cfg(feature = "rest-api")]
 pub use openapi::{ApiDoc, openapi_spec};
 #[cfg(feature = "rest-api")]
-pub use routes::get_routes;
+pub use routes::{get_routes, get_web_ui_routes};
 
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};

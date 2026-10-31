@@ -134,6 +134,31 @@ Two probe endpoints are always mounted, whether or not the `rest-api` feature is
 | /healthz | GET    | Liveness. Always `200 OK` while the process runs.                                                                                   |
 | /readyz  | GET    | Readiness. `200 OK` once at least `--min-ready-executors` executors are registered, and `503` while the scheduler is shutting down. |
 
+## Web UI
+
+The scheduler serves a built-in web UI on its own port, by default `4040`
+(like Spark's UI), bound to `--bind-host`:
+
+```bash
+ballista-scheduler --web-ui-port 4040   # 0 disables the UI
+```
+
+If the port is in use, the next free port up to 15 higher is used; the
+scheduler logs the address (`Ballista web UI available at http://...`). The UI
+is compiled into the scheduler binary and reads the REST API on the same port,
+so it needs no other service or internet access. Schedulers embedded as a
+library (`SchedulerConfig`) have the UI disabled unless
+`SchedulerConfig::with_web_ui_port` is set.
+
+| Page | Shows |
+| ---- | ----- |
+| Jobs | Active, completed and failed jobs with progress, and an event timeline of recent jobs |
+| Job | Event timeline of its stages (independent stages run concurrently), the stage DAG with each stage's operators, the stages table, and the logical, physical and final plans |
+| Stage | Summary metrics (task duration and input row quantiles), the stage plan, a task timeline and the task list |
+| Stages | Stages of the most recent jobs |
+| Executors | Task slots, memory pool use, process memory, free disk and last heartbeat per executor |
+| Environment | Scheduler state and the session configuration a job ran with |
+
 ## Web TUI Configuration
 
 When the Scheduler is built with the `rest-api` feature, several command-line options control its integration with the Web TUI:

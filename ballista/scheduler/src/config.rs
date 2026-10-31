@@ -341,6 +341,14 @@ pub struct Config {
         help = "The HTTP path that will redirect to the WebTUI app at https://nightlies.apache.org."
     )]
     pub web_tui_route: String,
+    #[cfg(feature = "rest-api")]
+    /// Port of the built-in web UI (jobs, stages, DAG, executors), like Spark's UI on 4040.
+    #[arg(
+        long,
+        default_value_t = 4040,
+        help = "Port of the built-in web UI, served on --bind-host. If the port is in use the next free one (up to 15 more) is used. 0 disables the UI."
+    )]
+    pub web_ui_port: u16,
 }
 
 /// Configurations for the ballista scheduler of scheduling jobs and tasks
@@ -479,6 +487,10 @@ pub struct SchedulerConfig {
     #[cfg(feature = "rest-api")]
     /// The HTTP path that will redirect to the WebTUI app at `https://nightlies.apache.org`
     pub web_tui_route: String,
+    #[cfg(feature = "rest-api")]
+    /// Port of the built-in web UI. `0` (the default for embedded schedulers)
+    /// disables it; the `ballista-scheduler` binary defaults to 4040.
+    pub web_ui_port: u16,
     /// Callback invoked when new work becomes available for executors.
     /// See [`OnWorkAvailableFn`].
     pub on_work_available: Option<OnWorkAvailableFn>,
@@ -540,6 +552,8 @@ impl Default for SchedulerConfig {
             event_log_dir: None,
             #[cfg(feature = "rest-api")]
             web_tui_route: String::from("/"),
+            #[cfg(feature = "rest-api")]
+            web_ui_port: 0,
             on_work_available: None,
             job_id_generator: None,
             disable_dataframe_cache: false,
@@ -629,6 +643,13 @@ impl SchedulerConfig {
     /// Sets the namespace for this scheduler.
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = namespace.into();
+        self
+    }
+
+    /// Serves the built-in web UI on `port` (0 disables it).
+    #[cfg(feature = "rest-api")]
+    pub fn with_web_ui_port(mut self, port: u16) -> Self {
+        self.web_ui_port = port;
         self
     }
 
@@ -997,6 +1018,8 @@ impl TryFrom<Config> for SchedulerConfig {
             event_log_dir: opt.event_log_dir,
             #[cfg(feature = "rest-api")]
             web_tui_route: opt.web_tui_route,
+            #[cfg(feature = "rest-api")]
+            web_ui_port: opt.web_ui_port,
             on_work_available: None,
             job_id_generator: None,
             disable_dataframe_cache: opt.disable_dataframe_cache,

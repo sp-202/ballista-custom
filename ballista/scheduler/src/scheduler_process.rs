@@ -19,7 +19,7 @@ use crate::api::SchedulerErrorResponse;
 use ballista_core::flight_proxy_service::BallistaFlightProxyService;
 
 #[cfg(feature = "rest-api")]
-use crate::api::get_routes;
+use crate::api::{get_routes, get_web_ui_routes};
 use crate::api::health_routes;
 use crate::api::route_disabled;
 use crate::cluster::BallistaCluster;
@@ -243,6 +243,7 @@ pub async fn start_grpc_service_with_listener<
             ))
             .merge(health)
     } else {
+        spawn_web_ui(scheduler.clone()).await;
         let axum = get_routes(scheduler);
         axum.merge(tonic).merge(health)
     };
@@ -261,6 +262,59 @@ pub async fn start_grpc_service_with_listener<
         .with_graceful_shutdown(async move { shutdown.recv().await })
         .await
         .map_err(BallistaError::from)
+}
+
+/// How many ports after `web_ui_port` are tried when it is in use, as Spark
+/// does for its UI (4040, 4041, ...).
+#[cfg(feature = "rest-api")]
+const WEB_UI_PORT_RETRIES: u16 = 15;
+
+/// Serves the built-in web UI on `bind_host:web_ui_port` (or the next free
+/// port), next to the REST API it reads. A UI that cannot start never stops
+/// the scheduler: it is logged and skipped.
+#[cfg(feature = "rest-api")]
+async fn spawn_web_ui<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
+    scheduler: Arc<SchedulerServer<T, U>>,
+) {
+    let config = scheduler.state.config.clone();
+    if config.web_ui_port == 0 {
+        return;
+    }
+    let first = config.web_ui_port;
+    let last = first.saturating_add(WEB_UI_PORT_RETRIES);
+    let mut listener = None;
+    for port in first..=last {
+        match tokio::net::TcpListener::bind((config.bind_host.as_str(), port)).await {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(e) => log::warn!("Web UI port {port} is unavailable: {e}"),
+        }
+    }
+    let Some(listener) = listener else {
+        log::warn!("Web UI disabled: no free port in {first}..={last}");
+        return;
+    };
+    match listener.local_addr() {
+        Ok(addr) => info!(
+            "Ballista web UI available at http://{}:{}",
+            config.external_host,
+            addr.port()
+        ),
+        Err(e) => log::warn!("Web UI listening, address unknown: {e}"),
+    }
+
+    let mut shutdown = scheduler.subscribe_for_shutdown();
+    let app = with_version_headers(get_web_ui_routes(scheduler));
+    tokio::spawn(async move {
+        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown.recv().await;
+        });
+        if let Err(e) = serve.await {
+            log::warn!("Web UI server stopped: {e}");
+        }
+    });
 }
 
 /// Creates scheduler and exposes it as grpc service

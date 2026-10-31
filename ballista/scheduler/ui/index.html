@@ -1,0 +1,47 @@
+<!doctype html>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ballista UI</title>
+<link rel="stylesheet" href="ui.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/jobs" title="Ballista scheduler">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="m3 7 9 5 9-5M12 12v10"/></svg>
+    <span>Ballista</span><small id="version"></small>
+  </a>
+  <nav id="nav">
+    <a href="#/jobs" data-tab="jobs">Jobs</a>
+    <a href="#/stages" data-tab="stages">Stages</a>
+    <a href="#/executors" data-tab="executors">Executors</a>
+    <a href="#/environment" data-tab="environment">Environment</a>
+  </nav>
+  <div class="status">
+    <span class="dot" id="conn"></span><span id="conn-text">connecting…</span>
+    <label class="refresh"><input type="checkbox" id="auto" checked> auto-refresh</label>
+  </div>
+</header>
+<main id="view" aria-live="polite"></main>
+<script src="ui.js"></script>
+</body>
+</html>

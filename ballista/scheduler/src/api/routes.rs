@@ -10,7 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::api::{handlers, openapi};
+use crate::api::{handlers, openapi, ui};
 use crate::config::SchedulerConfig;
 use crate::scheduler_server::SchedulerServer;
 use axum::{Router, routing::get};
@@ -20,17 +20,12 @@ use http::HeaderValue;
 use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-/// All routes configured for rest-api.
-pub fn get_routes<
+/// The `/api/...` routes, shared by the scheduler port and the web UI port.
+fn api_router<
     T: AsLogicalPlan + Clone + Send + Sync + 'static,
     U: AsExecutionPlan + Send + Sync + 'static,
->(
-    scheduler_server: Arc<SchedulerServer<T, U>>,
-) -> Router {
-    let web_tui_route = scheduler_server.state.config.web_tui_route.clone();
-
+>() -> Router<Arc<SchedulerServer<T, U>>> {
     let router = Router::new()
-        .route(&web_tui_route, get(handlers::get_webtui))
         .route("/api/openapi.json", get(openapi::get_openapi_spec))
         .route("/api/state", get(handlers::get_scheduler_state::<T, U>))
         .route("/api/version", get(handlers::get_scheduler_version))
@@ -69,6 +64,33 @@ pub fn get_routes<
     );
 
     router
+}
+
+/// All routes configured for rest-api on the scheduler port.
+pub fn get_routes<
+    T: AsLogicalPlan + Clone + Send + Sync + 'static,
+    U: AsExecutionPlan + Send + Sync + 'static,
+>(
+    scheduler_server: Arc<SchedulerServer<T, U>>,
+) -> Router {
+    let web_tui_route = scheduler_server.state.config.web_tui_route.clone();
+
+    api_router()
+        .route(&web_tui_route, get(handlers::get_webtui))
+        .layer(cors(scheduler_server.state.config.clone()))
+        .with_state(scheduler_server)
+}
+
+/// Routes of the web UI port: the UI at `/` and the REST API it reads, so the
+/// page and the API share an origin.
+pub fn get_web_ui_routes<
+    T: AsLogicalPlan + Clone + Send + Sync + 'static,
+    U: AsExecutionPlan + Send + Sync + 'static,
+>(
+    scheduler_server: Arc<SchedulerServer<T, U>>,
+) -> Router {
+    api_router()
+        .merge(ui::routes("/"))
         .layer(cors(scheduler_server.state.config.clone()))
         .with_state(scheduler_server)
 }
