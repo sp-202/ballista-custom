@@ -23,6 +23,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-012](#bs-012) | 🔴 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
+| [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
 
 ---
 
@@ -141,3 +142,12 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   `CoalescePartitionsExec` (never `SortExec`/`SortPreservingMergeExec`) and let
   `EnforceDistribution` re-add what operators require. Verify with the ordered
   end-to-end test, the scheduler suite, and TPC-H stage counts + answers.
+
+## BS-015
+**Uneven file-partition assignment makes one scan task a straggler** · 🔴 open · step 07
+- **Evidence (web UI, stage page):** TPC-H Q9 via Spark Connect, stage 5 (`lineitem`
+  scan, 12 tasks): task 0 got partitions 0–5 and 12.9 M rows (770 ms); median task
+  4.3 M rows (559 ms), min 2.1 M. Stage time is set by task 0 (1.2 s of a 2.3 s job).
+- **Likely cause:** partitions are grouped into tasks without balancing by size.
+- **Plan:** confirm on Ballista's SQL path; balance task groups by bytes/rows, or split
+  oversized groups (relates to skew handling in step 07).
