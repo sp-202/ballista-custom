@@ -397,6 +397,17 @@ impl Default for BallistaPhysicalExtensionCodec {
     }
 }
 
+impl BallistaPhysicalExtensionCodec {
+    /// Creates a codec whose `default_codec` encodes the expressions and
+    /// functions nested inside Ballista nodes (e.g. hash-partitioning
+    /// expressions of a shuffle writer). Use this when plans contain
+    /// extension UDFs or physical expressions that the DataFusion default
+    /// codec cannot serialize.
+    pub fn new(default_codec: Arc<dyn PhysicalExtensionCodec>) -> Self {
+        Self { default_codec }
+    }
+}
+
 /// Encode a `ScalarValue` list for the wire, naming what failed.
 fn encode_scalars(
     values: &[datafusion::scalar::ScalarValue],
