@@ -177,3 +177,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   partial phase emits early, final phase spills when temp files are enabled (they are
   on Ballista executors) — no change needed. Next: Ballista `JoinSpillHook`, build
   against the fork, memory-pressure proof.
+- **Progress 2026-11-01 (2):** testing the hook contract found 8 pre-existing
+  correctness bugs in the fork's grace hash join (lost/duplicated rows once 2+ buckets
+  spill; e.g. 3356 of 4000 rows). Fixed in `443183b7c` with tests; table in
+  `roadmap/notes/datafusion-spill-fork.md`. They also affect the Comet branch.
