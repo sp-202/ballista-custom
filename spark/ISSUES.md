@@ -24,7 +24,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
 | [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
-| [BS-016](#bs-016) | 🔴 | S2 | Hash join build side cannot spill (DataFusion 55) | 06 |
+| [BS-016](#bs-016) | 🟢 | S2 | Hash join build side cannot spill (DataFusion 55) | 06 |
+| [BS-017](#bs-017) | 🔴 | S1 | Table path missing on the scheduler returns empty results, no error | 05 |
 
 ---
 
@@ -163,7 +164,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   oversized groups (relates to skew handling in step 07).
 
 ## BS-016
-**Hash join build side cannot spill (DataFusion 55)** · 🔴 open · step 06
+**Hash join build side cannot spill (DataFusion 55)** · 🟢 fixed · step 06
 - **Cause:** upstream `HashJoinExec` only `try_grow`s its reservation; a build side
   larger than the pool fails with `ResourcesExhausted`. Ballista mitigates via AQE's
   switch to sort-merge join above `hash_join_max_build_partition_bytes` (SMJ, sort and
@@ -181,3 +182,30 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   correctness bugs in the fork's grace hash join (lost/duplicated rows once 2+ buckets
   spill; e.g. 3356 of 4000 rows). Fixed in `443183b7c` with tests; table in
   `roadmap/notes/datafusion-spill-fork.md`. They also affect the Comet branch.
+- **Progress 2026-11-01 (3):** Ballista hook `BallistaJoinSpillHook` (`f6f6fd3`):
+  Arrow IPC spill files through the executor's `DiskManager` (counted against
+  `--max-temp-directory-size`, removed when read back), attached to every
+  partitioned hash join of a task plan; `ballista.join.spill.enabled` (default true).
+- **Progress 2026-11-01 (4):** cluster proof first failed: executors at 512 MB pools
+  (8 tasks each) ran a 60 M × 15 M-row join and died with `ResourcesExhausted` in
+  `HashJoinInput[n]` (`can spill: false`) although the hook had spilled 2.2 M rows.
+  Causes in the fork: the build reservation was unspillable, so the first joins took
+  the whole fair pool; the post-build hash-table check reserved and *released* the
+  memory, so another task claimed it, and it omitted the concat copy and bitmap. Fixed
+  in `bd2b42f8b` (spillable reservation with a hook; post-build memory reserved and
+  held). Reproduced first: 8–16 concurrent partitions on a multi-threaded runtime,
+  14/15 runs failed → 42/42 correct.
+- **Result:** on 512 MB executors, the join spills 1.7 GB (51.6 M build rows, 352
+  files) and matches vanilla Spark; spill files removed. TPC-H SF10 with hash join
+  forced everywhere (`hash_join_max_build_partition_bytes=0`): 22/22 match Spark.
+
+## BS-017
+**Table path missing on the scheduler returns empty results, no error** · 🔴 open · step 05
+- **Evidence:** the Spark compose scheduler lacked the `~/Documents/tpch` mount
+  (executors had it). Ballista SQL-path queries over those tables completed with
+  0 rows instead of failing.
+- **Cause (likely):** the scheduler plans the scan by listing files; a missing
+  directory lists as an empty table.
+- **Plan:** fail planning when a registered table's location does not exist, as Spark
+  does (`Path does not exist`). Mount fixed in `cluster/spark/compose.yml`.
+
