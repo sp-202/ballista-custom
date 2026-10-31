@@ -172,3 +172,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   `df-55.2.0-comet`): grace hash join with a `JoinSpillHook`. Review:
   `roadmap/notes/datafusion-spill-fork.md` — needs a Ballista hook, and a fix for a
   panic when no hook is set and the pool is above the proactive threshold.
+- **Progress 2026-11-01:** panic fixed in the fork (`df-55.2.0-ballista`, `bd36d3c56`,
+  reproduced by a test first; 1697 physical-plan tests pass). Aggregates reviewed:
+  partial phase emits early, final phase spills when temp files are enabled (they are
+  on Ballista executors) — no change needed. Next: Ballista `JoinSpillHook`, build
+  against the fork, memory-pressure proof.
