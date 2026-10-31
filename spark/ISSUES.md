@@ -24,6 +24,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
 | [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
+| [BS-016](#bs-016) | 🔴 | S2 | Hash join build side cannot spill (DataFusion 55) | 06 |
 
 ---
 
@@ -138,10 +139,19 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Cause:** the front end's physical plan already contains hash `RepartitionExec`s
   placed for its own join choices; `try_new_from_physical` keeps them (by design, for
   ordering safety), and AQE turns each into a shuffle.
-- **Plan:** before the adaptive chain, remove hash/round-robin `RepartitionExec` and
-  `CoalescePartitionsExec` (never `SortExec`/`SortPreservingMergeExec`) and let
-  `EnforceDistribution` re-add what operators require. Verify with the ordered
-  end-to-end test, the scheduler suite, and TPC-H stage counts + answers.
+- **Refined cause (Q9 stage dump):** every join in the front end's plan is a partitioned
+  hash join with both inputs repartitioned, so the 60 M-row `lineitem` is shuffled in
+  full; Ballista's SQL path broadcasts `part`/`supplier`/`nation` (`CollectLeft`) after
+  measuring them and shuffles only 3.3 M rows. Q9: 13 stages vs 8; 2.4 s vs 1.1 s.
+- **Attempt 1 (2026-11-01, rolled back):** `StripRequiredDistributionRule` removed
+  repartitions that only satisfy a parent's required distribution before AQE. Unit and
+  end-to-end tests passed and answers stayed 22/22, but TPC-H got slower
+  (24.2 s → 27.9 s; Q8 1.93 → 3.71 s) and stage counts did not drop, so the joins
+  were still not broadcast. Patch kept at `roadmap/attempts/bs-014-strip-required-distribution.patch`.
+- **Next:** trace one join through `DelayJoinSelectionRule` / `SelectJoinRule` on the
+  Spark path to see why the measured build side does not lead to `CollectLeft`
+  (candidates: join type or Sail-specific operators between join and scan blocking
+  build-side staging; statistics not reported for Sail scans).
 
 ## BS-015
 **Uneven file-partition assignment makes one scan task a straggler** · 🔴 open · step 07
@@ -151,3 +161,14 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Likely cause:** partitions are grouped into tasks without balancing by size.
 - **Plan:** confirm on Ballista's SQL path; balance task groups by bytes/rows, or split
   oversized groups (relates to skew handling in step 07).
+
+## BS-016
+**Hash join build side cannot spill (DataFusion 55)** · 🔴 open · step 06
+- **Cause:** upstream `HashJoinExec` only `try_grow`s its reservation; a build side
+  larger than the pool fails with `ResourcesExhausted`. Ballista mitigates via AQE's
+  switch to sort-merge join above `hash_join_max_build_partition_bytes` (SMJ, sort and
+  aggregates do spill).
+- **Candidate:** the DataFusion 55.2.0 spill fork (`~/Documents/datafusion`,
+  `df-55.2.0-comet`): grace hash join with a `JoinSpillHook`. Review:
+  `roadmap/notes/datafusion-spill-fork.md` — needs a Ballista hook, and a fix for a
+  panic when no hook is set and the pool is above the proactive threshold.
