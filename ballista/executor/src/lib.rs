@@ -387,6 +387,8 @@ pub mod executor_server;
 pub mod flight_service;
 /// HTTP server for Kubernetes-style /healthz and /readyz probes.
 pub mod health;
+/// Disk-backed spilling for partitioned hash joins.
+pub mod join_spill;
 /// Metrics collection for executor runtime statistics.
 pub mod metrics;
 /// Session-scoped cache of shared executor runtime environments.

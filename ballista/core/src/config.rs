@@ -87,6 +87,8 @@ pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
     "ballista.client.io_retry_wait_time_ms";
 /// Enables adaptive query planning
 pub const BALLISTA_ADAPTIVE_PLANNER_ENABLED: &str = "ballista.planner.adaptive.enabled";
+/// Enables grace-hash spilling of partitioned hash joins on executors
+pub const BALLISTA_JOIN_SPILL_ENABLED: &str = "ballista.join.spill.enabled";
 /// Enables adaptive query planning for jobs submitted as physical plans
 pub const BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED: &str =
     "ballista.planner.adaptive.physical_plans.enabled";
@@ -321,6 +323,14 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          "Enables Adaptive Query Planning: joins and partition counts are \
                          chosen from measured runtime statistics instead of planning-time \
                          estimates. Set to false to use the static distributed planner.".to_string(),
+                         DataType::Boolean,
+                         Some(true.to_string())),
+        ConfigEntry::new(BALLISTA_JOIN_SPILL_ENABLED.to_string(),
+                         "Let partitioned hash joins spill build-side buckets, with their \
+                         probe rows, to the executor's disk under memory pressure and join \
+                         them afterwards (grace hash join), instead of failing when the build \
+                         side does not fit in memory. Spill files count against \
+                         datafusion.runtime.max_temp_directory_size.".to_string(),
                          DataType::Boolean,
                          Some(true.to_string())),
         ConfigEntry::new(BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED.to_string(),
@@ -869,6 +879,11 @@ impl BallistaConfig {
     /// Is Adaptive Query Planner enabled
     pub fn adaptive_query_planner_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_ADAPTIVE_PLANNER_ENABLED)
+    }
+
+    /// Whether partitioned hash joins may spill to disk on executors
+    pub fn join_spill_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_JOIN_SPILL_ENABLED)
     }
 
     /// Is Adaptive Query Planner enabled for jobs submitted as physical plans

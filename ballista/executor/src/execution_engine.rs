@@ -29,6 +29,7 @@ use ballista_core::execution_plans::{
 };
 use ballista_core::serde::protobuf::{ShuffleWritePartition, TaskColumnStats};
 use ballista_core::serde::scheduler::PartitionStats;
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::{JobId, utils};
 use datafusion::arrow::array::{
     Array, StringArray, StructArray, UInt32Array, UInt64Array,
@@ -162,8 +163,9 @@ impl ExecutionEngine for DefaultExecutionEngine {
         global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
-        _config: &SessionConfig,
+        config: &SessionConfig,
     ) -> Result<Arc<dyn QueryStageExecutor>> {
+        let join_spill = config.ballista_config().join_spill_enabled();
         let plan = plan
             .transform(|p| {
                 if let Some(reader) = p.downcast_ref::<ShuffleReaderExec>() {
@@ -211,6 +213,14 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 }
             })?
             .data;
+
+        // Let partitioned hash joins spill to this executor's disk instead of failing
+        // when their build side does not fit in memory.
+        let plan = if join_spill {
+            crate::join_spill::with_join_spill_hooks(plan)?
+        } else {
+            plan
+        };
 
         // the query plan created by the scheduler always starts with a shuffle
         // writer (ShuffleWriterExec, RangeShuffleWriterExec,
