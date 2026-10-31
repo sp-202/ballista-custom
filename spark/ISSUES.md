@@ -26,6 +26,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
 | [BS-016](#bs-016) | 🟢 | S2 | Hash join build side cannot spill (DataFusion 55) | 06 |
 | [BS-017](#bs-017) | 🔴 | S1 | Table path missing on the scheduler returns empty results, no error | 05 |
+| [BS-018](#bs-018) | 🔴 | S2 | Hash join: one key larger than memory still fails after 4 spill levels | 06 |
+| [BS-019](#bs-019) | 🔴 | S4 | DataFusion fork's hash-join code is not `cargo fmt` clean | 06 |
 
 ---
 
@@ -208,4 +210,28 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   directory lists as an empty table.
 - **Plan:** fail planning when a registered table's location does not exist, as Spark
   does (`Path does not exist`). Mount fixed in `cluster/spark/compose.yml`.
+
+## BS-018
+**Hash join: one key larger than memory still fails after 4 spill levels** · 🔴 open · step 06
+- **Cause:** grace hash join splits a spilled bucket by re-hashing its rows into new
+  buckets. Rows with the same key always land in one bucket, so one very hot key cannot
+  be split. The fork stops at `MAX_SPILL_DEPTH = 4` (so recursion ends) and builds that
+  bucket in memory; if it does not fit, the query fails with `ResourcesExhausted`.
+- **Evidence:** fork test `spilling_join_with_one_hot_key_terminates` (4000 rows, one
+  key) returns the right answer only because the bucket fits in memory.
+- **Spark:** skewed keys are handled by AQE's skew-join split (`OptimizeSkewedJoin`)
+  and by sort-merge join, which streams equal-key groups and can spill them.
+- **Plan:** when a bucket at max depth still does not fit, fall back to sort-merge join
+  for that bucket, or rely on step 07 skew-join splitting. AQE's switch to sort-merge
+  join above `hash_join_max_build_partition_bytes` (default 64 MiB) already avoids
+  most cases.
+
+## BS-019
+**DataFusion fork's hash-join code is not `cargo fmt` clean** · 🔴 open · step 06
+- **Evidence:** `cargo fmt -p datafusion-physical-plan -- --check` on
+  `~/Documents/datafusion` (`df-55.2.0-ballista`) reports diffs in
+  `hash_join/exec.rs` (including the fixes in `443183b7c`, `bd2b42f8b`) and in
+  `aggregates/grouped_hash_stream.rs`, code that was already in the fork.
+- **Plan:** run `cargo fmt` as its own commit on both fork branches, so later fix diffs
+  stay readable and the fork could be offered upstream.
 
