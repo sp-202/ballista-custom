@@ -15,13 +15,14 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-004](#bs-004) | 🟢 | S2 | Python interpreter not initialized in standalone binaries | 00 |
 | [BS-005](#bs-005) | 🟢 | S2 | Catalog commands executed on executors | 00 |
 | [BS-006](#bs-006) | 🟢 | S2 | Sail crate `data/` dirs ignored by git | 00 |
-| [BS-007](#bs-007) | 🔴 | S3 | Spark Connect jobs run without AQE | 03 |
+| [BS-007](#bs-007) | 🟢 | S3 | Spark Connect jobs run without AQE | 03 |
 | [BS-008](#bs-008) | 🔴 | S4 | DDL returns a `value: true` row instead of no columns | 04 |
 | [BS-009](#bs-009) | ⚪ | S4 | Decimal averages truncated instead of HALF_UP | 04 |
 | [BS-010](#bs-010) | 🔴 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
 | [BS-011](#bs-011) | 🔴 | S2 | Executors don't register object stores from Sail settings | 05 |
 | [BS-012](#bs-012) | 🔴 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
+| [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
 
 ---
 
@@ -76,12 +77,20 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Fix:** `spark/.gitignore` re-includes `crates/*/data/`.
 
 ## BS-007
-**Spark Connect jobs run without AQE** · 🔴 open · step 03
+**Spark Connect jobs run without AQE** · 🟢 fixed · step 03
 - **Evidence:** 0 of 28 jobs from a TPC-H SF10 run had an `AdaptiveDatafusionExec`
   root; TPC-H total 30.7 s via Spark Connect vs 12.6 s through Ballista's SQL path.
 - **Cause:** `scheduler/src/state/task_manager.rs` routes `SubmitPlan::Physical` to the
   static planner ("AQE plans from the logical plan").
-- **Plan:** step 03 — AQE entry point for physical plans.
+- **Fix (Ballista core):** `AdaptivePlanner::try_new_from_physical` applies the
+  plan-preparation rules to the submitted plan, then the normal adaptive chain; routed
+  when `ballista.planner.adaptive.physical_plans.enabled` (default **false**, so
+  existing behaviour is unchanged). Spark planning sessions enable it. Existing
+  repartitions and sorts are kept, so global ordering is preserved.
+- **Tests:** 4 scheduler unit tests (`aqe/test/physical_submission.rs`) + 1 end-to-end
+  test comparing ordered results with local execution; full scheduler suite 537/537.
+- **Result:** 24/24 Spark Connect jobs use AQE; TPC-H SF10 30.7 s → 24.2 s; answers still
+  22/22 vs vanilla Spark. Remaining gap: BS-014.
 
 ## BS-008
 **DDL returns a `value: true` row instead of no columns** · 🔴 open · step 04
@@ -119,3 +128,16 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Risk:** driver-only parents (e.g. `DeltaCommitExec`, `FileDeleteExec`) expecting
   N input partitions may misbehave.
 - **Plan:** Delta/Iceberg write tests through Spark Connect; preserve partitioning if needed.
+
+## BS-014
+**Redundant shuffles from the front end's repartitions** · 🔴 open · step 03
+- **Evidence:** TPC-H Q9 (SF10). Ballista SQL path: 8 stages, 5 sort-shuffle writes,
+  0.95–1.4 s. Spark Connect + AQE: 13 stages, 11 sort-shuffle writes, 3.1 s. Both end
+  with the same 5 hash joins. TPC-H total still 24.2 s vs 12.6 s.
+- **Cause:** the front end's physical plan already contains hash `RepartitionExec`s
+  placed for its own join choices; `try_new_from_physical` keeps them (by design, for
+  ordering safety), and AQE turns each into a shuffle.
+- **Plan:** before the adaptive chain, remove hash/round-robin `RepartitionExec` and
+  `CoalescePartitionsExec` (never `SortExec`/`SortPreservingMergeExec`) and let
+  `EnforceDistribution` re-add what operators require. Verify with the ordered
+  end-to-end test, the scheduler suite, and TPC-H stage counts + answers.

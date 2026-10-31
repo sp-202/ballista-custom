@@ -53,7 +53,11 @@ impl ServerSessionMutator for BallistaSparkSessionMutator {
         info: &ServerSessionInfo,
     ) -> Result<SessionConfig> {
         let config = self.spark.mutate_config(config, info)?;
-        Ok(config.ballista_restricted_configuration())
+        Ok(config
+            .ballista_restricted_configuration()
+            // Spark plans reach the scheduler as physical plans; plan them
+            // adaptively like Ballista's own SQL jobs (BS-007).
+            .with_ballista_adaptive_physical_plans(true))
     }
 
     fn mutate_state(
