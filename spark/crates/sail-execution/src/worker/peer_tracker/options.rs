@@ -1,0 +1,29 @@
+use std::num::NonZeroUsize;
+
+use crate::id::WorkerId;
+use crate::worker::WorkerOptions;
+
+#[readonly::make]
+pub struct PeerTrackerOptions {
+    pub worker_id: WorkerId,
+    pub enable_tls: bool,
+    pub flight_connection_count: NonZeroUsize,
+    pub flight_initial_stream_window_size: Option<u32>,
+    pub flight_initial_connection_window_size: Option<u32>,
+}
+
+impl From<&WorkerOptions> for PeerTrackerOptions {
+    fn from(options: &WorkerOptions) -> Self {
+        Self {
+            worker_id: options.worker_id,
+            enable_tls: options.enable_tls,
+            flight_connection_count: options.shuffle_backend.flight_connection_count(),
+            flight_initial_stream_window_size: options
+                .shuffle_backend
+                .flight_initial_stream_window_size(),
+            flight_initial_connection_window_size: options
+                .shuffle_backend
+                .flight_initial_connection_window_size(),
+        }
+    }
+}

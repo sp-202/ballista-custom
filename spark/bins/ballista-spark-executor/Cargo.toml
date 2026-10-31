@@ -1,0 +1,21 @@
+[package]
+name = "ballista-spark-executor"
+description = "Ballista executor that can run Spark (Sail-planned) tasks"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+ballista-spark-python = { workspace = true }
+ballista-core = { workspace = true }
+ballista-executor = { workspace = true }
+ballista-spark-codec = { workspace = true }
+ballista-spark-session = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,367 @@
+use std::sync::Arc;
+
+use datafusion_common::{Column, JoinType, NullEquality};
+use datafusion_expr::utils::split_conjunction;
+use datafusion_expr::{
+    Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, build_join_schema, cast,
+};
+use sail_common::spec;
+use sail_python_udf::udf::pyspark_udf::PySparkUDF;
+
+use crate::error::{PlanError, PlanResult};
+use crate::function::common::{FunctionContextInput, ScalarFunctionInput};
+use crate::function::get_built_in_function;
+use crate::resolver::PlanResolver;
+use crate::resolver::expression::ansi_float_comparison_types;
+use crate::resolver::state::PlanResolverState;
+
+/// Returns `true` if the expression is itself a top-level Python scalar UDF call.
+/// This matches Spark SQL's `ExtractPythonUDFFromJoinCondition` optimizer rule
+/// (`org.apache.spark.sql.catalyst.optimizer.ExtractPythonUDFFromJoinCondition`),
+/// which only extracts conjuncts that ARE Python UDF calls, not ones that merely
+/// contain a UDF in a sub-expression.
+fn expr_is_python_udf(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarFunction(sf) => sf.func.inner().is::<PySparkUDF>(),
+        _ => false,
+    }
+}
+
+/// Returns a string representation of the join type suitable for error messages.
+fn join_type_name(join_type: JoinType) -> &'static str {
+    match join_type {
+        JoinType::Left => "LEFT OUTER",
+        JoinType::Right => "RIGHT OUTER",
+        JoinType::Full => "FULL OUTER",
+        JoinType::LeftSemi => "LEFT SEMI",
+        JoinType::LeftAnti => "LEFT ANTI",
+        JoinType::RightSemi => "RIGHT SEMI",
+        JoinType::RightAnti => "RIGHT ANTI",
+        JoinType::Inner => "INNER",
+        JoinType::LeftMark => "LEFT MARK",
+        JoinType::RightMark => "RIGHT MARK",
+    }
+}
+
+const IMPLICIT_CARTESIAN_PRODUCT_MSG: &str = "Detected implicit cartesian product for INNER join between logical plans. \
+    Join condition is missing or trivial. \
+    Either: use the CROSS JOIN syntax to allow cartesian products between \
+    these relations, or: enable implicit cartesian products by setting the \
+    configuration variable spark.sql.crossJoin.enabled=true;";
+
+impl PlanResolver<'_> {
+    pub(super) async fn resolve_query_join(
+        &self,
+        join: spec::Join,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let spec::Join {
+            left,
+            right,
+            join_type,
+            join_criteria,
+            join_data_type,
+        } = join;
+        let left = self
+            .resolve_query_plan_with_hidden_fields(*left, state)
+            .await?;
+        let right = self
+            .resolve_query_plan_with_hidden_fields(*right, state)
+            .await?;
+        let join_type = match join_type {
+            spec::JoinType::Inner => Some(JoinType::Inner),
+            spec::JoinType::LeftOuter => Some(JoinType::Left),
+            spec::JoinType::RightOuter => Some(JoinType::Right),
+            spec::JoinType::FullOuter => Some(JoinType::Full),
+            spec::JoinType::LeftSemi => Some(JoinType::LeftSemi),
+            spec::JoinType::RightSemi => Some(JoinType::RightSemi),
+            spec::JoinType::LeftAnti => Some(JoinType::LeftAnti),
+            spec::JoinType::RightAnti => Some(JoinType::RightAnti),
+            spec::JoinType::Cross => None,
+        };
+
+        match (join_type, join_criteria) {
+            (None, Some(_)) => Err(PlanError::invalid("cross join with join criteria")),
+            // An absent condition is TRUE, but still preserves the requested join type.
+            (Some(_), None) | (None, None) => {
+                if join_data_type.is_some() {
+                    return Err(PlanError::invalid("cross join with join data type"));
+                }
+                // When the join type is not an explicit cross join and no join criteria are given,
+                // we need to check whether implicit cartesian products are allowed.
+                if join_type.is_some() && !self.config.cross_join_enabled {
+                    return Err(PlanError::AnalysisError(
+                        IMPLICIT_CARTESIAN_PRODUCT_MSG.to_string(),
+                    ));
+                }
+                match join_type {
+                    None | Some(JoinType::Inner) => {
+                        Ok(LogicalPlanBuilder::from(left).cross_join(right)?.build()?)
+                    }
+                    Some(join_type) => Ok(LogicalPlanBuilder::from(left)
+                        .join_on(right, join_type, Some(datafusion_expr::lit(true)))?
+                        .build()?),
+                }
+            }
+            (Some(join_type), Some(spec::JoinCriteria::On(condition))) => {
+                // Use Inner to build the schema for resolving the ON condition,
+                // because the condition may reference columns from both sides.
+                // Semi/anti/mark joins restrict the output schema, but the ON
+                // condition still needs access to both sides.
+                let join_schema = Arc::new(build_join_schema(
+                    left.schema(),
+                    right.schema(),
+                    &JoinType::Inner,
+                )?);
+                // TODO: Like Spark, prefer a DataFrame column of a direct join child over
+                //   another instance of the DataFrame deeper in the other child.
+                let condition = self
+                    .resolve_expression(condition, &join_schema, state)
+                    .await?
+                    .unalias_nested()
+                    .data;
+
+                // Validate Python UDF usage in the join condition, matching
+                // Spark's ExtractPythonUDFFromJoinCondition optimizer rule.
+                let conjuncts = split_conjunction(&condition);
+                let (udf_conjuncts, other_conjuncts): (Vec<_>, Vec<_>) = conjuncts
+                    .into_iter()
+                    .partition(|expr| expr_is_python_udf(expr));
+                if !udf_conjuncts.is_empty() {
+                    match join_type {
+                        JoinType::Inner => {
+                            // In Spark, Python UDF conjuncts in an inner join are extracted into a
+                            // Filter on top of a cross join (using only the non-UDF conjuncts).
+                            // DataFusion can evaluate Python UDFs inside join conditions directly,
+                            // so we pass the full condition to `join_on` without extracting them.
+                            // We only need to reject the case where there are no non-UDF conjuncts
+                            // and implicit cross joins are disabled, because that would degrade to
+                            // a cartesian product.
+                            if other_conjuncts.is_empty() && !self.config.cross_join_enabled {
+                                return Err(PlanError::AnalysisError(
+                                    IMPLICIT_CARTESIAN_PRODUCT_MSG.to_string(),
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(PlanError::AnalysisError(format!(
+                                "Python UDF in the ON clause of a {} JOIN.",
+                                join_type_name(join_type)
+                            )));
+                        }
+                    }
+                }
+
+                let plan = LogicalPlanBuilder::from(left)
+                    .join_on(right, join_type, Some(condition))?
+                    .build()?;
+                Ok(plan)
+            }
+            (Some(join_type), Some(spec::JoinCriteria::Natural)) => {
+                let left_names = Self::get_field_names(left.schema(), state)?;
+                let right_names = Self::get_field_names(right.schema(), state)?;
+                let mut seen = std::collections::HashSet::new();
+                let using = left_names
+                    .iter()
+                    .filter(|name| {
+                        right_names
+                            .iter()
+                            .any(|right| self.merge_name_key(name) == self.merge_name_key(right))
+                    })
+                    .filter(|name| seen.insert(self.merge_name_key(name)))
+                    .map(|x| x.clone().into())
+                    .collect::<Vec<_>>();
+                // We let the column resolver return errors when either plan contains
+                // duplicated columns for the natural join key.
+                let join_columns =
+                    self.resolve_query_join_using_columns(&left, &right, using, state)?;
+                self.resolve_query_join_using(left, right, join_type, join_columns, state)
+            }
+            (Some(join_type), Some(spec::JoinCriteria::Using(using))) => {
+                let join_columns =
+                    self.resolve_query_join_using_columns(&left, &right, using, state)?;
+                self.resolve_query_join_using(left, right, join_type, join_columns, state)
+            }
+        }
+    }
+
+    fn resolve_query_join_using_columns(
+        &self,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        using: Vec<spec::Identifier>,
+        state: &PlanResolverState,
+    ) -> PlanResult<Vec<(String, (Column, Column))>> {
+        using
+            .into_iter()
+            .map(|name| {
+                // USING chooses the first matching output, even for duplicate names.
+                let resolve = |plan: &LogicalPlan| {
+                    self.resolve_column_candidates(plan.schema(), name.as_ref(), None, state)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            PlanError::analysis(format!("Cannot resolve USING column {name:?}"))
+                        })
+                };
+                let left_column = resolve(left)?;
+                let right_column = resolve(right)?;
+                Ok((name.into(), (left_column, right_column)))
+            })
+            .collect()
+    }
+
+    fn resolve_query_join_using(
+        &self,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        join_type: JoinType,
+        join_columns: Vec<(String, (Column, Column))>,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let (left_columns, right_columns) = join_columns
+            .iter()
+            .map(|(_, (left, right))| (left.clone(), right.clone()))
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+
+        let builder = LogicalPlanBuilder::from(left).join_detailed(
+            right,
+            join_type,
+            (left_columns.clone(), right_columns.clone()),
+            None,
+            NullEquality::NullEqualsNothing,
+        )?;
+        let mut plan = builder.build()?;
+        if self.config.ansi_mode
+            && let LogicalPlan::Join(join) = &mut plan
+        {
+            // USING/NATURAL keys bypass expression resolution, but need the same precision as ON.
+            for (left, right) in &mut join.on {
+                let types = [
+                    left.get_type(join.left.schema())?,
+                    right.get_type(join.right.schema())?,
+                ];
+                if let Some(targets) =
+                    ansi_float_comparison_types(&types, self.config.case_sensitive)
+                {
+                    if types[0] != targets[0] {
+                        *left = cast(left.clone(), targets[0].clone());
+                    }
+                    if types[1] != targets[1] {
+                        *right = cast(right.clone(), targets[1].clone());
+                    }
+                }
+            }
+        }
+        let builder = LogicalPlanBuilder::from(plan);
+        // Re-register join key columns as hidden fields so that subsequent
+        // attribute resolution (by plan_id) can still find them.
+        // TODO: Spark keeps the left key (the right key for right joins) as the visible
+        //   key attribute, which DataFrame columns prefer over hidden keys, and it keeps
+        //   hidden keys available to later joins.
+        let hidden_columns = builder
+            .schema()
+            .columns()
+            .into_iter()
+            .map(|col| {
+                if left_columns.iter().chain(&right_columns).any(|x| {
+                    state
+                        .get_field_info(&x.name)
+                        .ok()
+                        .zip(state.get_field_info(&col.name).ok())
+                        .is_some_and(|(key, candidate)| key.origin() == candidate.origin())
+                }) {
+                    let info = state.get_field_info(col.name())?.clone();
+                    let field_id = state.register_hidden_field_name(info.name());
+                    for plan_id in info.plan_ids() {
+                        state.register_plan_id_for_field(&field_id, plan_id)?;
+                    }
+                    Ok(Expr::Column(col.clone()).alias_qualified(col.relation, field_id))
+                } else {
+                    Ok(Expr::Column(col))
+                }
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        let builder = match join_type {
+            JoinType::Inner | JoinType::Left | JoinType::Right => {
+                let uses_right = matches!(join_type, JoinType::Right);
+                let projections = join_columns
+                    .into_iter()
+                    .map(|(name, (left, right))| {
+                        let column = if uses_right { right } else { left };
+                        Ok(Expr::Column(column.clone())
+                            .alias(state.register_identity_field(name, column.name())?))
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?
+                    .into_iter()
+                    .chain(hidden_columns);
+                builder.project(projections)?
+            }
+            JoinType::Full => {
+                let join_schema = builder.schema().clone();
+                let coalesce_function = get_built_in_function("coalesce")?;
+                let projections = join_columns
+                    .into_iter()
+                    .map(|(name, (left, right))| {
+                        let mut arguments = vec![Expr::Column(left), Expr::Column(right)];
+                        if self.config.ansi_mode {
+                            let types = arguments
+                                .iter()
+                                .map(|arg| arg.get_type(&join_schema))
+                                .collect::<datafusion_common::Result<Vec<_>>>()?;
+                            if let Some(targets) =
+                                ansi_float_comparison_types(&types, self.config.case_sensitive)
+                            {
+                                // The visible FULL-join key must retain the comparison's precision.
+                                arguments = arguments
+                                    .into_iter()
+                                    .zip(types)
+                                    .zip(targets)
+                                    .map(
+                                        |((arg, from), to)| {
+                                            if from == to { arg } else { cast(arg, to) }
+                                        },
+                                    )
+                                    .collect();
+                            }
+                        }
+                        let expression = coalesce_function(ScalarFunctionInput {
+                            arguments,
+                            function_context: FunctionContextInput {
+                                argument_display_names: &[],
+                                plan_config: &self.config,
+                                session_context: self.ctx,
+                                schema: &join_schema,
+                            },
+                        })?;
+                        Ok(expression.alias(state.register_field_name(name)))
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?;
+                builder.project(projections.into_iter().chain(hidden_columns))?
+            }
+            JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+            | JoinType::LeftMark
+            | JoinType::RightMark => {
+                let uses_right = matches!(
+                    join_type,
+                    JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+                );
+                let projections = join_columns
+                    .into_iter()
+                    .map(|(name, (left, right))| {
+                        let col = if uses_right { right } else { left };
+                        Ok(Expr::Column(col.clone())
+                            .alias(state.register_identity_field(name, col.name())?))
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?
+                    .into_iter()
+                    .chain(hidden_columns);
+                builder.project(projections)?
+            }
+        };
+        Ok(builder.build()?)
+    }
+}

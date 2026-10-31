@@ -1,0 +1,52 @@
+# Code copied from LakeSail Sail
+
+The `crates/sail-*` crates in this workspace are copied from
+[LakeSail Sail](https://github.com/lakehq/sail), licensed under the Apache
+License 2.0 (see `LICENSE-SAIL`). They provide the Spark-facing half of Spark
+support for Ballista: the Spark Connect protocol, the Spark SQL parser and
+analyzer, plan resolution, Spark functions, catalogs, Delta Lake and Iceberg,
+and PySpark UDFs. Ballista's own crates (`../ballista/*`) execute the plans.
+
+- **Source:** `https://github.com/lakehq/sail`, commit
+  `35d4d2f2d58890567c2a7b56372b12c9a4092c57` (2026-10-31, version 0.7.3)
+- **Copied:** the 34 crates needed by `sail-spark-connect` and
+  `sail-execution` (the plan codec), unmodified except as listed below.
+- **Not copied:** `sail-cli`, `sail-flight`, `sail-gold-test`, `sail-mimalloc`,
+  `sail-python`.
+- `Cargo.lock` started from Sail's lockfile at the same commit, so the copied
+  code builds against the dependency versions it was tested with.
+
+## Local modifications
+
+Every change to copied code is listed here. Keep this list current; it is what
+has to be re-applied when updating from upstream.
+
+| File | Change | Why |
+|---|---|---|
+| `sail-execution/src/lib.rs` | Re-export `RemoteExecutionCodec` | Ballista's scheduler and executors decode Spark plans with it (through `ballista-spark-codec`) |
+| `sail-execution/src/lib.rs`, `job_graph/mod.rs`, `job_graph/planner.rs` | Make `is_driver_stage_plan` public and re-export it | `ballista-spark-runner` keeps driver-only operators (catalog commands, commits, ...) in the Spark Connect server, using Sail's own list |
+| `sail-session/src/session_factory/job_runner.rs` | Public `SessionJobRunner::new(Box<dyn JobRunner>)` | Lets a Ballista job runner be plugged in |
+| `sail-session/src/session_manager/mod.rs` | `create_session_manager_with_job_runner_factory`; `create_session_manager` delegates to it | Same |
+| `sail-spark-connect/src/session_manager.rs` | `create_spark_session_manager_with_factories` | Same |
+| `sail-spark-connect/src/entrypoint.rs` | `serve_with_factories`; shared `serve_session_manager` used by both serve functions | Same |
+| `sail-common-datafusion/src/error.rs` | Handle `DataFusionError::SQL` | Ballista enables DataFusion's `sql` feature, which adds this variant |
+| `sail-plan/src/resolver/expression/wildcard.rs` | Build wildcard options with `sqlparser` AST types | Under the `sql` feature DataFusion uses `sqlparser` types instead of `datafusion_expr::sql`; the rename/replace items are display-only (DataFusion evaluates `planned_expressions`), so results are unchanged |
+
+Workspace-level: `Cargo.toml` is derived from Sail's root manifest (same
+dependency versions, lints and release profile) with an explicit member list,
+the Ballista integration crates, DataFusion's `sql` feature declared, and a
+`dev-opt` profile for local builds.
+
+## Known gaps (not yet handled)
+
+- `ExplicitRepartitionExec` with round-robin partitioning (Spark
+  `df.repartition(n)`) is not rewritten to a standard operator by Sail's
+  optimizer; Ballista does not treat it as a shuffle boundary.
+- Executors use Ballista's default runtime environment, so object stores
+  configured through Sail settings (S3, GCS, Azure, HDFS) are not yet
+  registered on executors.
+- `BallistaJobRunner::stop` does not cancel running jobs.
+- DDL such as `DROP VIEW` returns one row `value: true`; Spark returns an
+  empty result with no columns.
+- Spark plans are submitted as physical plans, which Ballista's scheduler
+  currently runs without AQE (roadmap step 03).

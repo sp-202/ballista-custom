@@ -1,0 +1,1513 @@
+use std::sync::Arc;
+
+use datafusion::functions_aggregate::{average, bit_and_or_xor, bool_and_or, count, min_max, sum};
+use datafusion_common::arrow::datatypes::DataType;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
+use datafusion_common::{
+    Column, DFSchemaRef, DataFusionError, Result as DataFusionResult, ScalarValue,
+};
+use datafusion_expr::expr_rewriter::normalize_col;
+use datafusion_expr::logical_plan::{FetchType, SkipType};
+use datafusion_expr::utils::find_aggregate_exprs;
+use datafusion_expr::{
+    Aggregate, AggregateUDF, Expr, ExprSchemable, Extension, LogicalPlan, LogicalPlanBuilder,
+    Projection, SortExpr, Volatility, bitwise_and, bitwise_shift_right, cast,
+};
+use datafusion_spark::function::aggregate::try_sum::SparkTrySum;
+use sail_common::spec;
+use sail_common_datafusion::input_file::is_input_file_metadata_function;
+use sail_common_datafusion::utils::items::ItemTaker;
+use sail_function::aggregate::try_avg::TryAvgFunction;
+use sail_function::scalar::explode::Explode;
+use sail_function::scalar::misc::monotonically_increasing_id::SparkMonotonicallyIncreasingId;
+use sail_function::scalar::misc::scalar_subquery_result::ScalarSubqueryResult;
+use sail_function::scalar::misc::spark_partition_id::SparkPartitionId;
+use sail_logical_plan::monotonic_id::MonotonicIdNode;
+use sail_logical_plan::sort::{RequiredSortNode, SortWithinPartitionsNode};
+use sail_logical_plan::spark_partition_id::SparkPartitionIdNode;
+use sail_python_udf::get_udf_display_name;
+use sail_python_udf::udf::pyspark_udaf::PySparkGroupAggregateUDF;
+
+use crate::error::{PlanError, PlanResult};
+use crate::resolver::PlanResolver;
+use crate::resolver::expression::NamedExpr;
+use crate::resolver::state::{AggregateState, PlanResolverState};
+use crate::resolver::tree::exists::ExistsRewriter;
+use crate::resolver::tree::explode::ExplodeRewriter;
+use crate::resolver::tree::monotonic_id::MonotonicIdRewriter;
+use crate::resolver::tree::spark_partition_id::SparkPartitionIdRewriter;
+
+/// Projections resolved by index, with typed columns for lateral dependencies.
+/// A `None` marks a projection deferred until grouping is materialized.
+struct ResolvedProjections {
+    expressions: Vec<Option<NamedExpr>>,
+    deferred: Vec<(usize, spec::Expr)>,
+    lateral_columns: Vec<Column>,
+    schema: DFSchemaRef,
+}
+
+struct AggregateProjections {
+    expressions: Vec<NamedExpr>,
+    lateral_columns: Vec<Column>,
+}
+
+/// A map from a grouping expression to the column that materializes it.
+type GroupingReplacements = Vec<(Expr, Expr)>;
+
+/// Returns the name of a volatile (non-deterministic) scalar expression found
+/// in an aggregate context. Catches two Spark CheckAnalysis violations:
+/// 1. Volatile scalar UDF used directly in aggregate projections (outside any aggregate fn)
+/// 2. Volatile scalar UDF nested inside aggregate function arguments
+fn find_volatile_in_aggregate_context(expr: &Expr) -> Option<String> {
+    let mut found_name: Option<String> = None;
+    let _ = expr.apply(|e| {
+        if let Expr::ScalarFunction(f) = e
+            && f.func.signature().volatility == Volatility::Volatile
+            && f.func.as_async().is_none()
+            // This internal assertion is evaluation-sensitive, but does not
+            // make the scalar subquery's value non-deterministic.
+            && !f.func.inner().is::<ScalarSubqueryResult>()
+        {
+            found_name = Some(f.func.name().to_string());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found_name
+}
+
+impl PlanResolver<'_> {
+    pub(super) async fn resolve_query_aggregate(
+        &self,
+        aggregate: spec::Aggregate,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let spec::Aggregate {
+            input,
+            grouping,
+            aggregate: projections,
+            having,
+            with_grouping_expressions,
+        } = aggregate;
+
+        let input = self
+            .resolve_query_plan_with_hidden_fields(*input, state)
+            .await?;
+        let schema = input.schema();
+
+        // Resolve the projections, deferring any that reference a grouping output
+        // until the grouping is materialized below.
+        let ResolvedProjections {
+            expressions: resolved_projections,
+            deferred: deferred_projections,
+            lateral_columns,
+            schema: lateral_schema,
+        } = self
+            .resolve_projections_deferring(&projections, &input, state)
+            .await?;
+
+        let infer_grouping = match grouping.as_slice() {
+            [spec::Expr::UnresolvedAttribute { name, .. }]
+                if name.parts().len() == 1
+                    && name.parts()[0].as_ref().eq_ignore_ascii_case("all") =>
+            {
+                let name = name.parts()[0].as_ref();
+                let has_alias = self.config.group_by_aliases
+                    && resolved_projections.iter().flatten().any(|projection| {
+                        matches!(projection.name.as_slice(), [alias]
+                            if self.merge_name_key(alias) == self.merge_name_key(name))
+                    });
+                !has_alias
+                    && self
+                        .resolve_column_candidates(schema, name, None, state)
+                        .is_empty()
+            }
+            _ => false,
+        };
+        let grouping = if infer_grouping {
+            let expanded = resolved_projections.iter().flatten().cloned().collect();
+            let expanded = if lateral_columns.is_empty() {
+                self.rewrite_wildcard(input.clone(), expanded, state)?.1
+            } else {
+                expanded
+            };
+            let mut aggregate_aliases = std::collections::HashSet::new();
+            expanded
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, named)| {
+                    let aggregate = !find_aggregate_exprs(std::slice::from_ref(&named.expr))
+                        .is_empty()
+                        || named
+                            .expr
+                            .column_refs()
+                            .iter()
+                            .any(|column| aggregate_aliases.contains(*column));
+                    if aggregate {
+                        if let Some(column) = lateral_columns.get(index) {
+                            aggregate_aliases.insert(column.clone());
+                        }
+                        None
+                    } else {
+                        Some(named)
+                    }
+                })
+                .collect()
+        } else {
+            let projections = resolved_projections.iter().flatten().cloned().collect();
+            let mut scope = state.enter_aggregate_scope(AggregateState::Grouping { projections });
+            let state = scope.state();
+            self.resolve_named_expressions(grouping, &lateral_schema, state)
+                .await?
+        };
+
+        // Expand a generator (e.g. window's `explode`) in the grouping into a named
+        // column; a no-op for ordinary aggregates.
+        let (input, grouping, generator_replacements) =
+            self.expand_grouping_generators(input, grouping, state)?;
+        let schema = input.schema();
+
+        // Resolve the deferred projections (grouping columns are now in scope) and
+        // inline any re-used generator expressions.
+        let projections = self
+            .finish_projections(
+                resolved_projections,
+                deferred_projections,
+                &generator_replacements,
+                schema,
+                state,
+            )
+            .await?;
+
+        let (input, projections) = if lateral_columns.is_empty() {
+            self.rewrite_wildcard(input, projections, state)?
+        } else {
+            (input, projections)
+        };
+        let grouping = if infer_grouping {
+            grouping
+        } else {
+            self.resolve_grouping_positions(grouping, &projections)?
+        };
+        let (input, projections, grouping, lateral_replacements) =
+            self.prepare_lateral_grouping(input, projections, grouping, &lateral_columns, state)?;
+        let (input, projections, grouping) =
+            self.prepare_aggregate_input(input, projections, grouping, state)?;
+        let schema = input.schema();
+
+        // Spark CheckAnalysis: GroupedAgg Pandas/Arrow UDFs cannot be mixed with regular
+        // (non-UDF) aggregate functions in the same .agg() call.
+        Self::check_no_mixed_grouped_agg_udf(&projections)?;
+
+        let having = {
+            let mut having_schema = schema.as_ref().clone();
+            having_schema.merge(&lateral_schema);
+            let having_schema = Arc::new(having_schema);
+            let mut scope = state.enter_aggregate_scope(AggregateState::Having {
+                projections: projections.clone(),
+                grouping: grouping.clone(),
+            });
+            let state = scope.state();
+            match having {
+                Some(having) => Some(Self::replace_grouping_expressions(
+                    Self::replace_grouping_expressions(
+                        self.resolve_expression(having, &having_schema, state)
+                            .await?,
+                        &lateral_replacements,
+                    )?,
+                    &generator_replacements,
+                )?),
+                None => None,
+            }
+        };
+
+        let (input, replacements) =
+            Self::materialize_grouping_input_file_metadata(input, &grouping, state)?;
+        let rewrite = |named: NamedExpr| -> PlanResult<NamedExpr> {
+            Ok(NamedExpr {
+                expr: Self::replace_grouping_expressions(named.expr, &replacements)?,
+                ..named
+            })
+        };
+        let grouping = grouping
+            .into_iter()
+            .map(rewrite)
+            .collect::<PlanResult<_>>()?;
+        let projections = projections
+            .into_iter()
+            .map(rewrite)
+            .collect::<PlanResult<Vec<_>>>()?;
+        let having = having
+            .map(|expr| Self::replace_grouping_expressions(expr, &replacements))
+            .transpose()?;
+
+        // Grouping keys now reference input columns; other volatile calls remain invalid.
+        for proj in &projections {
+            if let Some(name) = find_volatile_in_aggregate_context(&proj.expr) {
+                return Err(PlanError::AnalysisError(format!(
+                    "Non-deterministic expression {name} should not appear in an aggregate query",
+                )));
+            }
+        }
+
+        self.rewrite_prepared_aggregate(
+            input,
+            AggregateProjections {
+                expressions: projections,
+                lateral_columns,
+            },
+            grouping,
+            having,
+            with_grouping_expressions,
+            state,
+        )
+    }
+
+    fn resolve_grouping_positions(
+        &self,
+        exprs: Vec<NamedExpr>,
+        projections: &[NamedExpr],
+    ) -> PlanResult<Vec<NamedExpr>> {
+        if !self.config.group_by_ordinal {
+            return Ok(exprs);
+        }
+        let num_projections = projections.len() as i64;
+        exprs
+            .into_iter()
+            .map(|named_expr| {
+                let NamedExpr { expr, .. } = &named_expr;
+                match expr {
+                    Expr::Literal(scalar_value, _metadata) => {
+                        let position = match scalar_value {
+                            ScalarValue::Int32(Some(position)) => *position as i64,
+                            ScalarValue::Int64(Some(position)) => *position,
+                            _ => return Ok(named_expr),
+                        };
+                        if position > 0_i64 && position <= num_projections {
+                            Ok(projections[(position - 1) as usize].clone())
+                        } else {
+                            Err(PlanError::invalid(format!(
+                                "Cannot resolve column position {position}. Valid positions are 1 to {num_projections}."
+                            )))
+                        }
+                    }
+                    _ => Ok(named_expr),
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn rewrite_aggregate(
+        &self,
+        input: LogicalPlan,
+        projections: Vec<NamedExpr>,
+        grouping: Vec<NamedExpr>,
+        having: Option<Expr>,
+        with_grouping_expressions: bool,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let grouping = self.resolve_grouping_positions(grouping, &projections)?;
+        let (input, projections, grouping) =
+            self.prepare_aggregate_input(input, projections, grouping, state)?;
+        self.rewrite_prepared_aggregate(
+            input,
+            AggregateProjections {
+                expressions: projections,
+                lateral_columns: vec![],
+            },
+            grouping,
+            having,
+            with_grouping_expressions,
+            state,
+        )
+    }
+
+    /// Materialize aliases needed by grouping keys on the input, keeping their
+    /// dependency graph as columns instead of recursively expanding expressions.
+    fn prepare_lateral_grouping(
+        &self,
+        input: LogicalPlan,
+        projections: Vec<NamedExpr>,
+        grouping: Vec<NamedExpr>,
+        columns: &[Column],
+        state: &mut PlanResolverState,
+    ) -> PlanResult<(
+        LogicalPlan,
+        Vec<NamedExpr>,
+        Vec<NamedExpr>,
+        GroupingReplacements,
+    )> {
+        let mut required = grouping
+            .iter()
+            .flat_map(|named| named.expr.column_refs().into_iter().cloned())
+            .collect::<std::collections::HashSet<_>>();
+        for (column, named) in columns.iter().zip(&projections).rev() {
+            if required.contains(column) {
+                required.extend(named.expr.column_refs().into_iter().cloned());
+            }
+        }
+        let mut expressions = vec![];
+        let mut fields = vec![];
+        let mut replacements = vec![];
+        for (column, named) in columns.iter().zip(&projections) {
+            if !required.contains(column) {
+                continue;
+            }
+            if !find_aggregate_exprs(std::slice::from_ref(&named.expr)).is_empty() {
+                return Err(PlanError::analysis(
+                    "aggregate functions are not allowed in GROUP BY",
+                ));
+            }
+            let value = Expr::Column(column.clone());
+            replacements.push((named.expr.clone(), value.clone()));
+            replacements.push((named.expr.clone().unalias(), value));
+            expressions.push(named.clone());
+            fields.push(column.clone());
+        }
+        if expressions.is_empty() {
+            return Ok((input, projections, grouping, vec![]));
+        }
+        let (input, _) = self.materialize_lateral_expressions(input, expressions, fields, state)?;
+        let replace = |named: NamedExpr| -> PlanResult<NamedExpr> {
+            Ok(NamedExpr {
+                expr: Self::replace_grouping_expressions(named.expr, &replacements)?,
+                ..named
+            })
+        };
+        let original_grouping = grouping;
+        let grouping = original_grouping
+            .iter()
+            .cloned()
+            .map(replace)
+            .collect::<PlanResult<Vec<_>>>()?;
+        // Only replace actual grouping keys in the output. Intermediate aliases
+        // still need to be computed from grouped values above the aggregate.
+        let replacements = original_grouping
+            .iter()
+            .zip(&grouping)
+            .flat_map(|(original, grouped)| {
+                [
+                    (original.expr.clone(), grouped.expr.clone()),
+                    (
+                        original.expr.clone().unalias(),
+                        grouped.expr.clone().unalias(),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let projections = projections
+            .into_iter()
+            .map(|named| {
+                Ok(NamedExpr {
+                    expr: Self::replace_grouping_expressions(named.expr, &replacements)?,
+                    ..named
+                })
+            })
+            .collect::<PlanResult<_>>()?;
+        Ok((input, projections, grouping, replacements))
+    }
+
+    fn prepare_aggregate_input(
+        &self,
+        input: LogicalPlan,
+        projections: Vec<NamedExpr>,
+        grouping: Vec<NamedExpr>,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<(LogicalPlan, Vec<NamedExpr>, Vec<NamedExpr>)> {
+        // Spark materializes non-deterministic grouping keys before CheckAnalysis,
+        // and reuses those values wherever the grouping expressions occur.
+        let mut partition_expressions = vec![];
+        for group in &grouping {
+            group.expr.apply(|expr| {
+                if let Expr::ScalarFunction(function) = expr
+                    && (function.func.inner().is::<SparkMonotonicallyIncreasingId>()
+                        || function.func.inner().is::<SparkPartitionId>())
+                    && !partition_expressions.contains(expr)
+                {
+                    partition_expressions.push(expr.clone());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        let (input, columns) =
+            self.rewrite_partition_expressions(input, partition_expressions.clone(), state)?;
+        let replacements = partition_expressions
+            .into_iter()
+            .zip(columns.into_iter().map(Expr::unalias))
+            .collect::<Vec<_>>();
+        let replace = |named: NamedExpr| -> PlanResult<NamedExpr> {
+            Ok(NamedExpr {
+                expr: Self::replace_grouping_expressions(named.expr, &replacements)?,
+                ..named
+            })
+        };
+        let grouping = grouping
+            .into_iter()
+            .map(replace)
+            .collect::<PlanResult<Vec<_>>>()?;
+        let projections = projections
+            .into_iter()
+            .map(replace)
+            .collect::<PlanResult<Vec<_>>>()?;
+        Ok((input, projections, grouping))
+    }
+
+    fn rewrite_prepared_aggregate(
+        &self,
+        input: LogicalPlan,
+        projections: AggregateProjections,
+        grouping: Vec<NamedExpr>,
+        having: Option<Expr>,
+        with_grouping_expressions: bool,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        let AggregateProjections {
+            expressions: projections,
+            mut lateral_columns,
+        } = projections;
+        let group_exprs = grouping.iter().map(|x| x.expr.clone()).collect::<Vec<_>>();
+        let has_grouping_set = Self::has_grouping_set(&group_exprs);
+        let grouping_exprs = Self::distinct_grouping_expressions_from_exprs(&group_exprs);
+        let duplicate_sets = has_grouping_set
+            && Self::correlation_keeps_grouping(&input, &group_exprs)?
+            && !having
+                .as_ref()
+                .is_some_and(Self::compares_grouping_with_outer)
+            && !projections
+                .iter()
+                .any(|x| Self::compares_grouping_with_outer(&x.expr))
+            && Self::has_duplicate_grouping_sets(&group_exprs)?;
+        let projections = projections
+            .into_iter()
+            .map(|x| {
+                Self::rewrite_grouping_functions(
+                    x,
+                    &grouping_exprs,
+                    has_grouping_set,
+                    duplicate_sets,
+                )
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        let having = having
+            .map(|having| {
+                Self::rewrite_grouping_expr(
+                    having,
+                    &grouping_exprs,
+                    has_grouping_set,
+                    duplicate_sets,
+                )
+            })
+            .transpose()?;
+        let mut aggregate_candidates = projections
+            .iter()
+            .map(|x| x.expr.clone())
+            .collect::<Vec<_>>();
+        if let Some(having) = having.as_ref() {
+            aggregate_candidates.push(having.clone());
+        }
+        let aggregate_exprs = find_aggregate_exprs(&aggregate_candidates);
+        let plan = LogicalPlanBuilder::from(input)
+            .aggregate(group_exprs, aggregate_exprs.clone())?
+            .build()?;
+        let (grouping_exprs, aggregate_or_grouping_exprs) = {
+            let mut grouping_exprs = vec![];
+            let mut aggregate_or_grouping_exprs = aggregate_exprs;
+            for expr in grouping {
+                let NamedExpr {
+                    name,
+                    expr,
+                    metadata,
+                } = expr;
+                let exprs = match expr {
+                    Expr::GroupingSet(g) => g.distinct_expr().into_iter().cloned().collect(),
+                    expr => vec![expr],
+                };
+                if name.len() != exprs.len() {
+                    return Err(PlanError::internal(format!(
+                        "group-by name count does not match expression count: {name:?} {exprs:?}",
+                    )));
+                }
+                grouping_exprs.extend(exprs.iter().zip(name).map(|(expr, name)| NamedExpr {
+                    name: vec![name],
+                    expr: expr.clone(),
+                    metadata: metadata.clone(),
+                }));
+                aggregate_or_grouping_exprs.extend(exprs);
+            }
+            (grouping_exprs, aggregate_or_grouping_exprs)
+        };
+        let projections = if with_grouping_expressions {
+            if !lateral_columns.is_empty() {
+                let mut columns = grouping_exprs
+                    .iter()
+                    .map(|_| Column::new_unqualified(state.register_field_name("")))
+                    .collect::<Vec<_>>();
+                columns.extend(lateral_columns);
+                lateral_columns = columns;
+            }
+            grouping_exprs.into_iter().chain(projections).collect()
+        } else {
+            projections
+        };
+        let projections = projections
+            .into_iter()
+            .map(|x| {
+                let NamedExpr {
+                    name,
+                    expr,
+                    metadata,
+                } = x;
+                let expr = Self::rebase_expression(expr, &aggregate_or_grouping_exprs, &plan)?;
+                Ok(NamedExpr {
+                    name,
+                    expr,
+                    metadata,
+                })
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        let (plan, projections) = if lateral_columns.is_empty() {
+            (plan, projections)
+        } else {
+            self.materialize_lateral_expressions(plan, projections, lateral_columns, state)?
+        };
+        let plan = match having {
+            Some(having) => {
+                let (plan, having) =
+                    self.rewrite_partition_expressions(plan, vec![having], state)?;
+                let having =
+                    Self::rebase_expression(having.one()?, &aggregate_or_grouping_exprs, &plan)?;
+                LogicalPlanBuilder::from(plan).having(having)?.build()?
+            }
+            None => plan,
+        };
+        let (plan, projections) =
+            self.rewrite_projection::<MonotonicIdRewriter>(plan, projections, state)?;
+        let (plan, projections) =
+            self.rewrite_projection::<SparkPartitionIdRewriter>(plan, projections, state)?;
+        let (plan, projections) =
+            self.rewrite_projection::<ExplodeRewriter>(plan, projections, state)?;
+        let (plan, projections) = self.rewrite_window_projection(plan, projections, state)?;
+        let (plan, projections) =
+            self.rewrite_projection::<ExistsRewriter>(plan, projections, state)?;
+        let projections = projections
+            .into_iter()
+            .map(|x| {
+                let NamedExpr {
+                    name,
+                    expr,
+                    metadata: _,
+                } = x;
+                Ok(expr.alias(state.register_field_name(name.one()?)))
+            })
+            .collect::<PlanResult<Vec<_>>>()?;
+        Ok(LogicalPlanBuilder::from(plan)
+            .project(projections)?
+            .build()?)
+    }
+
+    pub(crate) fn input_sort_ordering(input: &LogicalPlan) -> Option<Vec<SortExpr>> {
+        Self::find_input_sort_ordering(input)?
+            .into_iter()
+            .map(|sort| {
+                Some(SortExpr {
+                    expr: normalize_col(sort.expr, input).ok()?,
+                    asc: sort.asc,
+                    nulls_first: sort.nulls_first,
+                })
+            })
+            .collect()
+    }
+
+    pub(in crate::resolver) fn find_input_sort_ordering(
+        input: &LogicalPlan,
+    ) -> Option<Vec<SortExpr>> {
+        match input {
+            LogicalPlan::Sort(sort) => Some(sort.expr.clone()),
+            LogicalPlan::SubqueryAlias(alias) => {
+                let ordering = Self::find_input_sort_ordering(alias.input.as_ref())?;
+                ordering
+                    .into_iter()
+                    .map(|sort| {
+                        let expr = sort
+                            .expr
+                            .transform(|expr| match expr {
+                                Expr::Column(mut column) => {
+                                    column.relation = Some(alias.alias.clone());
+                                    Ok(Transformed::yes(Expr::Column(column)))
+                                }
+                                expr => Ok(Transformed::no(expr)),
+                            })
+                            .data()
+                            .ok()?;
+                        Some(SortExpr { expr, ..sort })
+                    })
+                    .collect()
+            }
+            LogicalPlan::Filter(filter) => Self::find_input_sort_ordering(filter.input.as_ref()),
+            LogicalPlan::Limit(limit) => Self::find_input_sort_ordering(limit.input.as_ref()),
+            LogicalPlan::Projection(projection) => {
+                let ordering = Self::find_input_sort_ordering(projection.input.as_ref())?;
+                ordering
+                    .into_iter()
+                    .map(|sort| {
+                        let expr = Self::remap_through_projection(sort.expr, projection)?;
+                        Some(SortExpr { expr, ..sort })
+                    })
+                    .collect()
+            }
+            LogicalPlan::Window(window) => {
+                let [Expr::WindowFunction(function)] = window.window_expr.as_slice() else {
+                    return None;
+                };
+                let mut required = function
+                    .params
+                    .partition_by
+                    .iter()
+                    .cloned()
+                    .map(|expr| SortExpr {
+                        expr,
+                        asc: true,
+                        nulls_first: true,
+                    })
+                    .collect::<Vec<_>>();
+                required.extend(function.params.order_by.clone());
+
+                let child = Self::find_input_sort_ordering(window.input.as_ref());
+                if required.is_empty() {
+                    child
+                } else {
+                    match child {
+                        Some(child) if child.starts_with(&required) => Some(child),
+                        _ => Some(required),
+                    }
+                }
+            }
+            LogicalPlan::Unnest(unnest) => {
+                let ordering = Self::find_input_sort_ordering(unnest.input.as_ref())?;
+                let references_unnested_column = ordering.iter().any(|sort| {
+                    sort.expr.column_refs().iter().any(|column| {
+                        unnest
+                            .input
+                            .schema()
+                            .maybe_index_of_column(column)
+                            .is_none_or(|index| {
+                                unnest
+                                    .list_type_columns
+                                    .iter()
+                                    .any(|(unnested, _)| *unnested == index)
+                                    || unnest.struct_type_columns.contains(&index)
+                            })
+                    })
+                });
+                (!references_unnested_column).then_some(ordering)
+            }
+            LogicalPlan::Extension(extension) => {
+                let node = extension.node.as_any();
+                if let Some(sort) = node.downcast_ref::<RequiredSortNode>() {
+                    Some(sort.sort_expr().to_vec())
+                } else if let Some(sort) = node.downcast_ref::<SortWithinPartitionsNode>() {
+                    Some(sort.sort_expr().to_vec())
+                } else if let Some(node) = node.downcast_ref::<MonotonicIdNode>() {
+                    Self::find_input_sort_ordering(node.input().as_ref())
+                } else if let Some(node) = node.downcast_ref::<SparkPartitionIdNode>() {
+                    Self::find_input_sort_ordering(node.input().as_ref())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn remap_through_projection(expr: Expr, projection: &Projection) -> Option<Expr> {
+        let rewritten = expr
+            .transform_down(|expr| {
+                match projection
+                    .expr
+                    .iter()
+                    .position(|projection| projection.clone().unalias() == expr)
+                {
+                    Some(index) => {
+                        let (qualifier, field) = projection.schema.qualified_field(index);
+                        Ok(Transformed::new(
+                            Expr::from(Column::from((qualifier, field))),
+                            true,
+                            TreeNodeRecursion::Jump,
+                        ))
+                    }
+                    None => Ok(Transformed::no(expr)),
+                }
+            })
+            .data()
+            .ok()?;
+        let mut derivable = true;
+        let _ = rewritten.apply(|expr| {
+            if let Expr::Column(column) = expr
+                && projection
+                    .schema
+                    .qualified_field_from_column(column)
+                    .is_err()
+            {
+                derivable = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        derivable.then_some(rewritten)
+    }
+
+    pub(crate) fn is_order_irrelevant_udaf(
+        udf: &AggregateUDF,
+        args: &[Expr],
+        schema: &DFSchemaRef,
+    ) -> PlanResult<bool> {
+        if udf == min_max::min_udaf().as_ref()
+            || udf == min_max::max_udaf().as_ref()
+            || udf == count::count_udaf().as_ref()
+            || udf == bit_and_or_xor::bit_and_udaf().as_ref()
+            || udf == bit_and_or_xor::bit_or_udaf().as_ref()
+            || udf == bit_and_or_xor::bit_xor_udaf().as_ref()
+            || udf == bool_and_or::bool_and_udaf().as_ref()
+            || udf == bool_and_or::bool_or_udaf().as_ref()
+        {
+            return Ok(true);
+        }
+
+        if udf == sum::sum_udaf().as_ref()
+            || udf == average::avg_udaf().as_ref()
+            || udf.inner().is::<SparkTrySum>()
+            || udf.inner().is::<TryAvgFunction>()
+        {
+            let Some(arg) = args.first() else {
+                return Ok(false);
+            };
+            return Ok(!matches!(
+                arg.get_type(schema.as_ref())?,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ));
+        }
+
+        Ok(false)
+    }
+
+    fn requires_input_order(
+        aggregates: &[Expr],
+        schema: &DFSchemaRef,
+        has_grouping: bool,
+    ) -> PlanResult<bool> {
+        for aggregate in aggregates {
+            let Expr::AggregateFunction(function) = aggregate else {
+                return Ok(true);
+            };
+            let udf = function.func.as_ref();
+            if !has_grouping
+                && (udf == sum::sum_udaf().as_ref() || udf == average::avg_udaf().as_ref())
+            {
+                continue;
+            }
+            if !Self::is_order_irrelevant_udaf(udf, &function.params.args, schema)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn preserve_order_sensitive_aggregate_sorts(
+        plan: LogicalPlan,
+    ) -> PlanResult<LogicalPlan> {
+        Ok(plan
+            .transform_up_with_subqueries(|plan| {
+                let LogicalPlan::Aggregate(mut aggregate) = plan else {
+                    return Ok(Transformed::no(plan));
+                };
+                let aggregate_exprs = find_aggregate_exprs(&aggregate.aggr_expr);
+                if !Self::requires_input_order(
+                    &aggregate_exprs,
+                    aggregate.input.schema(),
+                    !aggregate.group_expr.is_empty(),
+                )
+                .map_err(|error| DataFusionError::External(Box::new(error)))?
+                {
+                    return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate)));
+                }
+
+                let (input, found, _) = Self::require_input_sort_inner(Arc::unwrap_or_clone(
+                    Arc::clone(&aggregate.input),
+                ))
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                if !found {
+                    return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate)));
+                }
+                aggregate.input = Arc::new(input);
+                Ok(Transformed::yes(LogicalPlan::Aggregate(aggregate)))
+            })
+            .data()?)
+    }
+
+    pub(crate) fn require_input_sort_inner(
+        plan: LogicalPlan,
+    ) -> PlanResult<(LogicalPlan, bool, bool)> {
+        match plan {
+            LogicalPlan::Sort(sort) => Ok((
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(RequiredSortNode::new(
+                        sort.input, sort.expr, sort.fetch, false,
+                    )),
+                }),
+                true,
+                true,
+            )),
+            LogicalPlan::Limit(mut limit) => {
+                let fetch = match (limit.get_skip_type()?, limit.get_fetch_type()?) {
+                    (SkipType::Literal(skip), FetchType::Literal(Some(fetch))) => Some(
+                        skip.checked_add(fetch)
+                            .ok_or_else(|| PlanError::invalid("LIMIT + OFFSET overflow"))?,
+                    ),
+                    _ => None,
+                };
+                let input = Arc::unwrap_or_clone(std::mem::replace(
+                    &mut limit.input,
+                    Arc::new(LogicalPlan::default()),
+                ));
+                let (input, found, global) = match fetch {
+                    Some(fetch) => Self::require_input_sort_with_fetch(input, fetch)?,
+                    None => Self::require_input_sort_inner(input)?,
+                };
+                limit.input = Arc::new(input);
+                Ok((LogicalPlan::Limit(limit), found, global))
+            }
+            LogicalPlan::Extension(extension) => {
+                if let Some(sort) = extension.node.as_any().downcast_ref::<RequiredSortNode>() {
+                    let global = !sort.preserve_partitioning();
+                    return Ok((LogicalPlan::Extension(extension), true, global));
+                }
+                if let Some(sort) = extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<SortWithinPartitionsNode>()
+                {
+                    return Ok((
+                        LogicalPlan::Extension(Extension {
+                            node: Arc::new(RequiredSortNode::new(
+                                Arc::clone(sort.input()),
+                                sort.sort_expr().to_vec(),
+                                sort.fetch(),
+                                true,
+                            )),
+                        }),
+                        true,
+                        false,
+                    ));
+                }
+                if !extension.node.as_any().is::<MonotonicIdNode>()
+                    && !extension.node.as_any().is::<SparkPartitionIdNode>()
+                {
+                    return Ok((LogicalPlan::Extension(extension), false, false));
+                }
+
+                let plan = LogicalPlan::Extension(extension);
+                let expressions = plan.expressions();
+                let child = plan.inputs().one()?.clone();
+                let (child, found, global) = Self::require_input_sort_inner(child)?;
+                if found {
+                    Ok((plan.with_new_exprs(expressions, vec![child])?, true, global))
+                } else {
+                    Ok((plan, false, false))
+                }
+            }
+            plan => {
+                let transparent = matches!(
+                    plan,
+                    LogicalPlan::SubqueryAlias(_)
+                        | LogicalPlan::Projection(_)
+                        | LogicalPlan::Filter(_)
+                        | LogicalPlan::Window(_)
+                        | LogicalPlan::Unnest(_)
+                );
+                if !transparent {
+                    return Ok((plan, false, false));
+                }
+
+                // Unnest's with_new_exprs requires no expressions and rebuilds from its own exec_columns.
+                let expressions = if matches!(&plan, LogicalPlan::Unnest(_)) {
+                    vec![]
+                } else {
+                    plan.expressions()
+                };
+                let child = plan.inputs().one()?.clone();
+                let (child, found, global) = Self::require_input_sort_inner(child)?;
+                if found {
+                    Ok((plan.with_new_exprs(expressions, vec![child])?, true, global))
+                } else {
+                    Ok((plan, false, false))
+                }
+            }
+        }
+    }
+
+    fn require_input_sort_with_fetch(
+        plan: LogicalPlan,
+        fetch: usize,
+    ) -> PlanResult<(LogicalPlan, bool, bool)> {
+        match plan {
+            LogicalPlan::Sort(sort) => Ok((
+                LogicalPlan::Extension(Extension {
+                    node: Arc::new(RequiredSortNode::new(
+                        sort.input,
+                        sort.expr,
+                        Some(sort.fetch.map_or(fetch, |old| old.min(fetch))),
+                        false,
+                    )),
+                }),
+                true,
+                true,
+            )),
+            plan => {
+                if !matches!(
+                    plan,
+                    LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_)
+                ) {
+                    return Self::require_input_sort_inner(plan);
+                }
+
+                let expressions = plan.expressions();
+                let child = plan.inputs().one()?.clone();
+                let (child, found, global) = Self::require_input_sort_with_fetch(child, fetch)?;
+                if found {
+                    Ok((plan.with_new_exprs(expressions, vec![child])?, true, global))
+                } else {
+                    Ok((plan, false, false))
+                }
+            }
+        }
+    }
+
+    pub(super) fn has_grouping_set(grouping: &[Expr]) -> bool {
+        grouping.iter().any(|x| matches!(x, Expr::GroupingSet(_)))
+    }
+
+    pub(super) fn distinct_grouping_expressions_from_exprs(grouping: &[Expr]) -> Vec<Expr> {
+        grouping
+            .iter()
+            .flat_map(|x| match x {
+                Expr::GroupingSet(g) => g.distinct_expr().into_iter().cloned().collect(),
+                expr => vec![expr.clone()],
+            })
+            .collect()
+    }
+
+    /// Resolve each projection once, deferring only expressions that need the
+    /// grouping output to be materialized before their names can resolve.
+    async fn resolve_projections_deferring(
+        &self,
+        projections: &[spec::Expr],
+        input: &LogicalPlan,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<ResolvedProjections> {
+        let resolved = self
+            .resolve_lateral_expressions(projections.to_vec(), input, true, state)
+            .await?;
+        Ok(ResolvedProjections {
+            expressions: resolved.expressions,
+            deferred: resolved.deferred,
+            lateral_columns: resolved.columns,
+            schema: resolved.schema,
+        })
+    }
+
+    /// Resolves the deferred projections (the grouping columns are now in scope) and
+    /// inlines re-used generator expressions, producing the final projection list.
+    async fn finish_projections(
+        &self,
+        mut resolved: Vec<Option<NamedExpr>>,
+        deferred: Vec<(usize, spec::Expr)>,
+        generator_replacements: &[(Expr, Expr)],
+        schema: &DFSchemaRef,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<Vec<NamedExpr>> {
+        for (index, projection) in deferred {
+            resolved[index] = Some(
+                self.resolve_named_expression(projection, schema, state)
+                    .await?,
+            );
+        }
+        resolved
+            .into_iter()
+            .enumerate()
+            .map(|(index, named)| {
+                let NamedExpr {
+                    name,
+                    expr,
+                    metadata,
+                } = named.ok_or_else(|| {
+                    PlanError::internal(format!("projection {index} was not resolved"))
+                })?;
+                Ok(NamedExpr {
+                    name,
+                    expr: Self::replace_grouping_expressions(expr, generator_replacements)?,
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    fn rewrite_grouping_functions(
+        named_expr: NamedExpr,
+        grouping_exprs: &[Expr],
+        has_grouping_set: bool,
+        duplicate_sets: bool,
+    ) -> PlanResult<NamedExpr> {
+        let NamedExpr {
+            name,
+            expr,
+            metadata,
+        } = named_expr;
+        Ok(NamedExpr {
+            name,
+            expr: Self::rewrite_grouping_expr(
+                expr,
+                grouping_exprs,
+                has_grouping_set,
+                duplicate_sets,
+            )?,
+            metadata,
+        })
+    }
+
+    pub(super) fn rewrite_grouping_expr(
+        expr: Expr,
+        grouping_exprs: &[Expr],
+        has_grouping_set: bool,
+        duplicate_sets: bool,
+    ) -> PlanResult<Expr> {
+        Ok(expr
+            .transform_down(|expr| {
+                if let Expr::AggregateFunction(function) = expr {
+                    match function.func.name() {
+                        "grouping" => Ok(Transformed::yes(Self::grouping_on_grouping_id(
+                            function,
+                            grouping_exprs,
+                            has_grouping_set,
+                            duplicate_sets,
+                        )?)),
+                        "grouping_id" => Ok(Transformed::yes(Self::grouping_id_on_grouping_id(
+                            function,
+                            grouping_exprs,
+                            has_grouping_set,
+                            duplicate_sets,
+                        )?)),
+                        _ => Ok(Transformed::no(Expr::AggregateFunction(function))),
+                    }
+                } else {
+                    Ok(Transformed::no(expr))
+                }
+            })
+            .data()?)
+    }
+
+    fn grouping_id_column() -> Expr {
+        Expr::Column(Column::from(Aggregate::INTERNAL_GROUPING_ID))
+    }
+
+    fn grouping_bitmask_literal(value: u64, grouping_expr_count: usize) -> Expr {
+        let value = if grouping_expr_count <= 8 {
+            ScalarValue::UInt8(Some(value as u8))
+        } else if grouping_expr_count <= 16 {
+            ScalarValue::UInt16(Some(value as u16))
+        } else if grouping_expr_count <= 32 {
+            ScalarValue::UInt32(Some(value as u32))
+        } else {
+            ScalarValue::UInt64(Some(value))
+        };
+        Expr::Literal(value, None)
+    }
+
+    fn format_grouping_exprs(exprs: &[Expr]) -> String {
+        exprs
+            .iter()
+            .map(|expr| expr.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn reject_grouping_clause(
+        function: &datafusion_expr::expr::AggregateFunction,
+    ) -> DataFusionResult<()> {
+        if function.params.distinct
+            || function.params.filter.is_some()
+            || !function.params.order_by.is_empty()
+            || function.params.null_treatment.is_some()
+        {
+            Err(DataFusionError::Plan(format!(
+                "invalid {} function clause",
+                function.func.name()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn grouping_on_grouping_id(
+        function: datafusion_expr::expr::AggregateFunction,
+        grouping_exprs: &[Expr],
+        has_grouping_set: bool,
+        duplicate_sets: bool,
+    ) -> DataFusionResult<Expr> {
+        Self::reject_grouping_clause(&function)?;
+        if !has_grouping_set {
+            return Err(DataFusionError::Plan(
+                "[UNSUPPORTED_GROUPING_EXPRESSION] grouping functions can only be used with grouping sets, cube, or rollup".to_string(),
+            ));
+        }
+        let args = &function.params.args;
+        let [arg] = args.as_slice() else {
+            return Err(DataFusionError::Plan(
+                "grouping requires exactly one argument".to_string(),
+            ));
+        };
+        let position = grouping_exprs
+            .iter()
+            .position(|expr| expr == arg)
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "[GROUPING_COLUMN_MISMATCH] grouping column {} is not in grouping columns ({})",
+                    arg,
+                    Self::format_grouping_exprs(grouping_exprs)
+                ))
+            })?;
+        let bitmap_index = grouping_exprs.len() - 1 - position;
+        // The duplicate-set ordinal can widen the grouping ID past the literal type.
+        let (grouping_id, width) = if duplicate_sets {
+            (
+                cast(
+                    Self::grouping_id_column(),
+                    datafusion_common::arrow::datatypes::DataType::UInt64,
+                ),
+                64,
+            )
+        } else {
+            (Self::grouping_id_column(), grouping_exprs.len())
+        };
+        let group_bit = bitwise_and(
+            grouping_id,
+            Self::grouping_bitmask_literal(1_u64 << bitmap_index, width),
+        );
+        let shifted = if bitmap_index == 0 {
+            group_bit
+        } else {
+            bitwise_shift_right(
+                group_bit,
+                Self::grouping_bitmask_literal(bitmap_index as u64, width),
+            )
+        };
+        Ok(cast(
+            shifted,
+            datafusion_common::arrow::datatypes::DataType::Int8,
+        ))
+    }
+
+    fn grouping_id_on_grouping_id(
+        function: datafusion_expr::expr::AggregateFunction,
+        grouping_exprs: &[Expr],
+        has_grouping_set: bool,
+        duplicate_sets: bool,
+    ) -> DataFusionResult<Expr> {
+        Self::reject_grouping_clause(&function)?;
+        if !has_grouping_set {
+            return Err(DataFusionError::Plan(
+                "[UNSUPPORTED_GROUPING_EXPRESSION] grouping functions can only be used with grouping sets, cube, or rollup".to_string(),
+            ));
+        }
+        if grouping_exprs.len() > 64 {
+            return Err(DataFusionError::Plan(
+                "[GROUPING_SIZE_LIMIT_EXCEEDED] grouping set size cannot be greater than 64"
+                    .to_string(),
+            ));
+        }
+        let args = &function.params.args;
+        if !args.is_empty() && args.as_slice() != grouping_exprs {
+            return Err(DataFusionError::Plan(format!(
+                "[GROUPING_ID_COLUMN_MISMATCH] grouping_id columns ({}) do not match grouping columns ({})",
+                Self::format_grouping_exprs(args),
+                Self::format_grouping_exprs(grouping_exprs)
+            )));
+        }
+        let grouping_id = if duplicate_sets {
+            // Like Spark, keep only the grouping bits: DataFusion packs a duplicate-set
+            // ordinal above them.
+            let mask = match grouping_exprs.len() {
+                0 => 0,
+                count => u64::MAX >> (64 - count),
+            };
+            // The ordinal can widen the grouping ID past the type of a grouping-bit literal.
+            bitwise_and(
+                cast(
+                    Self::grouping_id_column(),
+                    datafusion_common::arrow::datatypes::DataType::UInt64,
+                ),
+                datafusion_expr::lit(mask),
+            )
+        } else {
+            Self::grouping_id_column()
+        };
+        Ok(cast(
+            grouping_id,
+            datafusion_common::arrow::datatypes::DataType::Int64,
+        ))
+    }
+
+    /// Whether native decorrelation keeps the grouping bits in place: it groups every set
+    /// by the inner columns that correlations compare, which adds nothing when each is
+    /// already grouped in every set. `NormalizeScalarSubqueryKeys` masks the other
+    /// correlated grouping IDs it rewrites.
+    pub(super) fn correlation_keeps_grouping(
+        plan: &LogicalPlan,
+        group_exprs: &[Expr],
+    ) -> PlanResult<bool> {
+        let mut columns = Vec::new();
+        let mut filters_only = true;
+        plan.apply(|node| {
+            match node {
+                LogicalPlan::Filter(filter) => columns.extend(
+                    datafusion_expr::utils::split_conjunction(&filter.predicate)
+                        .into_iter()
+                        .filter(|expr| expr.contains_outer())
+                        .flat_map(Expr::column_refs)
+                        .cloned(),
+                ),
+                node => filters_only &= !node.contains_outer_reference(),
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        if columns.is_empty() || !filters_only {
+            return Ok(filters_only);
+        }
+        let expanded = datafusion_expr::utils::enumerate_grouping_sets(group_exprs.to_vec())?;
+        let [Expr::GroupingSet(datafusion_expr::GroupingSet::GroupingSets(sets))] =
+            expanded.as_slice()
+        else {
+            // Some rollup or cube set omits every expression.
+            return Ok(false);
+        };
+        Ok(columns.into_iter().all(|column| {
+            let column = Expr::Column(column);
+            sets.iter().all(|set| set.contains(&column))
+        }))
+    }
+
+    /// Whether an expression reads both the outer query and a grouping function, which
+    /// native decorrelation cannot pull up once the grouping ID is masked.
+    fn compares_grouping_with_outer(expr: &Expr) -> bool {
+        expr.contains_outer()
+            && expr
+                .exists(|expr| {
+                    Ok(matches!(expr, Expr::AggregateFunction(function)
+                        if matches!(function.func.name(), "grouping" | "grouping_id")))
+                })
+                .unwrap_or(true)
+    }
+
+    /// Whether two grouping sets group by the same expressions, in any order.
+    pub(super) fn has_duplicate_grouping_sets(group_exprs: &[Expr]) -> PlanResult<bool> {
+        let expanded = datafusion_expr::utils::enumerate_grouping_sets(group_exprs.to_vec())?;
+        let sets = match expanded.as_slice() {
+            [Expr::GroupingSet(datafusion_expr::GroupingSet::GroupingSets(sets))] => sets,
+            // Only a repeated expression makes two rollup or cube sets equal.
+            [
+                Expr::GroupingSet(
+                    datafusion_expr::GroupingSet::Rollup(exprs)
+                    | datafusion_expr::GroupingSet::Cube(exprs),
+                ),
+            ] => {
+                let mut seen = std::collections::HashSet::new();
+                return Ok(!exprs.iter().all(|expr| seen.insert(expr)));
+            }
+            _ => return Ok(false),
+        };
+        let groups = datafusion_expr::utils::grouping_set_to_exprlist(&expanded)?;
+        let mut seen = std::collections::HashSet::new();
+        Ok(!sets.iter().all(|set| {
+            seen.insert(
+                groups
+                    .iter()
+                    .map(|group| set.contains(group))
+                    .collect::<Vec<_>>(),
+            )
+        }))
+    }
+
+    /// Expands a generator in the grouping into rows, naming the unnested column
+    /// after the grouping output. Returns a map from each generator to its column.
+    /// A no-op when the grouping has no generator.
+    pub(super) fn expand_grouping_generators(
+        &self,
+        input: LogicalPlan,
+        grouping: Vec<NamedExpr>,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<(LogicalPlan, Vec<NamedExpr>, GroupingReplacements)> {
+        if !grouping.iter().any(Self::grouping_has_generator) {
+            return Ok((input, grouping, vec![]));
+        }
+        let generators = grouping.iter().map(|x| x.expr.clone()).collect::<Vec<_>>();
+        let (input, mut grouping) =
+            self.rewrite_projection::<ExplodeRewriter>(input, grouping, state)?;
+        let mut replacements = vec![];
+        for (group, generator) in grouping.iter_mut().zip(generators) {
+            // The rewriter returns the unnested column wrapped in an alias. Rename
+            // that column to the grouping's output name and use it directly.
+            let column = match (&group.expr, group.name.as_slice()) {
+                (Expr::Alias(alias), [name]) => match alias.expr.as_ref() {
+                    Expr::Column(column) => {
+                        state.set_field_name(column.name(), name);
+                        Some(Expr::Column(column.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(column) = column {
+                replacements.push((generator, column.clone()));
+                group.expr = column;
+            }
+        }
+        Ok((input, grouping, replacements))
+    }
+
+    /// Whether a grouping expression contains a generator (e.g. `explode`) and so
+    /// must expand the input rows before grouping.
+    fn grouping_has_generator(group: &NamedExpr) -> bool {
+        group
+            .expr
+            .exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.func.inner().is::<Explode>())))
+            .unwrap_or(false)
+    }
+
+    fn materialize_grouping_input_file_metadata(
+        input: LogicalPlan,
+        grouping: &[NamedExpr],
+        state: &mut PlanResolverState,
+    ) -> PlanResult<(LogicalPlan, GroupingReplacements)> {
+        let mut metadata = Vec::new();
+        for group in grouping {
+            group.expr.apply(|expr| {
+                if let Expr::ScalarFunction(function) = expr
+                    && is_input_file_metadata_function(&function.func)
+                    && !metadata.contains(expr)
+                {
+                    metadata.push(expr.clone());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        if metadata.is_empty() {
+            return Ok((input, vec![]));
+        }
+
+        let mut projection = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+        let replacements = metadata
+            .into_iter()
+            .map(|expr| {
+                let name = state.register_field_name("");
+                projection.push(expr.clone().alias(&name));
+                (expr, Expr::Column(Column::from_name(name)))
+            })
+            .collect();
+        let input = LogicalPlan::Projection(Projection::try_new(projection, Arc::new(input))?);
+        Ok((input, replacements))
+    }
+
+    /// Reuses the input column for each materialized grouping expression.
+    pub(super) fn replace_grouping_expressions(
+        expr: Expr,
+        replacements: &[(Expr, Expr)],
+    ) -> PlanResult<Expr> {
+        if replacements.is_empty() {
+            return Ok(expr);
+        }
+        Ok(expr
+            .transform_down(|e| match replacements.iter().find(|(from, _)| *from == e) {
+                Some((_, to)) => Ok(Transformed::yes(to.clone())),
+                None => Ok(Transformed::no(e)),
+            })
+            .data()?)
+    }
+
+    /// Reference: [datafusion_sql::utils::rebase_expr]
+    pub(super) fn rebase_expression(
+        expr: Expr,
+        base: &[Expr],
+        plan: &LogicalPlan,
+    ) -> PlanResult<Expr> {
+        Ok(expr
+            .transform_down(|e| {
+                if base.contains(&e) {
+                    Ok(Transformed::yes(
+                        Self::expr_as_column_expr(&e, plan)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                    ))
+                } else {
+                    Ok(Transformed::no(e))
+                }
+            })
+            .data()?)
+    }
+
+    // Modification of DataFusion's `expr_as_column_expr`
+    fn expr_as_column_expr(expr: &Expr, plan: &LogicalPlan) -> PlanResult<Expr> {
+        match expr {
+            Expr::Column(column) => {
+                let result = plan
+                    .schema()
+                    .qualified_field_from_column(column)
+                    .or_else(|_| {
+                        let column = Column::new_unqualified(column.name.clone());
+                        plan.schema().qualified_field_from_column(&column)
+                    })?;
+                let (qualifier, field) = result;
+                Ok(Expr::from(Column::from((qualifier, field))))
+            }
+            _ => Ok(Expr::Column(Column::from_name(
+                expr.schema_name().to_string(),
+            ))),
+        }
+    }
+
+    /// Spark CheckAnalysis: GroupedAgg Pandas/Arrow UDFs cannot be mixed with regular
+    /// (non-UDF) aggregate functions in the same `.agg()` call.
+    fn check_no_mixed_grouped_agg_udf(projections: &[NamedExpr]) -> PlanResult<()> {
+        let mut pyspark_agg_name: Option<String> = None;
+        let mut has_regular_agg = false;
+        for proj in projections {
+            let _ = proj.expr.apply(|e| {
+                if let Expr::AggregateFunction(agg) = e {
+                    if agg.func.inner().is::<PySparkGroupAggregateUDF>() {
+                        if pyspark_agg_name.is_none() {
+                            let full = agg.func.name();
+                            pyspark_agg_name = Some(get_udf_display_name(full).to_string());
+                        }
+                    } else {
+                        has_regular_agg = true;
+                    }
+                    // Don't recurse into the aggregate's args — no nested aggs here
+                    return Ok(TreeNodeRecursion::Jump);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+        }
+        if let Some(udf_name) = pyspark_agg_name
+            && has_regular_agg
+        {
+            return Err(PlanError::AnalysisError(format!(
+                // Spark tests expect this error message. Typo is intended.
+                "The group aggregate pandas UDF `{udf_name}` cannot be invoked \
+                     together with as other, non-pandas aggregate functions."
+            )));
+        }
+        Ok(())
+    }
+}

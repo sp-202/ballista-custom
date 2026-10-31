@@ -1,0 +1,121 @@
+# Spark on Ballista — issue tracker
+
+Every error or incompatibility found while building Spark support. Fixed issues
+stay here as history (what broke, why, how it was fixed), so regressions are
+recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
+
+**Status:** 🔴 open · 🟡 in progress · 🟢 fixed · ⚪ accepted difference (documented)
+**Severity:** S1 wrong answer / data loss · S2 feature broken · S3 performance · S4 cosmetic
+
+| ID | Status | Sev | Title | Step |
+|---|---|---|---|---|
+| [BS-001](#bs-001) | 🟢 | S2 | Sail build breaks under Ballista's DataFusion `sql` feature (error enum) | 00 |
+| [BS-002](#bs-002) | 🟢 | S2 | Sail wildcard options don't compile with `sql` feature types | 00 |
+| [BS-003](#bs-003) | 🟢 | S1 | Planning session ignored Ballista's distributed-safety restrictions | 00 |
+| [BS-004](#bs-004) | 🟢 | S2 | Python interpreter not initialized in standalone binaries | 00 |
+| [BS-005](#bs-005) | 🟢 | S2 | Catalog commands executed on executors | 00 |
+| [BS-006](#bs-006) | 🟢 | S2 | Sail crate `data/` dirs ignored by git | 00 |
+| [BS-007](#bs-007) | 🔴 | S3 | Spark Connect jobs run without AQE | 03 |
+| [BS-008](#bs-008) | 🔴 | S4 | DDL returns a `value: true` row instead of no columns | 04 |
+| [BS-009](#bs-009) | ⚪ | S4 | Decimal averages truncated instead of HALF_UP | 04 |
+| [BS-010](#bs-010) | 🔴 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
+| [BS-011](#bs-011) | 🔴 | S2 | Executors don't register object stores from Sail settings | 05 |
+| [BS-012](#bs-012) | 🔴 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
+| [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
+
+---
+
+## BS-001
+**Sail build breaks under Ballista's DataFusion `sql` feature (error enum)** · 🟢 fixed
+- **Error:** `error[E0004]: non-exhaustive patterns: &DataFusionError::SQL(_, _) not covered` in `sail-common-datafusion/src/error.rs`
+- **Cause:** Ballista depends on DataFusion with default features (incl. `sql`); Sail
+  builds without it. Cargo unifies features, so the enum gains a variant.
+- **Fix:** map `DataFusionError::SQL` to Sail's `Plan` error; declare `sql` in the
+  workspace DataFusion features so the dependency is explicit.
+
+## BS-002
+**Sail wildcard options don't compile with `sql` feature types** · 🟢 fixed
+- **Error:** `unresolved import datafusion_expr::sql` and type mismatches in
+  `sail-plan/src/resolver/expression/wildcard.rs`
+- **Cause:** with `sql`, `datafusion_expr` uses `sqlparser` AST types for
+  `SELECT * EXCLUDE/EXCEPT/REPLACE/RENAME` instead of its stand-in module.
+- **Fix:** build the options with `sqlparser` types. Verified in DataFusion 55.2 that
+  `ReplaceSelectElement.expr` and `RenameSelectItem` are display-only
+  (`replace_columns` uses `column_name` + `planned_expressions`), so results are unchanged.
+
+## BS-003
+**Planning session ignored Ballista's distributed-safety restrictions** · 🟢 fixed (prevented)
+- **Risk:** Sail plans with physical scalar subqueries (shared in-process container
+  can't cross stages → executor decode failure), dynamic filter pushdown (scan
+  waits forever for a filter produced in another stage), round-robin repartition and
+  Utf8View (oversized Flight frames).
+- **Fix:** `BallistaSparkSessionMutator` applies `ballista_restricted_configuration()`
+  after Sail's settings (Sail calls the mutator last, verified in `ServerSessionFactory`).
+
+## BS-004
+**Python interpreter not initialized in standalone binaries** · 🟢 fixed
+- **Error:** `panicked at pyo3-0.29.2/src/interpreter_lifecycle.rs:134: The Python interpreter is not initialized and the auto-initialize feature is not enabled`; client saw `internal error: failed to send message to actor`
+- **Cause:** Sail normally runs inside Python (`pysail`) or its CLI initializes Python;
+  session creation discovers Python data sources.
+- **Fix:** `ballista-spark-python::bootstrap()` (ported from Sail's CLI) first thing in
+  all three binaries, before any threads; Tokio runtime built afterwards.
+
+## BS-005
+**Catalog commands executed on executors** · 🟢 fixed
+- **Error:** `Task failed due to runtime execution error: ... Internal("session extension not found: catalog manager")` on `createOrReplaceTempView`
+- **Cause:** Sail runs catalog commands as `CatalogCommandExec` plans through the job
+  runner; they need the Spark session, which only exists in the Spark Connect server.
+- **Fix:** `ballista-spark-runner::placement` keeps driver-only operators (Sail's
+  `is_driver_stage_plan`, now public) in the server; other subtrees run as Ballista jobs
+  via `BallistaSubplanExec`.
+
+## BS-006
+**Sail crate `data/` dirs ignored by git** · 🟢 fixed
+- **Cause:** repository `.gitignore` has `data/`; Sail keeps build inputs and test
+  fixtures in `crates/*/data/` (read by `sail-sql-parser` and `sail-spark-connect` build scripts).
+- **Fix:** `spark/.gitignore` re-includes `crates/*/data/`.
+
+## BS-007
+**Spark Connect jobs run without AQE** · 🔴 open · step 03
+- **Evidence:** 0 of 28 jobs from a TPC-H SF10 run had an `AdaptiveDatafusionExec`
+  root; TPC-H total 30.7 s via Spark Connect vs 12.6 s through Ballista's SQL path.
+- **Cause:** `scheduler/src/state/task_manager.rs` routes `SubmitPlan::Physical` to the
+  static planner ("AQE plans from the logical plan").
+- **Plan:** step 03 — AQE entry point for physical plans.
+
+## BS-008
+**DDL returns a `value: true` row instead of no columns** · 🔴 open · step 04
+- **Repro:** `spark.sql("drop view v").columns` → Spark: `[]`; ours: `['value']`, row `True`.
+- **Impact:** code that inspects DDL results; our TPC-H runner overwrote Q15's answer
+  (runner fixed to skip DDL).
+- **Plan:** match Spark's empty result for DDL in the Spark front end.
+
+## BS-009
+**Decimal averages truncated instead of HALF_UP** · ⚪ documented · step 04
+- **Repro:** TPC-H Q1 `avg_price` 38237.151008 vs Spark 38237.151009.
+- **Cause:** DataFusion decimal division truncates at the result scale.
+- **Plan:** HALF_UP in the Spark function layer; within comparator tolerance meanwhile.
+
+## BS-010
+**`df.repartition(n)` is not a Ballista stage boundary** · 🔴 open · step 03
+- **Cause:** Sail's optimizer leaves round-robin `ExplicitRepartitionExec` for its own job
+  graph; Ballista's planner splits stages at DataFusion repartition operators only.
+- **Plan:** rewrite to a Ballista-supported repartition when submitting to Ballista.
+
+## BS-011
+**Executors don't register object stores from Sail settings** · 🔴 open · step 05
+- **Cause:** executors use Ballista's default runtime environment; Sail registers S3,
+  GCS, Azure, HDFS stores through its own `RuntimeEnvFactory`.
+- **Plan:** executor runtime producer that adds Sail's object store registry while keeping
+  Ballista's memory pool and spill settings.
+
+## BS-012
+**Closing a Spark session doesn't cancel its Ballista jobs** · 🔴 open · step 02
+- **Cause:** `BallistaJobRunner::stop` only logs.
+- **Plan:** track job ids per session; `CancelJob` on stop and on `spark.interruptAll()`.
+
+## BS-013
+**`BallistaSubplanExec` is single-partition; untested under driver-side writes** · 🔴 open · step 05
+- **Risk:** driver-only parents (e.g. `DeltaCommitExec`, `FileDeleteExec`) expecting
+  N input partitions may misbehave.
+- **Plan:** Delta/Iceberg write tests through Spark Connect; preserve partitioning if needed.

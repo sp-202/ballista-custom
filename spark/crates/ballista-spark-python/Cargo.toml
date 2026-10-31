@@ -1,0 +1,14 @@
+[package]
+name = "ballista-spark-python"
+description = "Embedded Python bootstrap for Spark-enabled Ballista processes"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+sail-common = { workspace = true }
+pyo3 = { workspace = true }

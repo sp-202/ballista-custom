@@ -1,0 +1,2028 @@
+{
+  "tests": [
+    {
+      "input": "\nSELECT\n/*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50), REPARTITION(300, c) */\n* FROM t\n      ",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "hint": {
+                      "input": {
+                        "hint": {
+                          "input": {
+                            "project": {
+                              "input": {
+                                "read": {
+                                  "namedTable": {
+                                    "name": [
+                                      "t"
+                                    ],
+                                    "temporal": null,
+                                    "sample": null,
+                                    "options": []
+                                  },
+                                  "isStreaming": false
+                                },
+                                "planId": null
+                              },
+                              "expressions": [
+                                {
+                                  "unresolvedStar": {
+                                    "target": null,
+                                    "planId": null,
+                                    "wildcardOptions": {
+                                      "ilikePattern": null,
+                                      "excludeColumns": null,
+                                      "exceptColumns": null,
+                                      "replaceColumns": null,
+                                      "renameColumns": null
+                                    }
+                                  }
+                                }
+                              ]
+                            },
+                            "planId": null
+                          },
+                          "name": "REPARTITION",
+                          "parameters": [
+                            {
+                              "literal": {
+                                "int32": {
+                                  "value": 300
+                                }
+                              }
+                            },
+                            {
+                              "unresolvedAttribute": {
+                                "name": [
+                                  "c"
+                                ],
+                                "planId": null,
+                                "isMetadataColumn": false
+                              }
+                            }
+                          ]
+                        },
+                        "planId": null
+                      },
+                      "name": "COALESCE",
+                      "parameters": [
+                        {
+                          "literal": {
+                            "int32": {
+                              "value": 50
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "BROADCASTJOIN",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "u"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ BROADCAST(tab) */ * FROM testcat.db.tab",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "testcat",
+                          "db",
+                          "tab"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "BROADCAST",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "tab"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ BROADCASTJOIN(u) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "BROADCASTJOIN",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "u"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ BROADCASTJOIN(u), REPARTITION(100) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "project": {
+                      "input": {
+                        "read": {
+                          "namedTable": {
+                            "name": [
+                              "t"
+                            ],
+                            "temporal": null,
+                            "sample": null,
+                            "options": []
+                          },
+                          "isStreaming": false
+                        },
+                        "planId": null
+                      },
+                      "expressions": [
+                        {
+                          "unresolvedStar": {
+                            "target": null,
+                            "planId": null,
+                            "wildcardOptions": {
+                              "ilikePattern": null,
+                              "excludeColumns": null,
+                              "exceptColumns": null,
+                              "replaceColumns": null,
+                              "renameColumns": null
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "REPARTITION",
+                  "parameters": [
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 100
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "BROADCASTJOIN",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "u"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ COALESCE(10) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "COALESCE",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 10
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ COALESCE(30 + 50) */ * FROM t",
+      "exception": "\n[PARSE_SYNTAX_ERROR] Syntax error at or near '+'. SQLSTATE: 42601 (line 1, pos 23)\n\n== SQL ==\nSELECT /*+ COALESCE(30 + 50) */ * FROM t\n-----------------------^^^\n",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "COALESCE",
+              "parameters": [
+                {
+                  "unresolvedFunction": {
+                    "functionName": [
+                      "+"
+                    ],
+                    "arguments": [
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 30
+                          }
+                        }
+                      },
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 50
+                          }
+                        }
+                      }
+                    ],
+                    "namedArguments": [],
+                    "isDistinct": false,
+                    "isUserDefinedFunction": false,
+                    "isInternal": null,
+                    "ignoreNulls": null,
+                    "filter": null,
+                    "orderBy": null
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT",
+              "parameters": []
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT() */ * FROM t",
+      "exception": "\n[PARSE_SYNTAX_ERROR] Syntax error at or near ')'. SQLSTATE: 42601 (line 1, pos 16)\n\n== SQL ==\nSELECT /*+ HINT() */ * FROM t\n----------------^^^\n",
+      "output": {
+        "failure": "invalid argument: found ) at 16:17 expected expression"
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1('a', (b, c), (1, 2)) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "literal": {
+                    "utf8": {
+                      "value": "a"
+                    }
+                  }
+                },
+                {
+                  "unresolvedFunction": {
+                    "functionName": [
+                      "struct"
+                    ],
+                    "arguments": [
+                      {
+                        "unresolvedAttribute": {
+                          "name": [
+                            "b"
+                          ],
+                          "planId": null,
+                          "isMetadataColumn": false
+                        }
+                      },
+                      {
+                        "unresolvedAttribute": {
+                          "name": [
+                            "c"
+                          ],
+                          "planId": null,
+                          "isMetadataColumn": false
+                        }
+                      }
+                    ],
+                    "namedArguments": [],
+                    "isDistinct": false,
+                    "isUserDefinedFunction": false,
+                    "isInternal": null,
+                    "ignoreNulls": null,
+                    "filter": null,
+                    "orderBy": null
+                  }
+                },
+                {
+                  "unresolvedFunction": {
+                    "functionName": [
+                      "struct"
+                    ],
+                    "arguments": [
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 1
+                          }
+                        }
+                      },
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 2
+                          }
+                        }
+                      }
+                    ],
+                    "namedArguments": [],
+                    "isDistinct": false,
+                    "isUserDefinedFunction": false,
+                    "isInternal": null,
+                    "ignoreNulls": null,
+                    "filter": null,
+                    "orderBy": null
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, 1) */ /*+ hint2(b, 2) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "project": {
+                      "input": {
+                        "read": {
+                          "namedTable": {
+                            "name": [
+                              "t"
+                            ],
+                            "temporal": null,
+                            "sample": null,
+                            "options": []
+                          },
+                          "isStreaming": false
+                        },
+                        "planId": null
+                      },
+                      "expressions": [
+                        {
+                          "unresolvedStar": {
+                            "target": null,
+                            "planId": null,
+                            "wildcardOptions": {
+                              "ilikePattern": null,
+                              "excludeColumns": null,
+                              "exceptColumns": null,
+                              "replaceColumns": null,
+                              "renameColumns": null
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "hint2",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "b"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    },
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 2
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 1
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, 1) hint2(b, 2) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "project": {
+                      "input": {
+                        "read": {
+                          "namedTable": {
+                            "name": [
+                              "t"
+                            ],
+                            "temporal": null,
+                            "sample": null,
+                            "options": []
+                          },
+                          "isStreaming": false
+                        },
+                        "planId": null
+                      },
+                      "expressions": [
+                        {
+                          "unresolvedStar": {
+                            "target": null,
+                            "planId": null,
+                            "wildcardOptions": {
+                              "ilikePattern": null,
+                              "excludeColumns": null,
+                              "exceptColumns": null,
+                              "replaceColumns": null,
+                              "renameColumns": null
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "hint2",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "b"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    },
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 2
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 1
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, 1), hint2(b, 2) */ /*+ hint3(c, 3) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "hint": {
+                      "input": {
+                        "project": {
+                          "input": {
+                            "read": {
+                              "namedTable": {
+                                "name": [
+                                  "t"
+                                ],
+                                "temporal": null,
+                                "sample": null,
+                                "options": []
+                              },
+                              "isStreaming": false
+                            },
+                            "planId": null
+                          },
+                          "expressions": [
+                            {
+                              "unresolvedStar": {
+                                "target": null,
+                                "planId": null,
+                                "wildcardOptions": {
+                                  "ilikePattern": null,
+                                  "excludeColumns": null,
+                                  "exceptColumns": null,
+                                  "replaceColumns": null,
+                                  "renameColumns": null
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "planId": null
+                      },
+                      "name": "hint3",
+                      "parameters": [
+                        {
+                          "unresolvedAttribute": {
+                            "name": [
+                              "c"
+                            ],
+                            "planId": null,
+                            "isMetadataColumn": false
+                          }
+                        },
+                        {
+                          "literal": {
+                            "int32": {
+                              "value": 3
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "hint2",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "b"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    },
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 2
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 1
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, 1),hint2(b, 2) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "project": {
+                      "input": {
+                        "read": {
+                          "namedTable": {
+                            "name": [
+                              "t"
+                            ],
+                            "temporal": null,
+                            "sample": null,
+                            "options": []
+                          },
+                          "isStreaming": false
+                        },
+                        "planId": null
+                      },
+                      "expressions": [
+                        {
+                          "unresolvedStar": {
+                            "target": null,
+                            "planId": null,
+                            "wildcardOptions": {
+                              "ilikePattern": null,
+                              "excludeColumns": null,
+                              "exceptColumns": null,
+                              "replaceColumns": null,
+                              "renameColumns": null
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "hint2",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "b"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    },
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 2
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 1
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, 5, 'a', b) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 5
+                    }
+                  }
+                },
+                {
+                  "literal": {
+                    "utf8": {
+                      "value": "a"
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "b"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ HINT1(a, array(1, 2, 3)) */ * from t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "HINT1",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "unresolvedFunction": {
+                    "functionName": [
+                      "array"
+                    ],
+                    "arguments": [
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 1
+                          }
+                        }
+                      },
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 2
+                          }
+                        }
+                      },
+                      {
+                        "literal": {
+                          "int32": {
+                            "value": 3
+                          }
+                        }
+                      }
+                    ],
+                    "namedArguments": [],
+                    "isDistinct": false,
+                    "isUserDefinedFunction": false,
+                    "isInternal": null,
+                    "ignoreNulls": null,
+                    "filter": null,
+                    "orderBy": null
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ INDEX(a b c) */ * from default.t",
+      "exception": "\n[PARSE_SYNTAX_ERROR] Syntax error at or near 'b'. SQLSTATE: 42601 (line 1, pos 19)\n\n== SQL ==\nSELECT /*+ INDEX(a b c) */ * from default.t\n-------------------^^^\n",
+      "output": {
+        "failure": "invalid argument: found b at 19:20 expected '->', '.', '(', '[', '::', 'ESCAPE', 'IS', 'NOT', 'IN', '*', '/', '%', 'DIV', '+', '-', '||', '>>>', '>>', '<<', '&', '^', '|', '!=', '!>', '!<', '==', '=', '>=', '>', '<=>', '<=', '<>', '<', 'BETWEEN', 'LIKE', 'ILIKE', 'RLIKE', 'REGEXP', 'SIMILAR', 'AND', 'OR', ',', or ')'"
+      }
+    },
+    {
+      "input": "SELECT /*+ INDEX(t, emp_job_ix) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "INDEX",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "t"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "emp_job_ix"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ MAPJOIN(`default.t`) */ * from `default.t`",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "default.t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "MAPJOIN",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "default.t"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ MAPJOIN(t) */ a from t where true group by a order by a",
+      "output": {
+        "success": {
+          "query": {
+            "sort": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "aggregate": {
+                      "input": {
+                        "filter": {
+                          "input": {
+                            "read": {
+                              "namedTable": {
+                                "name": [
+                                  "t"
+                                ],
+                                "temporal": null,
+                                "sample": null,
+                                "options": []
+                              },
+                              "isStreaming": false
+                            },
+                            "planId": null
+                          },
+                          "condition": {
+                            "literal": {
+                              "boolean": {
+                                "value": true
+                              }
+                            }
+                          }
+                        },
+                        "planId": null
+                      },
+                      "grouping": [
+                        {
+                          "unresolvedAttribute": {
+                            "name": [
+                              "a"
+                            ],
+                            "planId": null,
+                            "isMetadataColumn": false
+                          }
+                        }
+                      ],
+                      "aggregate": [
+                        {
+                          "unresolvedAttribute": {
+                            "name": [
+                              "a"
+                            ],
+                            "planId": null,
+                            "isMetadataColumn": false
+                          }
+                        }
+                      ],
+                      "having": null,
+                      "withGroupingExpressions": false
+                    },
+                    "planId": null
+                  },
+                  "name": "MAPJOIN",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "t"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "order": [
+                {
+                  "child": {
+                    "unresolvedAttribute": {
+                      "name": [
+                        "a"
+                      ],
+                      "planId": null,
+                      "isMetadataColumn": false
+                    }
+                  },
+                  "direction": "unspecified",
+                  "nullOrdering": "unspecified"
+                }
+              ],
+              "isGlobal": true
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ MAPJOIN(u) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "MAPJOIN",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "u"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION(100) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION(100, c) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION(100, c), BROADCASTJOIN(u), COALESCE(50) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "hint": {
+                      "input": {
+                        "project": {
+                          "input": {
+                            "read": {
+                              "namedTable": {
+                                "name": [
+                                  "t"
+                                ],
+                                "temporal": null,
+                                "sample": null,
+                                "options": []
+                              },
+                              "isStreaming": false
+                            },
+                            "planId": null
+                          },
+                          "expressions": [
+                            {
+                              "unresolvedStar": {
+                                "target": null,
+                                "planId": null,
+                                "wildcardOptions": {
+                                  "ilikePattern": null,
+                                  "excludeColumns": null,
+                                  "exceptColumns": null,
+                                  "replaceColumns": null,
+                                  "renameColumns": null
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "planId": null
+                      },
+                      "name": "COALESCE",
+                      "parameters": [
+                        {
+                          "literal": {
+                            "int32": {
+                              "value": 50
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "BROADCASTJOIN",
+                  "parameters": [
+                    {
+                      "unresolvedAttribute": {
+                        "name": [
+                          "u"
+                        ],
+                        "planId": null,
+                        "isMetadataColumn": false
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION(100, c), COALESCE(50) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "hint": {
+                  "input": {
+                    "project": {
+                      "input": {
+                        "read": {
+                          "namedTable": {
+                            "name": [
+                              "t"
+                            ],
+                            "temporal": null,
+                            "sample": null,
+                            "options": []
+                          },
+                          "isStreaming": false
+                        },
+                        "planId": null
+                      },
+                      "expressions": [
+                        {
+                          "unresolvedStar": {
+                            "target": null,
+                            "planId": null,
+                            "wildcardOptions": {
+                              "ilikePattern": null,
+                              "excludeColumns": null,
+                              "exceptColumns": null,
+                              "replaceColumns": null,
+                              "renameColumns": null
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    "planId": null
+                  },
+                  "name": "COALESCE",
+                  "parameters": [
+                    {
+                      "literal": {
+                        "int32": {
+                          "value": 50
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION(c) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION_BY_RANGE(100, c) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION_BY_RANGE",
+              "parameters": [
+                {
+                  "literal": {
+                    "int32": {
+                      "value": 100
+                    }
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ REPARTITION_BY_RANGE(c) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "REPARTITION_BY_RANGE",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    },
+    {
+      "input": "SELECT /*+ STREAMTABLE(a,b,c) */ * FROM t",
+      "output": {
+        "success": {
+          "query": {
+            "hint": {
+              "input": {
+                "project": {
+                  "input": {
+                    "read": {
+                      "namedTable": {
+                        "name": [
+                          "t"
+                        ],
+                        "temporal": null,
+                        "sample": null,
+                        "options": []
+                      },
+                      "isStreaming": false
+                    },
+                    "planId": null
+                  },
+                  "expressions": [
+                    {
+                      "unresolvedStar": {
+                        "target": null,
+                        "planId": null,
+                        "wildcardOptions": {
+                          "ilikePattern": null,
+                          "excludeColumns": null,
+                          "exceptColumns": null,
+                          "replaceColumns": null,
+                          "renameColumns": null
+                        }
+                      }
+                    }
+                  ]
+                },
+                "planId": null
+              },
+              "name": "STREAMTABLE",
+              "parameters": [
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "a"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "b"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                },
+                {
+                  "unresolvedAttribute": {
+                    "name": [
+                      "c"
+                    ],
+                    "planId": null,
+                    "isMetadataColumn": false
+                  }
+                }
+              ]
+            },
+            "planId": null
+          }
+        }
+      }
+    }
+  ]
+}

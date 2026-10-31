@@ -16,7 +16,7 @@
 # under the License.
 
 [workspace]
-exclude = ["dev/msrvcheck", "python"]
+exclude = ["dev/msrvcheck", "python", "spark"]
 members = [
     "ballista-cli",
     "ballista/api-types",
