@@ -17,7 +17,7 @@ Last updated 2026-11-01.
 |---|---|---|---|
 | TPC-H SF10, 22 queries | SQL | ✅ 22/22 | `tpcbench/compare_answers.py`, answers in `~/Documents/tpch/answers/` |
 | TPC-H SF10, 22 queries | Connect | ✅ 22/22 | same; re-verified after BS-017 |
-| TPC-DS SF10, 99 queries | Connect | ⚠️ 50 of 51 run match; 48 not run yet; **q23 wrong** (BS-024) | run of 2026-11-01 stopped at q39 when the disk filled (BS-023, fixed) |
+| TPC-DS SF10, 99 queries | Connect | ⚠️ 98/99 match; q72 does not finish (BS-025) | runs of 2026-11-01 after BS-022/023/024; `compare_answers.py` |
 | TPC-DS SF10 | SQL | ❔ not run | |
 | Spark `sql-tests` suite | both | ❔ not run | step 01 |
 
@@ -92,7 +92,7 @@ decimal averages differ in the last digit (BS-009).
 
 | Spark AQE rule | Spark default | Status | Evidence / gap |
 |---|---|---|---|
-| Runtime join selection (shuffle join → broadcast) | on | ✅ | `SelectJoinRule`, `DelayJoinSelectionRule`, `DemoteUnsafeBroadcastJoinRule` |
+| Runtime join selection (shuffle join → broadcast) | on | ⚠️ | `SelectJoinRule`, `DelayJoinSelectionRule`, `DemoteUnsafeBroadcastJoinRule`; decides only once *both* inputs are materialized, so a large side is shuffled before joining a known-small table (BS-025) |
 | Empty relation propagation | on | ✅ | `PropagateEmptyExecRule`; BS-022 fixed the hang it exposed |
 | Coalesce small shuffle partitions | on (`parallelismFirst`, 1 MB min) | ⚠️ | `CoalescePartitionsRule` exists but is off by default (`ballista.planner.coalesce.enabled`) and not mapped from `spark.sql.adaptive.*` |
 | Initial shuffle partition count from `spark.sql.shuffle.partitions` | 200 | ❌ | every exchange uses 28 (looks like DataFusion `target_partitions` = CPU count) |
@@ -111,7 +111,7 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
-1. BS-024 — q23 drops a row (wrong answer).
-2. Finish the TPC-DS SF10 Connect run (48 queries) and file every difference.
-3. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
-4. AQE: skew join splitting.
+1. BS-025 — broadcast a join as soon as its small side is known (q72 shuffles ~80 GB).
+2. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
+3. AQE: skew join splitting.
+4. Closing a session cancels its jobs (BS-012): a stopped client leaves its job running.

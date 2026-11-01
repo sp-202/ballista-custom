@@ -33,6 +33,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
 | [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
 | [BS-024](#bs-024) | 🟢 | S1 | `UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23) | 03 |
+| [BS-025](#bs-025) | 🔴 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
 
 ---
 
@@ -341,4 +342,24 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   slice instead of writing over other partitions' files.
 - **Verified:** union repro 102,000 rows twice; q23 second SELECT returns both rows.
 - **Not covered:** the pipelined (streaming shuffle) writer has no such check yet.
+
+## BS-025
+**AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk** · 🔴 open · step 07
+- **Evidence:** TPC-DS SF10 q72 on Spark Connect: after 5 minutes the job held 78 GB of
+  shuffle data (sort-shuffle writers spilled ~6 GB per input partition) and `/home` was down
+  to 12 GB; stopped by hand. The other 98 queries match Spark.
+- **Plan shape:** catalog_sales ⋈ inventory on `item_sk` (with `inv_quantity_on_hand <
+  cs_quantity`) runs first, as in Spark, and produces a very large intermediate. Spark joins
+  it to warehouse, item, demographics and three date_dim copies with broadcast hash joins in
+  the same stage, so it is never written out. Here every one of those joins waits for the
+  large side to be shuffled to disk first.
+- **Cause:** `DynamicJoinSelectionExec` decides a join only when `upstream_resolved()`: neither
+  input may contain an unresolved exchange or an undecided join. The small sides finish at
+  once (warehouse is 10 rows, stage 8) but the large side is the join below, so each join is
+  planned as shuffled.
+- **Plan:** decide a broadcast as soon as one side is resolved, under the broadcast threshold
+  and safe to build from (join type), without waiting for the other side; the other side then
+  needs no exchange and streams through in the same stage, as in Spark.
+- **Also seen:** stopping the client did not stop the job (BS-012); only stopping the cluster
+  freed the disk.
 
