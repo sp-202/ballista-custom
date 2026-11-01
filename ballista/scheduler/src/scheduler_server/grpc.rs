@@ -18,6 +18,7 @@
 use axum::extract::ConnectInfo;
 use ballista_core::config::BALLISTA_JOB_NAME;
 use ballista_core::error::{BallistaError, Result as BResult};
+use ballista_core::execution_plans::JOB_ID_HEADER;
 use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::protobuf::execute_query_params::Query;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
@@ -516,7 +517,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 "execution query (PUSH) job submitted - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}, job_id: {job_id}"
             );
 
-            Ok(versioned_response(Box::pin(stream)))
+            let mut response: Response<Self::ExecuteQueryPushStream> =
+                versioned_response(Box::pin(stream));
+            if let Ok(value) = job_id.as_str().parse() {
+                response.metadata_mut().insert(JOB_ID_HEADER, value);
+            }
+            Ok(response)
         } else {
             Err(Status::internal(
                 "Error processing request, invalid message",

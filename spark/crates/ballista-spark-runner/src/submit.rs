@@ -1,9 +1,9 @@
 //! Submitting physical plans to a Ballista scheduler.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ballista_core::config::BallistaConfig;
-use ballista_core::execution_plans::execute_physical_plan;
+use ballista_core::execution_plans::{JobCancelHandle, submit_physical_plan};
 use ballista_spark_codec::SparkPhysicalCodec;
 use datafusion::common::Result;
 use datafusion::execution::SendableRecordBatchStream;
@@ -29,12 +29,23 @@ impl BallistaClusterOptions {
     }
 }
 
-/// Submits plans of one Spark session as Ballista physical-plan jobs.
-#[derive(Debug)]
+/// Submits plans of one Spark session as Ballista physical-plan jobs, and
+/// keeps track of them so they can be cancelled when the session ends.
 pub struct BallistaSubmitter {
     options: BallistaClusterOptions,
     session_id: String,
     codec: Arc<dyn PhysicalExtensionCodec>,
+    /// Jobs submitted and not yet known to have finished.
+    jobs: Mutex<Vec<JobCancelHandle>>,
+}
+
+impl std::fmt::Debug for BallistaSubmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BallistaSubmitter")
+            .field("options", &self.options)
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BallistaSubmitter {
@@ -43,6 +54,7 @@ impl BallistaSubmitter {
             options,
             session_id,
             codec: SparkPhysicalCodec::shared(),
+            jobs: Mutex::new(Vec::new()),
         }
     }
 
@@ -65,7 +77,7 @@ impl BallistaSubmitter {
             self.session_id,
             displayable(plan.as_ref()).indent(true)
         );
-        execute_physical_plan::<PhysicalPlanNode>(
+        let (stream, job) = submit_physical_plan::<PhysicalPlanNode>(
             self.options.scheduler_url.clone(),
             &self.options.ballista_config,
             plan,
@@ -73,6 +85,21 @@ impl BallistaSubmitter {
             self.session_id.clone(),
             session_config,
         )
-        .await
+        .await?;
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|job| !job.is_finished());
+        jobs.push(job);
+        Ok(stream)
+    }
+
+    /// Cancels every job of this session that has not finished. A job whose
+    /// result stream is dropped early is cancelled anyway; this also covers
+    /// streams still held, e.g. by a client that went away mid-query.
+    pub async fn cancel_all(&self) {
+        let jobs: Vec<_> =
+            std::mem::take(&mut *self.jobs.lock().unwrap_or_else(|e| e.into_inner()));
+        for job in jobs {
+            job.cancel().await;
+        }
     }
 }

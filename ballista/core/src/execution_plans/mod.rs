@@ -34,6 +34,7 @@ mod range_repartition_common;
 pub mod range_shuffle;
 mod range_shuffle_reader;
 mod runtime_stats;
+mod select_partitions;
 mod shuffle_reader;
 mod shuffle_writer;
 mod shuffle_writer_trait;
@@ -48,7 +49,10 @@ pub use buffer::{BufferExec, BufferMode};
 pub use chaos_exec::ChaosExec;
 use datafusion::common::exec_err;
 pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
-pub use distributed_query::{DistributedQueryExec, execute_physical_plan};
+pub use distributed_query::{
+    DistributedQueryExec, JOB_ID_HEADER, JobCancelHandle, execute_physical_plan,
+    submit_physical_plan,
+};
 pub use empty_partitions::EmptyPartitionsExec;
 pub use ordered_range_repartition::OrderedRangeRepartitionExec;
 pub use partitioned_bounded_window_agg::PartitionedBoundedWindowAggExec;
@@ -67,6 +71,7 @@ pub use runtime_stats::{
     log_merged_runtime_stats, merge_reports as merge_runtime_stats_reports,
     repartition_routing_expr,
 };
+pub use select_partitions::SelectPartitionsExec;
 pub use shuffle_reader::{CoalescePlan, PartitionGroup, ShuffleReaderExec};
 pub use shuffle_reader::{stats_for_partition, stats_for_partitions};
 pub use shuffle_writer::DEFAULT_SHUFFLE_CHANNEL_CAPACITY;

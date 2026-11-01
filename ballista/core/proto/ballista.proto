@@ -66,7 +66,13 @@ message BallistaPhysicalPlanNode {
     PipelinedShuffleWriterExecNode pipelined_shuffle_writer = 18;
     PipelinedShuffleReaderExecNode pipelined_shuffle_reader = 19;
     EmptyPartitionsExecNode empty_partitions = 20;
+    SelectPartitionsExecNode select_partitions = 21;
   }
+}
+
+// Output partition i is input partition `partitions[i]` (see `SelectPartitionsExec`).
+message SelectPartitionsExecNode {
+  repeated uint32 partitions = 1;
 }
 
 // A leaf producing no rows from `partitions` partitions (see `EmptyPartitionsExec`).

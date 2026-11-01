@@ -20,7 +20,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-009](#bs-009) | ⚪ | S4 | Decimal averages truncated instead of HALF_UP | 04 |
 | [BS-010](#bs-010) | 🔴 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
 | [BS-011](#bs-011) | 🔴 | S2 | Executors don't register object stores from Sail settings | 05 |
-| [BS-012](#bs-012) | 🔴 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
+| [BS-012](#bs-012) | 🟢 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
 | [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
@@ -35,6 +35,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-024](#bs-024) | 🟢 | S1 | `UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23) | 03 |
 | [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
 | [BS-026](#bs-026) | 🔴 | S3 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
+| [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
 
 ---
 
@@ -131,9 +132,20 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   Ballista's memory pool and spill settings.
 
 ## BS-012
-**Closing a Spark session doesn't cancel its Ballista jobs** · 🔴 open · step 02
-- **Cause:** `BallistaJobRunner::stop` only logs.
-- **Plan:** track job ids per session; `CancelJob` on stop and on `spark.interruptAll()`.
+**Closing a Spark session doesn't cancel its Ballista jobs** · 🟢 fixed · step 02
+- **Cause:** `BallistaJobRunner::stop` only logged. Interrupts did nothing either:
+  `execute_physical_plan` followed the job to its end before returning a stream, so Sail
+  registered the operation only after the job finished (`interruptAll` returned `[]`); a
+  dropped result stream never cancelled its job; and the push client learnt the job id
+  only from status updates, of which none came while a job ran.
+- **Fix:** `submit_physical_plan` returns the stream at once (the job is submitted on first
+  poll) with a `JobCancelHandle`; the stream cancels its job if dropped before its end; the
+  scheduler returns the job id in the `ballista-job-id` response header; the runner keeps
+  its session's handles and `stop()` cancels the unfinished ones. Sail now answers a
+  reattach to an interrupted operation with `[OPERATION_CANCELED]` (see `VENDORED.md`).
+- **Verified:** `spark/tests/connect_operations.py`: `interruptAll`, `interruptTag` and
+  `stop()` stop the Ballista job within a second; the client gets `SparkException` with
+  condition `OPERATION_CANCELED`; reattach after cut connections returns the answer.
 
 ## BS-013
 **`BallistaSubplanExec` is single-partition; untested under driver-side writes** · 🔴 open · step 05
@@ -390,4 +402,18 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Plan:** build each broadcast hash table once per executor and share it across that
   executor's tasks of the stage (keyed by job, stage and build plan); consider a lower
   threshold for scan build sides until then.
+
+## BS-027
+**`spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions** · 🟢 fixed · step 02
+- **Evidence:** `spark.range(0, n, 1, 56).select(sum(id % 7))` failed with "shuffle writer
+  input has 56 partition(s) but the task owns 8" once BS-024 added that guard; before it,
+  each of the stage's 7 tasks ran all 56 partitions and wrote them, multiplying the result.
+- **Cause:** per-task restriction (`restrict_plan_to_partitions`) only knows shuffle
+  readers, file and memory scans and empty leaves. Any other leaf (Sail's `RangeExec`, an
+  unrecognised data source) was left whole in every task.
+- **Fix:** such a leaf is wrapped in `SelectPartitionsExec`, which exposes only the task's
+  partitions (keeping those the leaf has, as file scans do). It is serialized by Ballista's
+  codec and reports no metrics, so task and stage plans keep the same metrics slots.
+  `UNION ALL` branches over such leaves can now stay in the union's stage (one stage fewer).
+- **Verified:** sums and counts exact for 3, 8, 56 and 100 partitions and 2 billion rows.
 

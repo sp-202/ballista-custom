@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -216,6 +216,21 @@ impl SparkSession {
         Ok(state.executors.get(id).cloned())
     }
 
+    /// Records that `id` was interrupted. Only the most recent ids are kept.
+    pub(crate) fn mark_interrupted(&self, id: &str) -> SparkResult<()> {
+        const KEEP: usize = 1024;
+        let mut state = self.state.lock()?;
+        if state.interrupted.len() == KEEP {
+            state.interrupted.pop_front();
+        }
+        state.interrupted.push_back(id.to_string());
+        Ok(())
+    }
+
+    pub(crate) fn was_interrupted(&self, id: &str) -> SparkResult<bool> {
+        Ok(self.state.lock()?.interrupted.iter().any(|x| x == id))
+    }
+
     pub(crate) fn remove_executor(&self, id: &str) -> SparkResult<Option<Arc<Executor>>> {
         let mut state = self.state.lock()?;
         Ok(state
@@ -344,6 +359,9 @@ struct SparkSessionState {
     config: SparkRuntimeConfig,
     native_config_keys: BTreeSet<String>,
     executors: HashMap<String, Arc<Executor>>,
+    /// Recently interrupted operation ids, oldest first, so a client reattaching
+    /// to one gets Spark's `OPERATION_CANCELED` rather than "not found".
+    interrupted: VecDeque<String>,
     streaming_queries: StreamingQueryManager,
 }
 
@@ -353,6 +371,7 @@ impl SparkSessionState {
             config: SparkRuntimeConfig::try_new()?,
             native_config_keys: BTreeSet::new(),
             executors: HashMap::new(),
+            interrupted: VecDeque::new(),
             streaming_queries: StreamingQueryManager::new(),
         })
     }

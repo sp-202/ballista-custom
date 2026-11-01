@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -81,7 +81,15 @@ pub mod ballista_physical_plan_node {
         PipelinedShuffleReader(super::PipelinedShuffleReaderExecNode),
         #[prost(message, tag = "20")]
         EmptyPartitions(super::EmptyPartitionsExecNode),
+        #[prost(message, tag = "21")]
+        SelectPartitions(super::SelectPartitionsExecNode),
     }
+}
+/// Output partition i is input partition `partitions\[i\]` (see `SelectPartitionsExec`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SelectPartitionsExecNode {
+    #[prost(uint32, repeated, tag = "1")]
+    pub partitions: ::prost::alloc::vec::Vec<u32>,
 }
 /// A leaf producing no rows from `partitions` partitions (see `EmptyPartitionsExec`).
 #[derive(Clone, PartialEq, ::prost::Message)]

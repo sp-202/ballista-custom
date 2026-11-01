@@ -49,6 +49,8 @@ pub enum SparkError {
     AnalysisError(String),
     #[error("parse error: {0}")]
     ParseError(String),
+    #[error("[OPERATION_CANCELED] Operation has been cancelled.")]
+    OperationCanceled,
 }
 
 impl SparkError {
@@ -335,6 +337,11 @@ impl From<SparkThrowable> for Status {
         let mut metadata = HashMap::new();
         // We do not add the "stackTrace" field since the Java stack trace is not available.
         metadata.insert("classes".into(), format!("[\"{class}\"]"));
+        // Spark sends an error's class (e.g. `OPERATION_CANCELED`) in `errorClass`;
+        // PySpark reads it for `getCondition()`. Messages carry it as a prefix.
+        if let Some(error_class) = spark_error_class(throwable.message()) {
+            metadata.insert("errorClass".into(), error_class.to_string());
+        }
 
         let mut details = ErrorDetails::new();
         details.set_error_info(class, "org.apache.spark", metadata);
@@ -350,6 +357,17 @@ impl From<SparkThrowable> for Status {
         // Reference: org.apache.spark.sql.connect.utils.ErrorUtils#buildStatusFromThrowable
         Status::with_error_details(Code::Internal, message, details)
     }
+}
+
+/// The error class of a message in Spark's `[ERROR_CLASS] message` form.
+fn spark_error_class(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix('[')?;
+    let class = &rest[..rest.find(']')?];
+    (!class.is_empty()
+        && class
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '.'))
+    .then_some(class)
 }
 
 impl From<CommonErrorCause> for SparkThrowable {
@@ -461,6 +479,9 @@ impl From<SparkError> for Status {
             }
             SparkError::AnalysisError(s) => SparkThrowable::AnalysisException(s).into(),
             SparkError::ParseError(s) => SparkThrowable::ParseException(s).into(),
+            e @ SparkError::OperationCanceled => {
+                SparkThrowable::SparkException(e.to_string()).into()
+            }
             e @ SparkError::SendError(_) => {
                 Status::cancelled(truncate_grpc_message(&e.to_string()))
             }
@@ -474,6 +495,21 @@ impl From<SparkError> for Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_error_class_reads_the_message_prefix() {
+        assert_eq!(
+            spark_error_class("[OPERATION_CANCELED] Operation has been cancelled."),
+            Some("OPERATION_CANCELED")
+        );
+        assert_eq!(
+            spark_error_class("[INVALID_ARRAY_INDEX.X1] bad"),
+            Some("INVALID_ARRAY_INDEX.X1")
+        );
+        assert_eq!(spark_error_class("[1, 2] is not a class"), None);
+        assert_eq!(spark_error_class("[] empty"), None);
+        assert_eq!(spark_error_class("no prefix"), None);
+    }
 
     #[test]
     fn truncate_grpc_message_preserves_tail() {

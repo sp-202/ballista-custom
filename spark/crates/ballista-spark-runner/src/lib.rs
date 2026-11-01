@@ -79,9 +79,10 @@ impl JobRunner for BallistaJobRunner {
         ))
     }
 
+    /// Called when the Spark session is released: cancels its Ballista jobs
+    /// that are still running (BS-012).
     async fn stop(&self) {
-        // Jobs are owned by the scheduler; cancelling running jobs when a
-        // session closes is follow-up work.
+        self.submitter.cancel_all().await;
         log::debug!(
             "Ballista job runner stopped for session {}",
             self.submitter.session_id()

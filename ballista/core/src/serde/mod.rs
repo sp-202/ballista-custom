@@ -61,9 +61,9 @@ use crate::execution_plans::{
     FinalizedPartitionState, InputOrder, OrderedRangeRepartitionExec, PartitionGroup,
     PartitionedBoundedWindowAggExec, PerPartitionFilterExec, PipelinedShuffleReaderExec,
     PipelinedShuffleWriterExec, PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec,
-    RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, ShuffleReaderExec,
-    ShuffleWriterExec, SortShuffleWriterExec, UnorderedRangeRepartitionExec,
-    UnresolvedShuffleExec, WindowApply,
+    RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, SelectPartitionsExec,
+    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    UnorderedRangeRepartitionExec, UnresolvedShuffleExec, WindowApply,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -918,6 +918,18 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 };
                 Ok(Arc::new(exec))
             }
+            PhysicalPlanType::SelectPartitions(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "SelectPartitionsExec expects one input, got {}",
+                        inputs.len()
+                    )));
+                };
+                Ok(Arc::new(SelectPartitionsExec::try_new(
+                    input.clone(),
+                    node.partitions.iter().map(|&p| p as usize).collect(),
+                )?))
+            }
             PhysicalPlanType::EmptyPartitions(node) => {
                 let schema: SchemaRef = Arc::new(convert_required!(node.schema)?);
                 Ok(Arc::new(EmptyPartitionsExec::new(
@@ -1433,6 +1445,21 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             })?;
 
             Ok(())
+        } else if let Some(exec) = node.downcast_ref::<SelectPartitionsExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::SelectPartitions(
+                    protobuf::SelectPartitionsExecNode {
+                        partitions: exec.partitions().iter().map(|&p| p as u32).collect(),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode select partitions execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
         } else if let Some(exec) = node.downcast_ref::<EmptyPartitionsExec>() {
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::EmptyPartitions(
@@ -1873,6 +1900,33 @@ mod test {
             decoded_exec.coalesce.is_none(),
             "absent coalesce field must decode to None (codec inertness)"
         );
+    }
+
+    #[test]
+    fn select_partitions_roundtrip() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyPartitionsExec::new(schema, 6));
+        let original =
+            SelectPartitionsExec::try_new(Arc::clone(&input), vec![4, 1]).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded
+            .downcast_ref::<SelectPartitionsExec>()
+            .expect("Expected SelectPartitionsExec");
+        assert_eq!(decoded.partitions(), &[4, 1]);
+        assert_eq!(decoded.properties().partitioning.partition_count(), 2);
     }
 
     #[test]

@@ -60,6 +60,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tonic::metadata::MetadataMap;
 use tonic::service::interceptor::InterceptedService;
@@ -420,14 +421,14 @@ impl<T: 'static + AsLogicalPlan> ExecutionPlan for DistributedQueryExec<T> {
 /// [LogicalPlan] that the scheduler turns into a physical plan itself, the caller
 /// supplies the physical plan up front - e.g. for plans containing custom
 /// operators that have no logical-plan representation.
-pub async fn execute_physical_plan<U: 'static + AsExecutionPlan>(
+pub async fn submit_physical_plan<U: 'static + AsExecutionPlan>(
     scheduler_url: String,
     config: &BallistaConfig,
     physical_plan: Arc<dyn ExecutionPlan>,
     codec: &dyn PhysicalExtensionCodec,
     session_id: String,
     session_config: SessionConfig,
-) -> Result<SendableRecordBatchStream> {
+) -> Result<(SendableRecordBatchStream, JobCancelHandle)> {
     let plan_message =
         U::try_from_physical_plan(physical_plan.clone(), codec).map_err(|e| {
             DataFusionError::Internal(format!("failed to serialize physical plan: {e:?}"))
@@ -457,7 +458,6 @@ pub async fn execute_physical_plan<U: 'static + AsExecutionPlan>(
     };
 
     let metrics = Arc::new(ExecutionPlanMetricsSet::new());
-    let job_id_handle = Arc::new(Mutex::new(None));
     let partition = 0;
 
     // Prefer the BallistaConfig registered on the task's session config.
@@ -468,50 +468,243 @@ pub async fn execute_physical_plan<U: 'static + AsExecutionPlan>(
         .options()
         .extensions
         .get::<BallistaConfig>()
-        .unwrap_or(config);
-    let grpc_config = GrpcClientConfig::from(bc);
+        .unwrap_or(config)
+        .clone();
+    let grpc_config = GrpcClientConfig::from(&bc);
+    let handle = JobCancelHandle::new(
+        scheduler_url.clone(),
+        grpc_config.clone(),
+        bc.grpc_client_max_message_size(),
+        session_config.ballista_grpc_interceptor(),
+        session_config.ballista_override_create_grpc_client_endpoint(),
+    );
 
-    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> =
-        if bc.client_pull() {
-            Box::pin(
-                execute_query_pull(
-                    scheduler_url,
-                    session_id,
-                    query,
-                    bc.grpc_client_max_message_size(),
-                    grpc_config,
-                    metrics,
-                    job_id_handle,
-                    partition,
-                    session_config.ballista_grpc_interceptor(),
-                    session_config.ballista_override_create_grpc_client_endpoint(),
-                    bc.use_tls(),
-                    bc.pipelined_registration_timeout(),
-                )
-                .await?,
+    // Submitted on first poll, so the caller holds the stream (and can drop or
+    // cancel it) while the job runs; the submit functions return only once
+    // the job has finished.
+    let job_id_handle = Arc::clone(&handle.inner.job_id);
+    let submitting = handle.clone();
+    let submit = async move {
+        if submitting.inner.cancelled.load(Ordering::Acquire) {
+            return Err(DataFusionError::Execution(
+                "Ballista job cancelled before it was submitted".to_string(),
+            ));
+        }
+        let stream: BoxStream<'static, Result<RecordBatch>> = if bc.client_pull() {
+            execute_query_pull(
+                scheduler_url,
+                session_id,
+                query,
+                bc.grpc_client_max_message_size(),
+                grpc_config,
+                metrics,
+                job_id_handle,
+                partition,
+                session_config.ballista_grpc_interceptor(),
+                session_config.ballista_override_create_grpc_client_endpoint(),
+                bc.use_tls(),
+                bc.pipelined_registration_timeout(),
             )
+            .await?
+            .boxed()
         } else {
-            Box::pin(
-                execute_query_push(
-                    scheduler_url,
-                    query,
-                    bc.grpc_client_max_message_size(),
-                    grpc_config,
-                    metrics,
-                    job_id_handle,
-                    partition,
-                    session_config.ballista_grpc_interceptor(),
-                    session_config.ballista_override_create_grpc_client_endpoint(),
-                    bc.use_tls(),
-                    bc.pipelined_registration_timeout(),
-                )
-                .await?,
+            execute_query_push(
+                scheduler_url,
+                query,
+                bc.grpc_client_max_message_size(),
+                grpc_config,
+                metrics,
+                job_id_handle,
+                partition,
+                session_config.ballista_grpc_interceptor(),
+                session_config.ballista_override_create_grpc_client_endpoint(),
+                bc.use_tls(),
+                bc.pipelined_registration_timeout(),
             )
+            .await?
         };
+        Ok::<_, DataFusionError>(stream)
+    };
+    let stream = CancelOnDrop {
+        stream: futures::stream::once(submit).try_flatten().boxed(),
+        handle: handle.clone(),
+    };
 
     let schema = physical_plan.schema();
-    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    Ok((
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
+        handle,
+    ))
 }
+
+/// Runs `physical_plan` as a Ballista job and streams its results; see
+/// [`submit_physical_plan`]. The job is cancelled if the stream is dropped
+/// before its end.
+pub async fn execute_physical_plan<U: 'static + AsExecutionPlan>(
+    scheduler_url: String,
+    config: &BallistaConfig,
+    physical_plan: Arc<dyn ExecutionPlan>,
+    codec: &dyn PhysicalExtensionCodec,
+    session_id: String,
+    session_config: SessionConfig,
+) -> Result<SendableRecordBatchStream> {
+    submit_physical_plan::<U>(
+        scheduler_url,
+        config,
+        physical_plan,
+        codec,
+        session_id,
+        session_config,
+    )
+    .await
+    .map(|(stream, _)| stream)
+}
+
+/// A job submitted by [`submit_physical_plan`], seen from the client: its id
+/// once the scheduler has assigned one, and whether its results were read to
+/// the end. [`cancel`](Self::cancel) cancels it unless it finished.
+#[derive(Clone)]
+pub struct JobCancelHandle {
+    inner: Arc<JobCancelInner>,
+}
+
+struct JobCancelInner {
+    job_id: Arc<Mutex<Option<JobId>>>,
+    finished: AtomicBool,
+    /// Set by `cancel`; a job not submitted yet is then never submitted.
+    cancelled: AtomicBool,
+    scheduler_url: String,
+    grpc_config: GrpcClientConfig,
+    max_message_size: usize,
+    grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
+    customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+}
+
+impl JobCancelHandle {
+    fn new(
+        scheduler_url: String,
+        grpc_config: GrpcClientConfig,
+        max_message_size: usize,
+        grpc_interceptor: Arc<BallistaGrpcMetadataInterceptor>,
+        customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(JobCancelInner {
+                job_id: Arc::new(Mutex::new(None)),
+                finished: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                scheduler_url,
+                grpc_config,
+                max_message_size,
+                grpc_interceptor,
+                customize_endpoint,
+            }),
+        }
+    }
+
+    /// The job's id, once the scheduler has assigned one.
+    pub fn job_id(&self) -> Option<JobId> {
+        self.inner.job_id.lock().clone()
+    }
+
+    /// Whether the job's results were read to the end.
+    pub fn is_finished(&self) -> bool {
+        self.inner.finished.load(Ordering::Acquire)
+    }
+
+    /// Cancels the job unless its results were read to the end. A job not yet
+    /// submitted is never submitted. Between submission and the scheduler's
+    /// first status update the id is unknown and the job cannot be cancelled.
+    pub async fn cancel(&self) {
+        if self.is_finished() || self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(job_id) = self.job_id() else {
+            info!("Ballista job cancelled before the scheduler assigned it an id");
+            return;
+        };
+        match self.connect().await {
+            Ok(mut scheduler) => {
+                info!("Cancelling Ballista job {job_id}");
+                cancel_job(&mut scheduler, job_id.as_str()).await;
+            }
+            Err(e) => warn!("Failed to reach the scheduler to cancel job {job_id}: {e}"),
+        }
+    }
+
+    async fn connect(&self) -> Result<SchedulerClient> {
+        let inner = &self.inner;
+        let mut endpoint = create_grpc_client_endpoint(
+            inner.scheduler_url.clone(),
+            Some(&inner.grpc_config),
+        )
+        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+        if let Some(customize) = &inner.customize_endpoint {
+            endpoint = customize
+                .configure_endpoint(endpoint)
+                .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+        }
+        let connection = endpoint
+            .connect()
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+        Ok(SchedulerGrpcClient::with_interceptor(
+            connection,
+            inner.grpc_interceptor.as_ref().clone(),
+        )
+        .max_encoding_message_size(inner.max_message_size)
+        .max_decoding_message_size(inner.max_message_size))
+    }
+}
+
+/// A job's result stream that marks the job finished at its end and cancels
+/// the job if dropped before then: a client that stops reading (a Spark
+/// interrupt, a closed session) leaves no job running on the cluster.
+struct CancelOnDrop {
+    stream: BoxStream<'static, Result<RecordBatch>>,
+    handle: JobCancelHandle,
+}
+
+impl Stream for CancelOnDrop {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let item = self.stream.poll_next_unpin(cx);
+        if let std::task::Poll::Ready(None) = item {
+            self.handle.inner.finished.store(true, Ordering::Release);
+        }
+        item
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.handle.is_finished() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                info!(
+                    "Result stream of Ballista job {:?} dropped before its end; cancelling it",
+                    self.handle.job_id()
+                );
+                let handle = self.handle.clone();
+                runtime.spawn(async move { handle.cancel().await });
+            }
+            Err(_) => warn!(
+                "Result stream of Ballista job {:?} dropped outside a Tokio runtime; not cancelled",
+                self.handle.job_id()
+            ),
+        }
+    }
+}
+
+/// Response metadata key under which the scheduler returns a pushed job's id,
+/// so a client can cancel the job before its first status update arrives.
+pub const JOB_ID_HEADER: &str = "ballista-job-id";
 
 type SchedulerClient =
     SchedulerGrpcClient<InterceptedService<Channel, BallistaGrpcMetadataInterceptor>>;
@@ -1112,6 +1305,13 @@ async fn execute_query_push(
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
     let version_check =
         check_scheduler_version(crate::BALLISTA_VERSION, query_push_response.metadata());
+    if let Some(job_id) = query_push_response
+        .metadata()
+        .get(JOB_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        job_id_handle.lock().get_or_insert_with(|| job_id.into());
+    }
     let mut query_status_stream = query_push_response.into_inner();
 
     if let Err(e) = version_check {

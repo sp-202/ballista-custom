@@ -31,13 +31,15 @@ decimal averages differ in the last digit (BS-009).
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | Connect `sc://host:15002`, `spark.sql(...).collect()` | ✅ | TPC-H/TPC-DS runs |
-| `spark.range`, `select`, `groupBy().count()`, `orderBy`, aggregate functions | ✅ | `smoke.py` |
+| `spark.range`, `select`, `groupBy().count()`, `orderBy`, aggregate functions | ✅ | `tests/connect_operations.py`; `range` with many partitions fixed in BS-027 |
 | `spark.read.parquet(path)`, temp views | ✅ | TPC-DS runner registers 24 tables this way |
 | `spark.read` of a missing path raises `PATH_NOT_FOUND` | ✅ | BS-017 |
 | Server-side Spark conf (`ballista-connect --conf k=v`) | ✅ | BS-020 |
 | `df.repartition(n)` as a stage boundary | ❌ | BS-010 |
-| Closing a session cancels its jobs | ❌ | BS-012 |
-| Interrupt / reattach (`spark.interruptAll`, reattachable execute) | ❔ | step 02 |
+| Closing a session cancels its jobs | ✅ | BS-012; `tests/connect_operations.py` |
+| `df.explain()` (all modes) | ✅ | `tests/connect_operations.py` |
+| `spark.interruptAll` / `interruptTag`: job stopped, client gets `OPERATION_CANCELED` | ✅ | BS-012; `tests/connect_operations.py` |
+| Reattach after a dropped connection | ✅ | `tests/connect_operations.py` (proxy cuts the connection mid-query) |
 | `df.write` to a path (parquet) | ❔ | managed-table writes tested, path writes not |
 | Other `spark.read` formats (CSV, JSON, ORC, text) | ❔ | |
 | `df.cache()` / `persist()` | ❔ | scheduler has a cache linker; untested from Connect |
@@ -114,4 +116,3 @@ decimal averages differ in the last digit (BS-009).
 1. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
 2. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
 3. AQE: skew join splitting.
-4. Closing a session cancels its jobs (BS-012): a stopped client leaves its job running.

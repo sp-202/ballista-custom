@@ -115,11 +115,13 @@ impl ExecutionPlan for BallistaSubplanExec {
         let submitter = self.submitter.clone();
         let plan = self.plan.clone();
         let session_config = self.session_config.clone();
-        let stream = futures::stream::once(async move {
-            submitter.submit(plan, session_config).await
-        })
-        .try_flatten()
-        .boxed();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream)))
+        let stream =
+            futures::stream::once(async move { submitter.submit(plan, session_config).await })
+                .try_flatten()
+                .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
     }
 }

@@ -28,6 +28,7 @@ has to be re-applied when updating from upstream.
 | `sail-session/src/session_factory/job_runner.rs` | Public `SessionJobRunner::new(Box<dyn JobRunner>)` | Lets a Ballista job runner be plugged in |
 | `sail-session/src/session_manager/mod.rs` | `create_session_manager_with_job_runner_factory`; `create_session_manager` delegates to it | Same |
 | `sail-spark-connect/src/session_manager.rs` | `create_spark_session_manager_with_factories` | Same |
+| `sail-spark-connect/src/session.rs`, `service/plan_executor.rs`, `error.rs` | Remember interrupted operation ids; reattaching to one fails with `[OPERATION_CANCELED]` (`SparkError::OperationCanceled`); errors whose message starts with `[ERROR_CLASS]` carry it as `errorClass` | PySpark then raises `SparkException` with `getCondition() == "OPERATION_CANCELED"` after an interrupt, as with Spark, instead of "operation not found" |
 | `sail-spark-connect/src/entrypoint.rs` | `serve_with_factories`; shared `serve_session_manager` used by both serve functions | Same |
 | `sail-common-datafusion/src/error.rs` | Handle `DataFusionError::SQL` | Ballista enables DataFusion's `sql` feature, which adds this variant |
 | `sail-plan/src/resolver/expression/wildcard.rs` | Build wildcard options with `sqlparser` AST types | Under the `sql` feature DataFusion uses `sqlparser` types instead of `datafusion_expr::sql`; the rename/replace items are display-only (DataFusion evaluates `planned_expressions`), so results are unchanged |
@@ -48,8 +49,5 @@ the Ballista integration crates, DataFusion's `sql` feature declared, and a
 - Executors use Ballista's default runtime environment, so object stores
   configured through Sail settings (S3, GCS, Azure, HDFS) are not yet
   registered on executors.
-- `BallistaJobRunner::stop` does not cancel running jobs.
 - DDL such as `DROP VIEW` returns one row `value: true`; Spark returns an
   empty result with no columns.
-- Spark plans are submitted as physical plans, which Ballista's scheduler
-  currently runs without AQE (roadmap step 03).

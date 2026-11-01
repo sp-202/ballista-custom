@@ -582,6 +582,7 @@ pub(crate) async fn handle_interrupt_all(ctx: &SessionContext) -> SparkResult<Ve
     let mut results = vec![];
     for executor in spark.remove_all_executors()? {
         executor.pause_if_running().await?;
+        spark.mark_interrupted(&executor.metadata.operation_id)?;
         results.push(executor.metadata.operation_id.clone());
     }
     Ok(results)
@@ -595,6 +596,7 @@ pub(crate) async fn handle_interrupt_tag(
     let mut results = vec![];
     for executor in spark.remove_executors_by_tag(tag.as_str())? {
         executor.pause_if_running().await?;
+        spark.mark_interrupted(&executor.metadata.operation_id)?;
         results.push(executor.metadata.operation_id.clone());
     }
     Ok(results)
@@ -608,6 +610,7 @@ pub(crate) async fn handle_interrupt_operation_id(
     match spark.remove_executor(operation_id.as_str())? {
         Some(executor) => {
             executor.pause_if_running().await?;
+            spark.mark_interrupted(&executor.metadata.operation_id)?;
             Ok(vec![executor.metadata.operation_id.clone()])
         }
         None => Ok(vec![]),
@@ -620,9 +623,16 @@ pub(crate) async fn handle_reattach_execute(
     response_id: Option<String>,
 ) -> SparkResult<ExecutePlanResponseStream> {
     let spark = ctx.extension::<SparkSession>()?;
-    let executor = spark
-        .get_executor(operation_id.as_str())?
-        .ok_or_else(|| SparkError::invalid(format!("operation not found: {operation_id}")))?;
+    let executor = spark.get_executor(operation_id.as_str())?.ok_or_else(|| {
+        if spark
+            .was_interrupted(operation_id.as_str())
+            .unwrap_or(false)
+        {
+            SparkError::OperationCanceled
+        } else {
+            SparkError::invalid(format!("operation not found: {operation_id}"))
+        }
+    })?;
     if !executor.metadata.reattachable {
         return Err(SparkError::invalid(format!(
             "operation not reattachable: {operation_id}"

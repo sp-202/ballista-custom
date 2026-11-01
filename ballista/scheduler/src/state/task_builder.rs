@@ -38,7 +38,7 @@
 
 use ballista_core::execution_plans::plan_algebra::as_partition_sliceable;
 use ballista_core::execution_plans::{
-    EmptyPartitionsExec, RangeShuffleReaderExec, ShuffleReaderExec,
+    EmptyPartitionsExec, RangeShuffleReaderExec, SelectPartitionsExec, ShuffleReaderExec,
 };
 use datafusion::common::internal_err;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -86,6 +86,15 @@ fn restrict(
         && let Some(rewritten) = select_output_partitions(&plan, partitions)?
     {
         return Ok(rewritten);
+    }
+    // Any other leaf: expose just the task's partitions. Without this, a leaf
+    // with no rule above (Spark's `RangeExec`, an unrecognised data source)
+    // would run all its partitions in every task.
+    if !under_collect
+        && plan.children().is_empty()
+        && let Some(selected) = select_leaf_partitions(&plan, partitions)?
+    {
+        return Ok(selected);
     }
 
     // Operators carrying data indexed by global input partition slice it
@@ -267,6 +276,24 @@ fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool>
 /// a leaf below a `CoalescePartitionsExec` / `SortPreservingMergeExec` /
 /// join build side must read its full upstream) lives in the walker —
 /// the walker simply doesn't call this function under collapse.
+/// Wraps a leaf in a [`SelectPartitionsExec`] keeping the task's partitions
+/// that the leaf has, the way a file scan keeps the file groups that exist.
+/// The leaf itself when that keeps every partition in order.
+fn select_leaf_partitions(
+    plan: &Arc<dyn ExecutionPlan>,
+    indices: &[usize],
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let count = plan.properties().output_partitioning().partition_count();
+    let kept: Vec<usize> = indices.iter().copied().filter(|&p| p < count).collect();
+    if kept.iter().copied().eq(0..count) {
+        return Ok(Some(Arc::clone(plan)));
+    }
+    Ok(Some(Arc::new(SelectPartitionsExec::try_new(
+        Arc::clone(plan),
+        kept,
+    )?)))
+}
+
 fn select_output_partitions(
     plan: &Arc<dyn ExecutionPlan>,
     indices: &[usize],
@@ -530,6 +557,33 @@ mod tests {
         let union: Arc<dyn ExecutionPlan> =
             UnionExec::try_new(vec![reader, repartitioned]).unwrap();
         assert!(restrict_plan_to_partitions(union, &[0, 5]).is_err());
+    }
+
+    /// A leaf with no specific rule (Spark's `RangeExec` is one) is restricted
+    /// to the task's partitions, keeping those it has, like a file scan.
+    #[test]
+    fn leaf_without_a_rule_is_restricted_to_the_slice() {
+        use ballista_core::execution_plans::SelectPartitionsExec;
+        use datafusion::physical_plan::test::exec::BlockingExec;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(BlockingExec::new(schema, 56));
+
+        let restricted =
+            restrict_plan_to_partitions(Arc::clone(&leaf), &[8, 9, 10]).unwrap();
+        let select = restricted
+            .downcast_ref::<SelectPartitionsExec>()
+            .expect("restricted through SelectPartitionsExec");
+        assert_eq!(select.partitions(), &[8, 9, 10]);
+
+        // Indices past the leaf's partitions are dropped; the whole range is a no-op.
+        let past = restrict_plan_to_partitions(Arc::clone(&leaf), &[55, 56, 57]).unwrap();
+        assert_eq!(past.properties().output_partitioning().partition_count(), 1);
+        let all: Vec<usize> = (0..56).collect();
+        assert!(
+            restrict_plan_to_partitions(Arc::clone(&leaf), &all)
+                .unwrap()
+                .is::<BlockingExec>()
+        );
     }
 
     #[test]
