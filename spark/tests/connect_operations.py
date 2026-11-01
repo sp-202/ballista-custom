@@ -195,6 +195,22 @@ def test_dynamic_partition_pruning(spark, scheduler, warehouse):
           rows and sum(rows) == 200_000, f"scan rows {rows}")
 
 
+def test_partitioned_write(spark, warehouse):
+    """Partitioned parquet writes run in every task (BS-034); overwrite keeps only the
+    new rows, append adds to them."""
+    import uuid
+    path = f"{warehouse}/ops_write_{uuid.uuid4().hex[:8]}"
+    rows = lambda n, k: spark.range(0, n, 1, 16).select("id", (F.col("id") % k).alias("d"))
+    read = lambda: tuple(spark.read.parquet(path).agg(
+        F.count("*"), F.sum("id"), F.countDistinct("d")).collect()[0])
+    rows(1_000_000, 100).write.partitionBy("d").parquet(path)
+    check("partitioned write", read() == (1_000_000, 499_999_500_000, 100), str(read()))
+    rows(100_000, 10).write.mode("overwrite").partitionBy("d").parquet(path)
+    check("partitioned overwrite keeps only new rows", read() == (100_000, 4_999_950_000, 10), str(read()))
+    rows(100_000, 10).write.mode("append").partitionBy("d").parquet(path)
+    check("partitioned append", read() == (200_000, 9_999_900_000, 10), str(read()))
+
+
 def test_object_store(spark, path):
     """Write to and read back from an object store (BS-011). Needs the store
     configured on every node, e.g. AWS_* settings for S3."""
@@ -313,6 +329,7 @@ def main():
     if args.warehouse:
         test_iceberg(spark, args.warehouse)
         test_dynamic_partition_pruning(spark, args.scheduler, args.warehouse)
+        test_partitioned_write(spark, args.warehouse)
     if args.s3_path:
         test_object_store(spark, args.s3_path)
     test_interrupts(spark, args.scheduler)

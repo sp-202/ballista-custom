@@ -42,7 +42,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-031](#bs-031) | 🔴 | S1 | Delta `MERGE` intermittently loses rows (unsorted input to the partitioned writer) | 05 |
 | [BS-032](#bs-032) | 🟢 | S1 | Iceberg `UPDATE` / `MERGE` fail: scans lose virtual columns in serialization | 05 |
 | [BS-033](#bs-033) | 🟢 | S3 | No dynamic partition pruning: broadcast joins read the whole fact table | 07 |
-| [BS-034](#bs-034) | 🔴 | S3 | File writes run in one task; partitioned writes run out of memory | 05 |
+| [BS-034](#bs-034) | 🟢 | S3 | File writes run in one task; partitioned writes run out of memory | 05 |
 | [BS-035](#bs-035) | 🔴 | S2 | `bucketBy` writes unsupported (no co-located bucketed joins) | 05 |
 
 ---
@@ -573,7 +573,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   checks the answer and that the fact scan outputs only the 2 matching partitions.
 
 ## BS-034
-**File writes run in one task; partitioned writes run out of memory** · 🔴 open · step 05
+**File writes run in one task; partitioned writes run out of memory** · 🟢 fixed 2026-11-01 · step 05
 - **Evidence:** `df.write.partitionBy("d").parquet(path)` of 10M rows with 100 values of `d`
   failed with `ResourcesExhausted`; with 20 values it works. The job's last stage is one task:
   `ShuffleReaderExec → CoalescePartitionsExec → DataSinkExec(ParquetSink)`. Spark writes from
@@ -581,11 +581,23 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Cause:** DataFusion's `DataSinkExec` requires a single input partition and demultiplexes
   rows to files itself, so every row passes through one task, which keeps an open writer
   per partition value.
-- **Plan:** a per-partition write node (each task writes its own files with the same sink)
-  feeding a single commit node that sums the counts. Overwrite currently deletes the target
-  first inside the write's stage (`BarrierExec`); with writes in an earlier stage the commit
-  node must instead delete the old files after all writes succeed, keeping the files this job
-  wrote (`ParquetSink::written`).
+- **Fix:** `sail-data-source` `listing/distributed_write.rs`, planned by `plan_file_write`.
+  `PartitionedFileWriteExec` runs the same sink once per input partition (each call names
+  its files with its own random write id; one file per partition when unpartitioned, as
+  Spark writes one per task), and `FileWriteCommitExec` over all partitions sums the counts.
+  Overwrite used to delete the target first, inside the write's stage (`BarrierExec`); with
+  the writes in an earlier stage the commit instead deletes, after every write succeeded,
+  each file under the path that this write did not produce (`ParquetSink::written`), so a
+  failed write leaves the old data. Only Parquet reports its files, so CSV/JSON/text
+  overwrites and writes with a required sort order keep the single-task plan. Both nodes
+  are in Sail's codec (`physical.proto` 67, 68).
+- **Verified:** TPC-H 22/22 (16.4 s), TPC-DS 99/99 (146.1 s). The 100-value write runs in 28 tasks (1.3 s); overwrite, append, CSV
+  overwrite and managed `INSERT OVERWRITE` give the expected rows, and vanilla Spark 3.5.8
+  reads every output with the same count, sum and partition values.
+  `tests/connect_operations.py` checks write, overwrite and append.
+- **Left:** an overwrite leaves the old partitions' directories empty (Spark removes them;
+  readers see no rows there). Writing every task's share of every partition makes
+  tasks × partition-values files, as Spark does without a repartition on the partition column.
 
 ## BS-035
 **`bucketBy` writes unsupported (no co-located bucketed joins)** · 🔴 open · step 05

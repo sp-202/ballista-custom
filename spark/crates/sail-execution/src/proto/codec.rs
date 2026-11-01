@@ -125,6 +125,7 @@ use sail_data_source::formats::socket::{SocketReadOptions, SocketSourceExec};
 use sail_data_source::formats::text::source::TextSource;
 use sail_data_source::formats::text::writer::{TextSink, TextWriterOptions};
 use sail_data_source::listing::delete::FileDeleteExec;
+use sail_data_source::listing::distributed_write::{FileWriteCommitExec, PartitionedFileWriteExec};
 use sail_data_source::options::r#gen::RateReadOptions;
 use sail_delta_lake::physical_plan::{
     DeletionVectorRowOperationMode, DeletionVectorRowsWriterConfig, DeletionVectorRowsWriterExec,
@@ -1462,6 +1463,24 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     Arc::new(data_sink),
                     sort_order,
                 )))
+            }
+            NodeKind::PartitionedFileWrite(r#gen::PartitionedFileWriteExecNode { sink }) => {
+                let sink =
+                    try_decode_physical_plan_with_converter(ctx, &*self.nested(), proto_converter, &sink)?;
+                Ok(Arc::new(PartitionedFileWriteExec::new(sink)))
+            }
+            NodeKind::FileWriteCommit(r#gen::FileWriteCommitExecNode { input, overwrite }) => {
+                let input =
+                    try_decode_physical_plan_with_converter(ctx, &*self.nested(), proto_converter, &input)?;
+                let overwrite = overwrite
+                    .map(|r#gen::FileDeleteExecNode { object_store_url, path }| {
+                        let url = datafusion::execution::object_store::ObjectStoreUrl::parse(object_store_url)?;
+                        let path = object_store::path::Path::parse(path)
+                            .map_err(|e| plan_datafusion_err!("invalid overwrite path: {e}"))?;
+                        Ok::<_, datafusion::common::DataFusionError>((url, path))
+                    })
+                    .transpose()?;
+                Ok(Arc::new(FileWriteCommitExec::new(input, overwrite)))
             }
             NodeKind::FileDelete(r#gen::FileDeleteExecNode {
                 object_store_url,
@@ -3517,6 +3536,24 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 rewrite_data_files,
             })
+        } else if let Some(write) = node.downcast_ref::<PartitionedFileWriteExec>() {
+            let sink = try_encode_physical_plan_with_converter(
+                &*self.nested(),
+                proto_converter,
+                write.sink().clone(),
+            )?;
+            NodeKind::PartitionedFileWrite(r#gen::PartitionedFileWriteExecNode { sink })
+        } else if let Some(commit) = node.downcast_ref::<FileWriteCommitExec>() {
+            let input = try_encode_physical_plan_with_converter(
+                &*self.nested(),
+                proto_converter,
+                commit.input().clone(),
+            )?;
+            let overwrite = commit.overwrite().map(|(url, path)| r#gen::FileDeleteExecNode {
+                object_store_url: url.as_str().to_string(),
+                path: path.to_string(),
+            });
+            NodeKind::FileWriteCommit(r#gen::FileWriteCommitExecNode { input, overwrite })
         } else if let Some(file_delete_exec) = node.downcast_ref::<FileDeleteExec>() {
             NodeKind::FileDelete(r#gen::FileDeleteExecNode {
                 object_store_url: file_delete_exec.object_store_url().as_str().to_string(),

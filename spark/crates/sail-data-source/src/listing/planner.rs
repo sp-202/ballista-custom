@@ -35,6 +35,7 @@ use sail_common_datafusion::streaming::event::schema::is_flow_event_schema;
 use sail_physical_plan::barrier::BarrierExec;
 
 use crate::listing::delete::FileDeleteExec;
+use crate::listing::distributed_write::distribute_file_write;
 use crate::listing::source::{ListingScanInput, ListingSinkInput};
 use crate::listing::table::ListingTableSource;
 use crate::listing::utils::{
@@ -250,6 +251,12 @@ async fn plan_file_write(
             },
         )
         .await?;
+    // Write from every partition, as Spark writes from every task, when the sink allows it.
+    let overwrite_target =
+        overwrite.then(|| (object_store_url.clone(), table_path.prefix().clone()));
+    if let Some(plan) = distribute_file_write(&plan, overwrite_target) {
+        return Ok(plan);
+    }
     if *overwrite {
         let delete = Arc::new(FileDeleteExec::new(
             object_store_url,

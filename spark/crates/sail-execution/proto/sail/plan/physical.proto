@@ -79,6 +79,8 @@ message ExtendedPhysicalPlanNode {
     InputFileMetadataExecNode input_file_metadata = 64;
     DeltaMaintenanceExecNode delta_maintenance = 65;
     DeltaOptimizeRewriteExecNode delta_optimize_rewrite = 66;
+    PartitionedFileWriteExecNode partitioned_file_write = 67;
+    FileWriteCommitExecNode file_write_commit = 68;
   }
 }
 
@@ -968,6 +970,17 @@ message TextSinkExecNode {
 message FileDeleteExecNode {
   string object_store_url = 1;
   string path = 2;
+}
+
+message PartitionedFileWriteExecNode {
+  // The DataSinkExec (with its input) run once per input partition.
+  bytes sink = 1;
+}
+
+message FileWriteCommitExecNode {
+  bytes input = 1;
+  // Set for an overwrite: files under this path that the write did not produce are deleted.
+  optional FileDeleteExecNode overwrite = 2;
 }
 
 message StreamCollectorExecNode {
