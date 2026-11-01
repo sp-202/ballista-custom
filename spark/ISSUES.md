@@ -32,6 +32,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-021](#bs-021) | 🟢 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
 | [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
 | [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
+| [BS-024](#bs-024) | 🔴 | S1 | TPC-DS q23 (second SELECT) loses a row on Spark Connect | 03 |
 
 ---
 
@@ -316,4 +317,10 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   stage retired by a replan) except the one the job's output locations point at.
 - **Verified:** after q1–q5 each executor keeps only the final stage (116K / 44K); whole-job
   cleanup still removes the rest after 300 s; no deleted-but-open files in the executor.
+
+## BS-024
+**TPC-DS q23 (second SELECT) loses a row on Spark Connect** · 🔴 open · step 03
+- **Evidence:** TPC-DS SF10 q23's second SELECT returns `Thompson, Fidel, 5834.01` only;
+  Spark also returns `Barnes, Lowell, 202.14`. The first SELECT matches (6036.15). This is
+  the query that hung before BS-022; its plan has a `UNION ALL` branch that AQE turns empty.
 
