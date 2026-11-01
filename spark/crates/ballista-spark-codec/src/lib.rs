@@ -15,6 +15,12 @@
 //!   Sail encodes its own functions with a payload and leaves built-in
 //!   DataFusion functions empty, which DataFusion then resolves by name.
 //!
+//! File scans reach the codec as `CodecScanExec` (Ballista wraps them before
+//! encoding) and go to Sail as `RemoteDataSourceExec`, as Sail's own cluster
+//! encodes them: DataFusion's built-in scan encoding drops reader-produced
+//! virtual columns, such as the Parquet row number Iceberg row-level
+//! operations read. Scans Sail cannot encode fall back to Ballista's codec.
+//!
 //! Ballista nodes that embed expressions (e.g. the hash-partitioning
 //! expressions of a shuffle writer) encode them with Sail's codec too, via
 //! `BallistaPhysicalExtensionCodec::new`, so Spark functions can appear there.
@@ -23,6 +29,8 @@ use std::sync::Arc;
 
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::common::{Result, internal_err};
+use ballista_core::execution_plans::CodecScanExec;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use datafusion::physical_expr::PhysicalExpr;
@@ -31,6 +39,7 @@ use datafusion::physical_expr_common::physical_expr::proto_encode::PhysicalExprE
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
 use sail_execution::RemoteExecutionCodec;
+use sail_physical_plan::data_source::RemoteDataSourceExec;
 
 /// Which codec produced an encoded plan node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +146,18 @@ impl PhysicalExtensionCodec for SparkPhysicalCodec {
         buf: &mut Vec<u8>,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
+        if let Some(scan) = node
+            .downcast_ref::<CodecScanExec>()
+            .and_then(|wrapper| wrapper.scan().downcast_ref::<DataSourceExec>())
+        {
+            let remote: Arc<dyn ExecutionPlan> = Arc::new(RemoteDataSourceExec::new(scan));
+            if self
+                .try_encode_with(Origin::Sail, &remote, buf, proto_converter)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         match self.try_encode_with(Origin::Ballista, &node, buf, proto_converter) {
             Ok(()) => Ok(()),
             Err(ballista_err) => self

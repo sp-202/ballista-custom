@@ -18,6 +18,7 @@
 use crate::JobId;
 use crate::client::BallistaClient;
 use crate::config::BallistaConfig;
+use crate::execution_plans::CodecScanExec;
 use crate::error::BallistaError;
 use crate::extension::{
     BallistaConfigGrpcEndpoint, BallistaGrpcMetadataInterceptor, SessionConfigExt,
@@ -430,7 +431,8 @@ pub async fn submit_physical_plan<U: 'static + AsExecutionPlan>(
     session_config: SessionConfig,
 ) -> Result<(SendableRecordBatchStream, JobCancelHandle)> {
     let plan_message =
-        U::try_from_physical_plan(physical_plan.clone(), codec).map_err(|e| {
+        U::try_from_physical_plan(CodecScanExec::wrap_scans(physical_plan.clone())?, codec)
+            .map_err(|e| {
             DataFusionError::Internal(format!("failed to serialize physical plan: {e:?}"))
         })?;
     let mut buf: Vec<u8> = vec![];

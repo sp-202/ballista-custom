@@ -67,7 +67,13 @@ message BallistaPhysicalPlanNode {
     PipelinedShuffleReaderExecNode pipelined_shuffle_reader = 19;
     EmptyPartitionsExecNode empty_partitions = 20;
     SelectPartitionsExecNode select_partitions = 21;
+    CodecScanExecNode codec_scan = 22;
   }
+}
+
+// A file scan in DataFusion's own encoding (see `CodecScanExec`).
+message CodecScanExecNode {
+  datafusion.PhysicalPlanNode scan = 1;
 }
 
 // Output partition i is input partition `partitions[i]` (see `SelectPartitionsExec`).

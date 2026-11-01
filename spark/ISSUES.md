@@ -36,10 +36,11 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
 | [BS-026](#bs-026) | 🔴 | S4 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 | [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
-| [BS-028](#bs-028) | 🟡 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
-| [BS-029](#bs-029) | 🔴 | S3 | `spark_partition_id()` returns task-local partition ids | 02 |
+| [BS-028](#bs-028) | ⏸️ | S3 | TPC-DS q72 takes 71 s (vanilla Spark 17 s, Spark + Comet 2.2 s) — deferred | 07 |
+| [BS-029](#bs-029) | 🟢 | S3 | `spark_partition_id()` returns task-local partition ids | 02 |
 | [BS-030](#bs-030) | 🟢 | S1 | `df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize | 02 |
 | [BS-031](#bs-031) | 🔴 | S1 | Delta `MERGE` intermittently loses rows (unsorted input to the partitioned writer) | 05 |
+| [BS-032](#bs-032) | 🟢 | S1 | Iceberg `UPDATE` / `MERGE` fail: scans lose virtual columns in serialization | 05 |
 
 ---
 
@@ -439,7 +440,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** sums and counts exact for 3, 8, 56 and 100 partitions and 2 billion rows.
 
 ## BS-028
-**TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s)** · 🟡 in progress (now 71 s) · step 07
+**TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s)** · ⏸️ deferred at 71 s (2026-11-01) · step 07
 - **Evidence:** SF10, 16 cores each, same machine (runs of 2026-11-01; Comet's of 2026-10-12
   used the `datafusion-benchmarks` copy of the query). With q72 excluded Ballista's TPC-DS
   total is 76.8 s against Comet's 123.8 s and Spark's 305.1 s; q72 alone decides the total.
@@ -461,9 +462,14 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   1.1 billion rows pass through nine broadcast joins. Next needs per-operator time in that
   stage, which the UI does not report yet (step 11, "operator metrics"); a local DataFusion
   `EXPLAIN ANALYZE` of q72 did not finish in 15 minutes (its own planner picks another plan).
+- **Deferred (2026-11-01):** parked to focus on Iceberg. To resume: get per-operator time for
+  stage 5 (step 11 operator metrics), then compare the sort-merge join alone (36 s) against
+  Spark's whole-query 17 s. Candidates: the SMJ filter evaluation per key group, the nine
+  broadcast probes over 1.1 billion rows, batch sizes after the join. AQE skew splitting does
+  not apply: the time is in one large key fan-out, not one oversized partition.
 
 ## BS-029
-**`spark_partition_id()` returns task-local partition ids** · 🔴 open · step 02
+**`spark_partition_id()` returns task-local partition ids** · 🟢 fixed 2026-11-01 · step 02
 - **Evidence:** `spark.range(0, 10**6, 1, 4).repartition(16)` grouped by `spark_partition_id()`
   shows 4 ids, not 16. Rows and sums are right.
 - **Cause:** a task runs its slice of a stage's partitions as partitions `0..k` of its own
@@ -471,6 +477,13 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Plan:** let the restricted task plan carry each local partition's global id (the writer
   already has them as `global_output_partition_ids`) and have partition-dependent operators
   read it.
+- **Also broke:** Iceberg `MERGE` (`MERGE_CARDINALITY_VIOLATION`): it keys target rows with
+  `monotonically_increasing_id()`, whose ids repeated across tasks.
+- **Fix:** the task plan restriction (`task_builder.rs`) keeps an operator that reads its
+  partition index (`SparkPartitionIdExec`, `MonotonicIdExec`) whole and selects the task's
+  partitions above it with `SelectPartitionsExec`, so it executes global indices.
+- **Verified:** 16 ids for 16 partitions; 100,000 unique monotonic ids;
+  `tests/connect_operations.py`.
 
 ## BS-030
 **`df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize** · 🟢 fixed · step 02
@@ -510,3 +523,21 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   reader not claim it; check whether `DeltaWriterExec` drops add actions for repeated partition
   values; add the MERGE sequence above to `tests/connect_operations.py`.
 
+## BS-032
+**Iceberg `UPDATE` / `MERGE` fail: scans lose virtual columns in serialization** · 🟢 fixed 2026-11-01 · step 05
+- **Evidence:** `UPDATE t SET id = -1 WHERE k = 3` on an Iceberg table: `Could not parse plan:
+  Column index 5 out of bounds for projected expressions of length 5` on the scheduler.
+  Write, append, overwrite, partitioned write, read and `DELETE` worked.
+- **Cause:** row-level Iceberg operations scan Parquet with a reader-produced virtual column
+  (`__sail_iceberg_row_position`). DataFusion serializes `DataSourceExec` itself before asking
+  the extension codec, and its encoding has no virtual columns. Sail's own cluster avoids
+  this by wrapping scans in `RemoteDataSourceExec` before encoding (`sail-execution`
+  `encode_remote_physical_plan`); Ballista's encode paths did not.
+- **Fix:** `CodecScanExec` (ballista-core) wraps every scan right before a plan is encoded (job
+  submission, task definitions), so the extension codec gets it. The Spark codec hands it to
+  Sail as `RemoteDataSourceExec`, which also keeps the schema-evolution settings DataFusion's
+  encoding drops; Ballista's codec stores DataFusion's encoding, so plain Ballista is
+  unchanged. Then BS-029 for `MERGE`.
+- **Verified:** write, append, overwrite, partitioned write, `UPDATE`, `DELETE`, `MERGE` give
+  Spark's counts (`tests/connect_operations.py`); TPC-H 22/22 (14.9 s), TPC-DS 99/99
+  (148.9 s), unchanged.

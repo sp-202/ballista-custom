@@ -37,7 +37,7 @@ decimal averages differ in the last digit (BS-009).
 | `spark.read` of a missing path raises `PATH_NOT_FOUND` | ✅ | BS-017 |
 | Server-side Spark conf (`ballista-connect --conf k=v`) | ✅ | BS-020 |
 | `df.repartition(n)`, `repartition(n, cols)`, `coalesce(n)` | ✅ | BS-010, BS-030; `tests/connect_operations.py`. `coalesce(n)` costs a shuffle (Spark's does not) |
-| `spark_partition_id()` | ⚠️ | ids are task-local (BS-029) |
+| `spark_partition_id()`, `monotonically_increasing_id()` | ✅ | BS-029; `tests/connect_operations.py` |
 | Closing a session cancels its jobs | ✅ | BS-012; `tests/connect_operations.py` |
 | `df.explain()` (all modes) | ✅ | `tests/connect_operations.py` |
 | `spark.interruptAll` / `interruptTag`: job stopped, client gets `OPERATION_CANCELED` | ✅ | BS-012; `tests/connect_operations.py` |
@@ -68,7 +68,8 @@ decimal averages differ in the last digit (BS-009).
 | Catalogs: Hive Metastore, Glue, Iceberg REST, Unity | ❔ | available in Sail; step 05 |
 | Delta write, append, overwrite, partitioned write, `UPDATE`, `DELETE` | ✅ | tested 2026-11-01 (BS-013) |
 | Delta `MERGE` | ❌ | intermittently loses rows (BS-031) |
-| Iceberg | ❔ | available in Sail; step 05 |
+| Iceberg path tables: write, append, overwrite, partitioned write, read, partition filter, `UPDATE`, `DELETE`, `MERGE` | ✅ | BS-032, BS-029; `tests/connect_operations.py` |
+| Iceberg catalogs (REST, Glue, HMS), time travel, metadata tables, schema evolution | ❔ | available in Sail; step 05 |
 
 ## 4. Data sources and writes
 
@@ -117,7 +118,8 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
-1. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
-2. BS-028 — q72 now 71 s (was 124 s; Spark 17 s, Comet 2.2 s).
-3. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
-4. AQE: skew join splitting.
+1. Iceberg beyond path tables: REST catalog, time travel, metadata tables, schema evolution.
+2. AQE: skew join splitting (Spark's `OptimizeSkewedJoin`).
+3. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
+4. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
+5. BS-028 — q72 at 71 s (Spark 17 s), deferred.

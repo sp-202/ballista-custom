@@ -113,6 +113,41 @@ def test_repartition(spark):
               f"sum={row.s} count={row.c}")
 
 
+def test_partition_ids(spark):
+    """Partition-indexed functions see global partition ids, not task-local ones (BS-029)."""
+    df = spark.range(0, 100_000, 1, 16)
+    ids = df.select(F.spark_partition_id().alias("p")).distinct().count()
+    check("spark_partition_id() is distinct per partition", ids == 16, f"{ids} ids")
+    unique = df.select(F.monotonically_increasing_id().alias("m")).distinct().count()
+    check("monotonically_increasing_id() is unique", unique == 100_000, f"{unique} unique")
+
+
+def test_iceberg(spark, warehouse):
+    """Iceberg path tables: write, append, overwrite, partitioned, UPDATE, DELETE, MERGE."""
+    import uuid
+    path = f"{warehouse}/ops_iceberg_{uuid.uuid4().hex[:8]}"
+    sum_count = lambda df: tuple(df.agg(F.count("*"), F.sum("id")).collect()[0])
+    try:
+        spark.range(0, 100_000, 1, 8).write.format("iceberg").mode("overwrite").save(path)
+        spark.range(100_000, 200_000, 1, 8).write.format("iceberg").mode("append").save(path)
+        got = sum_count(spark.read.format("iceberg").load(path))
+        check("iceberg write + append", got == (200_000, 19_999_900_000), str(got))
+        spark.range(0, 100_000, 1, 8).withColumn("k", F.col("id") % 10) \
+            .write.format("iceberg").partitionBy("k").mode("overwrite").save(path + "_p")
+        spark.sql("DROP TABLE IF EXISTS ops_ice")
+        spark.sql(f"CREATE TABLE ops_ice USING iceberg LOCATION '{path}_p'")
+        spark.sql("UPDATE ops_ice SET id = -1 WHERE k = 3").collect()
+        spark.sql("DELETE FROM ops_ice WHERE k = 4").collect()
+        spark.range(0, 20).withColumn("k", F.lit(99)).createOrReplaceTempView("ops_src")
+        spark.sql("MERGE INTO ops_ice USING ops_src ON ops_ice.id = ops_src.id "
+                  "WHEN MATCHED THEN UPDATE SET k = ops_src.k WHEN NOT MATCHED THEN INSERT *").collect()
+        got = tuple(spark.sql("SELECT count(*), sum(CASE WHEN k = 99 THEN 1 ELSE 0 END), "
+                              "sum(CASE WHEN id = -1 THEN 1 ELSE 0 END) FROM ops_ice").collect()[0])
+        check("iceberg UPDATE, DELETE, MERGE", got == (90_004, 20, 10_000), str(got))
+    except Exception as e:  # noqa: BLE001
+        check("iceberg operations", False, str(e).splitlines()[0][:200])
+
+
 def test_object_store(spark, path):
     """Write to and read back from an object store (BS-011). Needs the store
     configured on every node, e.g. AWS_* settings for S3."""
@@ -217,6 +252,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--remote", default="sc://localhost:15002")
     p.add_argument("--scheduler", default="http://localhost:4040")
+    p.add_argument("--warehouse", default="/warehouse",
+                   help="a path every node shares, for table tests; '' skips them")
     p.add_argument("--s3-path", help="e.g. s3://spark-test/ops; skipped when not given")
     args = p.parse_args()
 
@@ -224,6 +261,9 @@ def main():
     test_explain(spark)
     test_range(spark)
     test_repartition(spark)
+    test_partition_ids(spark)
+    if args.warehouse:
+        test_iceberg(spark, args.warehouse)
     if args.s3_path:
         test_object_store(spark, args.s3_path)
     test_interrupts(spark, args.scheduler)

@@ -97,6 +97,19 @@ fn restrict(
         return Ok(selected);
     }
 
+    // Operators whose output depends on the partition index they execute
+    // (Spark's `spark_partition_id()`, `monotonically_increasing_id()`) must
+    // see global indices. Restricting below them would renumber the task's
+    // partitions from 0, so every task would produce the same ids (and Spark
+    // MERGE, which keys target rows by such ids, would see duplicates). Keep
+    // the subtree whole and select the task's partitions above it.
+    if !under_collect
+        && reads_partition_index(&plan)
+        && let Some(selected) = select_leaf_partitions(&plan, partitions)?
+    {
+        return Ok(selected);
+    }
+
     // Operators carrying data indexed by global input partition slice it
     // parallel to the input restriction. Each one implements the slicing
     // beside its own fields; this walker only supplies the restricted child.
@@ -276,6 +289,14 @@ fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool>
 /// a leaf below a `CoalescePartitionsExec` / `SortPreservingMergeExec` /
 /// join build side must read its full upstream) lives in the walker —
 /// the walker simply doesn't call this function under collapse.
+/// Operators (by name, as they come from Spark's planner) whose rows depend on
+/// the partition index passed to `execute`.
+const PARTITION_INDEX_OPERATORS: &[&str] = &["SparkPartitionIdExec", "MonotonicIdExec"];
+
+fn reads_partition_index(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    PARTITION_INDEX_OPERATORS.contains(&plan.name())
+}
+
 /// Wraps a leaf in a [`SelectPartitionsExec`] keeping the task's partitions
 /// that the leaf has, the way a file scan keeps the file groups that exist.
 /// The leaf itself when that keeps every partition in order.

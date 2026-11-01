@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -83,7 +83,15 @@ pub mod ballista_physical_plan_node {
         EmptyPartitions(super::EmptyPartitionsExecNode),
         #[prost(message, tag = "21")]
         SelectPartitions(super::SelectPartitionsExecNode),
+        #[prost(message, tag = "22")]
+        CodecScan(super::CodecScanExecNode),
     }
+}
+/// A file scan in DataFusion's own encoding (see `CodecScanExec`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CodecScanExecNode {
+    #[prost(message, optional, tag = "1")]
+    pub scan: ::core::option::Option<::datafusion_proto::protobuf::PhysicalPlanNode>,
 }
 /// Output partition i is input partition `partitions\[i\]` (see `SelectPartitionsExec`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

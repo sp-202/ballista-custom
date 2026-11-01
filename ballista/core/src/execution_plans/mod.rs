@@ -34,6 +34,7 @@ mod range_repartition_common;
 pub mod range_shuffle;
 mod range_shuffle_reader;
 mod runtime_stats;
+mod codec_scan;
 mod select_partitions;
 mod shuffle_reader;
 mod shuffle_writer;
@@ -71,6 +72,7 @@ pub use runtime_stats::{
     log_merged_runtime_stats, merge_reports as merge_runtime_stats_reports,
     repartition_routing_expr,
 };
+pub use codec_scan::CodecScanExec;
 pub use select_partitions::SelectPartitionsExec;
 pub use shuffle_reader::{CoalescePlan, PartitionGroup, ShuffleReaderExec};
 pub use shuffle_reader::{stats_for_partition, stats_for_partitions};

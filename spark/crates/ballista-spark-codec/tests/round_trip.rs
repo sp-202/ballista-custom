@@ -110,3 +110,49 @@ fn sail_node_over_ballista_node_round_trips() -> Result<()> {
     assert!(after.contains("SelectPartitionsExec"), "{after}");
     Ok(())
 }
+
+/// A Parquet scan that projects a reader-produced virtual column (the row
+/// number Iceberg row-level operations read) keeps that column after a round
+/// trip, so projections over it still resolve (Iceberg `UPDATE` / `MERGE`).
+#[test]
+fn parquet_scan_with_virtual_column_round_trips() -> Result<()> {
+    use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::datasource::table_schema::TableSchema;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use parquet::arrow::RowNumber;
+
+    let file_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("k", DataType::Int64, false),
+    ]));
+    let partition_cols = vec![
+        Arc::new(Field::new("p1", DataType::Utf8, false)),
+        Arc::new(Field::new("p2", DataType::Int32, false)),
+        Arc::new(Field::new("p3", DataType::Utf8, false)),
+    ];
+    let row_number = Arc::new(
+        Field::new("row_position", DataType::Int64, false).with_extension_type(RowNumber),
+    );
+    let table_schema = TableSchema::builder(file_schema)
+        .with_table_partition_cols(partition_cols)
+        .with_virtual_columns(vec![row_number])
+        .build();
+    let source = Arc::new(ParquetSource::new(table_schema));
+    let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+        .with_file(PartitionedFile::new("data/k=3/part-0.parquet", 100))
+        .with_projection_indices(Some(vec![0, 1, 2, 3, 4, 5]))?
+        .build();
+    let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+    let wrapped = ballista_core::execution_plans::CodecScanExec::wrap_scans(plan.clone())?;
+    let codec = SparkPhysicalCodec::shared();
+    let bytes = physical_plan_to_bytes_with_extension_codec(wrapped, codec.as_ref())?;
+    let ctx = SessionContext::new();
+    let decoded =
+        physical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), codec.as_ref())?;
+    assert_eq!(plan.schema(), decoded.schema());
+    let shown = displayable(decoded.as_ref()).indent(true).to_string();
+    assert!(shown.contains("row_position"), "{shown}");
+    Ok(())
+}

@@ -61,7 +61,7 @@ use crate::execution_plans::{
     FinalizedPartitionState, InputOrder, OrderedRangeRepartitionExec, PartitionGroup,
     PartitionedBoundedWindowAggExec, PerPartitionFilterExec, PipelinedShuffleReaderExec,
     PipelinedShuffleWriterExec, PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec,
-    RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, SelectPartitionsExec,
+    CodecScanExec, RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, SelectPartitionsExec,
     ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
     UnorderedRangeRepartitionExec, UnresolvedShuffleExec, WindowApply,
 };
@@ -918,6 +918,12 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 };
                 Ok(Arc::new(exec))
             }
+            PhysicalPlanType::CodecScan(node) => {
+                let scan = node.scan.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal("CodecScanExecNode is missing its scan".into())
+                })?;
+                scan.try_into_physical_plan(ctx, self)
+            }
             PhysicalPlanType::SelectPartitions(node) => {
                 let [input] = inputs else {
                     return Err(DataFusionError::Internal(format!(
@@ -1445,6 +1451,20 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             })?;
 
             Ok(())
+        } else if let Some(exec) = node.downcast_ref::<CodecScanExec>() {
+            let scan = datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(
+                Arc::clone(exec.scan()),
+                self,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::CodecScan(
+                    protobuf::CodecScanExecNode { scan: Some(scan) },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!("failed to encode scan: {e:?}"))
+            })?;
+            Ok(())
         } else if let Some(exec) = node.downcast_ref::<SelectPartitionsExec>() {
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::SelectPartitions(
@@ -1900,6 +1920,28 @@ mod test {
             decoded_exec.coalesce.is_none(),
             "absent coalesce field must decode to None (codec inertness)"
         );
+    }
+
+    #[test]
+    fn codec_scan_decodes_to_the_scan() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let scan: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![], vec![]], schema, None).unwrap();
+        let wrapped = CodecScanExec::wrap_scans(Arc::clone(&scan)).unwrap();
+        assert_eq!(wrapped.name(), "CodecScanExec");
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(wrapped, &mut buf, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        assert_eq!(decoded.name(), "DataSourceExec");
+        assert_eq!(decoded.properties().partitioning.partition_count(), 2);
     }
 
     #[test]

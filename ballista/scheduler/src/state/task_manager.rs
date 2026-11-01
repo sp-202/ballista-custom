@@ -31,7 +31,7 @@ use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::config::ExecutionMode;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
-use ballista_core::execution_plans::compute_global_output_partition_ids;
+use ballista_core::execution_plans::{CodecScanExec, compute_global_output_partition_ids};
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
@@ -912,7 +912,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             )?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(
-                restricted,
+                CodecScanExec::wrap_scans(restricted)?,
                 self.codec.physical_extension_codec(),
             )?;
             plan_proto.try_encode(&mut plan_buf)?;
@@ -1032,7 +1032,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 &task.global_input_partition_ids,
             )?;
             let mut plan_buf: Vec<u8> = vec![];
-            let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
+            let plan_proto = PhysicalPlanNode::try_from_physical_plan(
+                CodecScanExec::wrap_scans(restricted)?,
+                codec,
+            )?;
             plan_proto.try_encode(&mut plan_buf)?;
             let task_ids = vec![TaskId {
                 task_id: task.key.task_id as u32,
