@@ -89,6 +89,9 @@ pub const BALLISTA_CLIENT_IO_RETRY_WAIT_TIME_MS: &str =
 pub const BALLISTA_ADAPTIVE_PLANNER_ENABLED: &str = "ballista.planner.adaptive.enabled";
 /// Enables grace-hash spilling of partitioned hash joins on executors
 pub const BALLISTA_JOIN_SPILL_ENABLED: &str = "ballista.join.spill.enabled";
+/// Fail planning when a listing table's location does not exist on the scheduler
+pub const BALLISTA_PLANNER_REQUIRE_TABLE_PATHS: &str =
+    "ballista.planner.require_table_paths";
 /// Enables adaptive query planning for jobs submitted as physical plans
 pub const BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED: &str =
     "ballista.planner.adaptive.physical_plans.enabled";
@@ -331,6 +334,14 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          them afterwards (grace hash join), instead of failing when the build \
                          side does not fit in memory. Spill files count against \
                          datafusion.runtime.max_temp_directory_size.".to_string(),
+                         DataType::Boolean,
+                         Some(true.to_string())),
+        ConfigEntry::new(BALLISTA_PLANNER_REQUIRE_TABLE_PATHS.to_string(),
+                         "Fail a query when the location of a file-based (listing) table it \
+                         reads does not exist on the scheduler, like Spark's PATH_NOT_FOUND. \
+                         The scheduler lists table files itself, so a location the client can \
+                         see but the scheduler cannot would otherwise read as an empty table \
+                         and return wrong results.".to_string(),
                          DataType::Boolean,
                          Some(true.to_string())),
         ConfigEntry::new(BALLISTA_ADAPTIVE_PLANNER_PHYSICAL_PLANS_ENABLED.to_string(),
@@ -884,6 +895,11 @@ impl BallistaConfig {
     /// Whether partitioned hash joins may spill to disk on executors
     pub fn join_spill_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_JOIN_SPILL_ENABLED)
+    }
+
+    /// Fail planning when a listing table's location does not exist
+    pub fn require_table_paths(&self) -> bool {
+        self.get_bool_setting(BALLISTA_PLANNER_REQUIRE_TABLE_PATHS)
     }
 
     /// Is Adaptive Query Planner enabled for jobs submitted as physical plans

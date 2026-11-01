@@ -291,6 +291,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         let mut graph = match plan {
             SubmitPlan::Logical(logical_plan) => {
+                if session_config.ballista_config().require_table_paths() {
+                    crate::state::table_paths::check_table_paths_exist(&ctx, logical_plan)
+                        .await?;
+                }
                 if session_config.ballista_adaptive_query_planner_enabled() {
                     debug!("Using adaptive query planner (AQE) for job planning");
                     Box::new(

@@ -87,6 +87,9 @@ struct BucketFiles {
     finished: Vec<Arc<dyn SpillFile>>,
 }
 
+/// `(bucket id, is build side)`.
+type BucketKey = (usize, bool);
+
 /// See the [module documentation](self).
 pub struct BallistaJoinSpillHook {
     /// The task this hook spills for, bound when the join starts executing.
@@ -97,7 +100,7 @@ pub struct BallistaJoinSpillHook {
     managers: Mutex<HashMap<bool, Arc<SpillManager>>>,
     /// Keyed by `(bucket id, is build side)`; ids are unique per partition, pass and
     /// bucket, so every key is written by one pass and read exactly once.
-    buckets: Mutex<HashMap<(usize, bool), Arc<Mutex<BucketFiles>>>>,
+    buckets: Mutex<HashMap<BucketKey, Arc<Mutex<BucketFiles>>>>,
 }
 
 impl Default for BallistaJoinSpillHook {

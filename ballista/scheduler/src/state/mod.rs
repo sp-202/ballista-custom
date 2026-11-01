@@ -61,6 +61,8 @@ pub mod session_manager;
 pub mod task_builder;
 /// Task scheduling and lifecycle management.
 pub mod task_manager;
+/// Checks that the file-based tables a job reads exist on the scheduler.
+mod table_paths;
 
 /// Decodes a protobuf message from bytes.
 pub fn decode_protobuf<T: Message + Default>(bytes: &[u8]) -> Result<T> {
