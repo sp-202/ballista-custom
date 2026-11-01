@@ -97,7 +97,7 @@ decimal averages differ in the last digit (BS-009).
 |---|---|---|---|
 | Runtime join selection (shuffle join → broadcast) | on | ✅ | `SelectJoinRule`, `DelayJoinSelectionRule`, `DemoteUnsafeBroadcastJoinRule`; broadcasts as soon as the small side is measured (BS-025) |
 | Empty relation propagation | on | ✅ | `PropagateEmptyExecRule`; BS-022 fixed the hang it exposed |
-| Coalesce small shuffle partitions | on (`parallelismFirst`, 1 MB min) | ⚠️ | `CoalescePartitionsRule` exists but is off by default (`ballista.planner.coalesce.enabled`) and not mapped from `spark.sql.adaptive.*` |
+| Coalesce small shuffle partitions | on (`parallelismFirst`, 1 MB min) | ⚪ off on purpose | `CoalescePartitionsRule` exists (`ballista.planner.coalesce.enabled`). Measured 2026-11-01: on, TPC-DS 144.6 → 148.2 s, q51 1.16 → 2.62 s, no query faster. Spark coalesces to avoid many tiny tasks; Ballista already packs several partitions into one task, so coalescing only removes parallelism |
 | Initial shuffle partition count from `spark.sql.shuffle.partitions` | 200 | ❌ | every exchange uses 28 (looks like DataFusion `target_partitions` = CPU count) |
 | Split skewed join partitions | on (5× median and > 256 MB) | ❌ | only a skew-aware memory check in `dynamic_join.rs`; step 07 |
 | Local shuffle reader after switching to broadcast | on | ❌ | step 07 |
@@ -116,5 +116,4 @@ decimal averages differ in the last digit (BS-009).
 ## 8. Next, in order
 1. BS-028 — q72 now 71 s (was 124 s; Spark 17 s, Comet 2.2 s).
 2. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
-3. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
-4. AQE: skew join splitting.
+3. AQE: skew join splitting.

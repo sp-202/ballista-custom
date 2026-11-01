@@ -34,7 +34,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
 | [BS-024](#bs-024) | 🟢 | S1 | `UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23) | 03 |
 | [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
-| [BS-026](#bs-026) | 🔴 | S3 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
+| [BS-026](#bs-026) | 🔴 | S4 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 | [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
 | [BS-028](#bs-028) | 🟡 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
 
@@ -400,6 +400,9 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Cause:** a `CollectLeft` join's build side is read and hashed by every task: a scan build
   side is read as one partition by each of the stage's 28 tasks, a broadcast exchange is
   fetched by each. Spark builds the hash relation once and ships it to executors.
+- **Update (after BS-028):** q23 is 12.5 s again (Comet 8.5 s). Tasks take several partitions
+  each, so a stage runs about 4 tasks, not 28: per-executor sharing would save about half of a
+  sub-second build. Low priority.
 - **Plan:** build each broadcast hash table once per executor and share it across that
   executor's tasks of the stage (keyed by job, stage and build plan); consider a lower
   threshold for scan build sides until then.
@@ -438,6 +441,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Result:** q72 125 → 71 s, q23 19.3 → 12.5 s; TPC-DS 210 → 145 s; TPC-H unchanged (15.3 s);
   22/22 and 99/99 match Spark, no query more than 1.5× slower.
 - **Left:** 71 s against Spark's 17 s. DataFusion's sort-merge join alone takes 36 s here, then
-  1.1 billion rows pass through nine broadcast joins. Next: per-operator time in that stage;
-  rerun Comet with this repository's query text.
+  1.1 billion rows pass through nine broadcast joins. Next needs per-operator time in that
+  stage, which the UI does not report yet (step 11, "operator metrics"); a local DataFusion
+  `EXPLAIN ANALYZE` of q72 did not finish in 15 minutes (its own planner picks another plan).
 
