@@ -19,9 +19,11 @@ use crate::planner::create_shuffle_writer_with_config;
 use crate::state::aqe::execution_plan::{
     AdaptiveDatafusionExec, ExchangeExec, RangeRepartitionRouting,
 };
+use crate::state::aqe::optimizer_rule::split_skewed_joins;
 use crate::state::aqe::planner::AdaptiveStageInfo;
 use crate::state::execution_graph::StageOutput;
 use ballista_core::JobId;
+use ballista_core::config::BallistaConfig;
 use ballista_core::execution_plans::{
     OrderedRangeRepartitionExec, RangeFilterExec, RangeShuffleReaderExec,
     RangeShuffleWriterExec, ShuffleReaderExec, ShuffleWriter, ShuffleWriterExec,
@@ -244,6 +246,20 @@ impl BallistaAdapter {
                 .transform_down(|e| adapter.transform_children(e))?
                 .data;
             let plan = attach_reader_bounds(plan)?;
+            // Skewed join partitions are split here, where the join's inputs
+            // are concrete readers with per-map-task sizes (Spark's
+            // `OptimizeSkewedJoin`). Only when the writer repartitions: a
+            // split join is no longer hash partitioned on its keys.
+            let writer_repartitions = matches!(
+                root.partitioning,
+                Some(Partitioning::Hash(_, _)) | Some(Partitioning::RoundRobinBatch(_))
+            );
+            let ballista_config = config
+                .extensions
+                .get::<BallistaConfig>()
+                .cloned()
+                .unwrap_or_default();
+            let plan = split_skewed_joins(plan, writer_repartitions, &ballista_config)?;
             let stage_id = root.stage_id().ok_or_else(|| {
                 DataFusionError::Execution(
                     "shuffle partitions have to be resolved at this point".to_string(),

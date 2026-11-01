@@ -192,6 +192,21 @@ pub const BALLISTA_PROPAGATE_EMPTY_ENABLED: &str =
 /// single-partition constraint isn't a serial bottleneck. Opt-in.
 pub const BALLISTA_PARALLEL_WINDOW_ENABLED: &str =
     "ballista.planner.parallel_window.enabled";
+/// Configuration key enabling AQE skew join splitting: a shuffled join's
+/// partition much larger than the rest is read in several pieces, each joined
+/// with the whole matching partition of the other side. Mirrors Spark's
+/// `spark.sql.adaptive.skewJoin.enabled` (default on).
+pub const BALLISTA_SKEW_JOIN_ENABLED: &str = "ballista.planner.skew_join.enabled";
+/// A partition is skewed when larger than this factor times the median
+/// partition size of its side (and than the threshold below). Mirrors
+/// `spark.sql.adaptive.skewJoin.skewedPartitionFactor`.
+pub const BALLISTA_SKEW_JOIN_PARTITION_FACTOR: &str =
+    "ballista.planner.skew_join.skewed_partition_factor";
+/// A partition is skewed only when larger than this many bytes. Mirrors
+/// `spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes`.
+pub const BALLISTA_SKEW_JOIN_PARTITION_THRESHOLD_BYTES: &str =
+    "ballista.planner.skew_join.skewed_partition_threshold_bytes";
+
 /// Configuration key for the target post-coalesce partition byte size (bytes).
 /// Mirrors Spark's `spark.sql.adaptive.advisoryPartitionSizeInBytes`.
 pub const BALLISTA_COALESCE_TARGET_PARTITION_BYTES: &str =
@@ -490,6 +505,29 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                         matching window shapes.".to_string(),
                         DataType::Boolean,
                         Some(false.to_string())),
+        ConfigEntry::new(
+            BALLISTA_SKEW_JOIN_ENABLED.to_string(),
+            "Splits skewed partitions of shuffled joins (Spark's \
+             spark.sql.adaptive.skewJoin.enabled)."
+                .to_string(),
+            DataType::Boolean,
+            Some(true.to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_SKEW_JOIN_PARTITION_FACTOR.to_string(),
+            "A join partition larger than this factor times its side's median \
+             partition size (and than the threshold) is skewed."
+                .to_string(),
+            DataType::Float64,
+            Some("5.0".to_string()),
+        ),
+        ConfigEntry::new(
+            BALLISTA_SKEW_JOIN_PARTITION_THRESHOLD_BYTES.to_string(),
+            "A join partition is skewed only when larger than this many bytes."
+                .to_string(),
+            DataType::UInt64,
+            Some((256 * 1024 * 1024_usize).to_string()),
+        ),
         ConfigEntry::new(
             BALLISTA_COALESCE_TARGET_PARTITION_BYTES.to_string(),
             "Target post-coalesce partition size in bytes. Mirrors Spark's \
@@ -954,6 +992,22 @@ impl BallistaConfig {
     /// Maximum per-partition hash-join build-side bytes before falling back to SMJ.
     pub fn hash_join_max_build_partition_bytes(&self) -> usize {
         self.get_usize_setting(BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES)
+    }
+
+    /// Returns whether AQE splits skewed partitions of shuffled joins.
+    pub fn skew_join_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_SKEW_JOIN_ENABLED)
+    }
+
+    /// Returns the factor over the median partition size that marks a skewed
+    /// join partition.
+    pub fn skew_join_partition_factor(&self) -> f64 {
+        self.get_float_setting(BALLISTA_SKEW_JOIN_PARTITION_FACTOR)
+    }
+
+    /// Returns the size in bytes a join partition must exceed to be skewed.
+    pub fn skew_join_partition_threshold_bytes(&self) -> usize {
+        self.get_usize_setting(BALLISTA_SKEW_JOIN_PARTITION_THRESHOLD_BYTES)
     }
 
     /// Returns whether AQE runs a shuffled inner or outer join with a non-equi

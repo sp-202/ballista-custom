@@ -122,6 +122,18 @@ def test_partition_ids(spark):
     check("monotonically_increasing_id() is unique", unique == 100_000, f"{unique} unique")
 
 
+def test_skew_join(spark):
+    """A join with one partition far larger than the rest (AQE skew splitting) keeps
+    every row: 80% of 60M rows share key 0, and the join feeds a hash shuffle."""
+    fact = spark.range(0, 60_000_000, 1, 32).select(
+        F.when(F.col("id") % 10 < 8, 0).otherwise(F.col("id")).alias("k"), F.col("id").alias("v"))
+    dim = spark.range(0, 30_000_000, 1, 32).select(F.col("id").alias("k"), (F.col("id") * 2).alias("w"))
+    row = (fact.join(dim, "k").groupBy((F.col("v") % 100).alias("g"))
+           .agg(F.count("*").alias("c"), F.sum("w").alias("s"))
+           .agg(F.sum("c"), F.sum("s")).collect()[0])
+    check("skewed join keeps every row", tuple(row) == (54_000_000, 180_000_042_000_000), str(tuple(row)))
+
+
 def test_iceberg(spark, warehouse):
     """Iceberg path tables: write, append, overwrite, partitioned, UPDATE, DELETE, MERGE."""
     import uuid
@@ -262,6 +274,7 @@ def main():
     test_range(spark)
     test_repartition(spark)
     test_partition_ids(spark)
+    test_skew_join(spark)
     if args.warehouse:
         test_iceberg(spark, args.warehouse)
     if args.s3_path:

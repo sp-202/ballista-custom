@@ -25,6 +25,7 @@ pub mod parallel_window;
 pub mod pin_broadcast_join;
 pub mod prefix_window;
 pub mod propagate_empty;
+pub mod skew_join;
 
 pub use coalesce_partitions::*;
 pub use demote_broadcast_join::*;
@@ -35,3 +36,4 @@ pub use parallel_window::*;
 pub use pin_broadcast_join::*;
 pub use prefix_window::*;
 pub use propagate_empty::*;
+pub use skew_join::*;

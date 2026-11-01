@@ -103,7 +103,7 @@ decimal averages differ in the last digit (BS-009).
 | Empty relation propagation | on | ✅ | `PropagateEmptyExecRule`; BS-022 fixed the hang it exposed |
 | Coalesce small shuffle partitions | on (`parallelismFirst`, 1 MB min) | ⚪ off on purpose | `CoalescePartitionsRule` exists (`ballista.planner.coalesce.enabled`). Measured 2026-11-01: on, TPC-DS 144.6 → 148.2 s, q51 1.16 → 2.62 s, no query faster. Spark coalesces to avoid many tiny tasks; Ballista already packs several partitions into one task, so coalescing only removes parallelism |
 | Initial shuffle partition count from `spark.sql.shuffle.partitions` | 200 | ❌ | every exchange uses 28 (looks like DataFusion `target_partitions` = CPU count) |
-| Split skewed join partitions | on (5× median and > 256 MB) | ❌ | only a skew-aware memory check in `dynamic_join.rs`; step 07 |
+| Split skewed join partitions | on (5× median and > 256 MB) | ✅ | `optimizer_rule/skew_join.rs`, Spark's `OptimizeSkewedJoin` (same thresholds, map-range splits, split sides per join type). Applies when the join's stage hash-shuffles its output; a join feeding a global aggregate or the result stays unsplit. `tests/connect_operations.py` (776 MB partition split, answer exact). Not triggered by TPC-H/TPC-DS SF10 |
 | Local shuffle reader after switching to broadcast | on | ❌ | step 07 |
 | Rebalance skew (`REBALANCE` hint) | on | ❌ | step 07 |
 | Dynamic partition pruning | on | ⚠️ | DataFusion dynamic filters only |
@@ -119,7 +119,7 @@ decimal averages differ in the last digit (BS-009).
 
 ## 8. Next, in order
 1. Iceberg beyond path tables: REST catalog, time travel, metadata tables, schema evolution.
-2. AQE: skew join splitting (Spark's `OptimizeSkewedJoin`).
+2. AQE skew join: also split joins whose stage does not repartition (Spark validates the whole plan).
 3. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
 4. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
 5. BS-028 — q72 at 71 s (Spark 17 s), deferred.
