@@ -20,7 +20,7 @@ use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::statistics::StatisticsContext;
 use datafusion::{
     catalog::memory::DataSourceExec,
-    common::tree_node::{Transformed, TreeNode},
+    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     error::DataFusionError,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
@@ -236,7 +236,12 @@ impl SelectJoinRule {
             return Ok(Transformed::no(node));
         };
         if !dynamic_join.upstream_resolved() {
-            return Ok(Transformed::no(node));
+            return match dynamic_join.early_collect_left(config)? {
+                Some(join) => Ok(Transformed::yes(
+                    self.collect_root_build_side(join, config)?,
+                )),
+                None => Ok(Transformed::no(node)),
+            };
         }
 
         let plan = match dynamic_join.to_actual_join(config)? {
@@ -298,6 +303,30 @@ impl SelectJoinRule {
 
         Ok(plan
             .transform_up(|p| self.collect_build_side(p, config))?
+            .data)
+    }
+
+    /// Decides how the build side of the `CollectLeft` join at the top of
+    /// `plan` (under the projection a swap may add) is collected. Joins further
+    /// down belong to the probe side and were decided on their own.
+    fn collect_root_build_side(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &datafusion::config::ConfigOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(plan
+            .transform_down(|p| {
+                if p.is::<HashJoinExec>() {
+                    let collected = self.collect_build_side(p, config)?;
+                    Ok(Transformed::new(
+                        collected.data,
+                        collected.transformed,
+                        TreeNodeRecursion::Stop,
+                    ))
+                } else {
+                    Ok(Transformed::no(p))
+                }
+            })?
             .data)
     }
 

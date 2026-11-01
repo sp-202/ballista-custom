@@ -339,81 +339,45 @@ async fn test_hash_join_three_tables_collect_left() -> datafusion::common::Resul
         .into_optimized_plan()
         .unwrap();
     let mut planner = AdaptivePlanner::try_new(&ctx, &lp, "test_job".into()).await?;
-    let plan = planner.current_plan();
 
-    assert_plan!(plan, @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
-      ProjectionExec: expr=[id@0 as id]
-        DynamicJoinSelectionExec: plan_id=1, join_type=Inner, on=[(id@0, id@0)] repartitioned=false
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
-            ExchangeExec: partitioning=None, plan_id=2, stage_id=pending, stage_resolved=false, broadcast=true
-              DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    // Both small tables are known before anything runs, so both joins are
+    // broadcast at once (BS-025): t3 does not wait for the t1 x t2 join.
+    assert_plan!(planner.current_plan(), @"
+    AdaptiveDatafusionExec: is_final=false, plan_id=4, stage_id=pending, stage_resolved=false
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@1]
+        ExchangeExec: partitioning=None, plan_id=3, stage_id=pending, stage_resolved=false, broadcast=true
+          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+          ExchangeExec: partitioning=None, plan_id=2, stage_id=pending, stage_resolved=false, broadcast=true
             DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
           DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
     ");
 
     let (stages, cancellable) = planner.actionable_stages()?;
     let stages = stages.unwrap();
-    assert_eq!(1, stages.len());
+    assert_eq!(2, stages.len());
     assert_eq!(0, cancellable.len());
 
-    let plan = planner.current_plan();
-    assert_plan!(plan, @ r"
-    AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
-      ProjectionExec: expr=[id@0 as id]
-        DynamicJoinSelectionExec: plan_id=1, join_type=Inner, on=[(id@0, id@0)] repartitioned=false
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
-            ExchangeExec: partitioning=None, plan_id=2, stage_id=0, stage_resolved=false, broadcast=true
-              DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-            DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-    ");
-
-    let stage = stages.first().unwrap();
-
-    // plan for first stage
-    assert_plan!(stage.plan.as_ref(), @ r"
-    ShuffleWriterExec: partitioning: UnknownPartitioning(4)
-      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-    ");
-
-    planner.finalise_stage_internal(0, mock_partitions_with_statistics())?;
-
-    let (stages, cancellable) = planner.actionable_stages()?;
-    let stages = stages.unwrap();
-    assert_eq!(1, stages.len());
-    assert_eq!(0, cancellable.len());
-
-    // The outer join's build side is the inner join's output, whose size is
-    // only an estimate until it runs, so it is staged rather than broadcast.
-    assert_plan!(planner.current_plan(),  @ "
-    AdaptiveDatafusionExec: is_final=false, plan_id=3, stage_id=pending, stage_resolved=false
-      ProjectionExec: expr=[id@0 as id]
-        DynamicJoinSelectionExec: plan_id=1, join_type=Inner, on=[(id@0, id@0)] repartitioned=false
-          ExchangeExec: partitioning=Hash([id@0], 4), plan_id=4, stage_id=1, stage_resolved=false
-            HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
-              ExchangeExec: partitioning=None, plan_id=2, stage_id=0, stage_resolved=true, broadcast=true
-                DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-              DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-    ");
-
-    // Once measured small, the staged output is broadcast as it stands.
-    planner.finalise_stage_internal(1, mock_partitions_with_statistics())?;
-
+    for stage in &stages {
+        planner.finalise_stage_internal(
+            stage.plan.stage_id(),
+            mock_partitions_with_statistics(),
+        )?;
+    }
     let (stages, cancellable) = planner.actionable_stages()?;
     assert_eq!(1, stages.unwrap().len());
     assert_eq!(0, cancellable.len());
 
+    // t1 streams through both broadcast joins in one stage.
     assert_plan!(planner.current_plan(), @"
-    AdaptiveDatafusionExec: is_final=true, plan_id=3, stage_id=2, stage_resolved=false
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
-        ExchangeExec: partitioning=None, plan_id=5, stage_id=1, stage_resolved=true, broadcast=true
-          HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
-            ExchangeExec: partitioning=None, plan_id=2, stage_id=0, stage_resolved=true, broadcast=true
-              DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+    AdaptiveDatafusionExec: is_final=true, plan_id=4, stage_id=2, stage_resolved=false
+      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@1]
+        ExchangeExec: partitioning=None, plan_id=3, stage_id=0, stage_resolved=true, broadcast=true
+          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0]
+          ExchangeExec: partitioning=None, plan_id=2, stage_id=1, stage_resolved=true, broadcast=true
             DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
-        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
+          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 1]
     ");
 
     Ok(())

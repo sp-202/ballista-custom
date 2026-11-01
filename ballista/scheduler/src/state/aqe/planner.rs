@@ -25,7 +25,7 @@ use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
 use crate::state::aqe::optimizer_rule::{
     CoalescePartitionsRule, DelayJoinSelectionRule, DemoteUnsafeBroadcastJoinRule,
     DistributedExchangeRule, NormalizeInterleaveRule, ParallelWindowRule,
-    PrefixWindowRule, PropagateEmptyExecRule, SelectJoinRule,
+    PinBroadcastJoins, PrefixWindowRule, PropagateEmptyExecRule, SelectJoinRule,
 };
 use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_stage::StageOutput;
@@ -585,8 +585,12 @@ impl AdaptivePlanner {
                 // Ballista runs one task per probe partition. Demote the unsafe
                 // ones straight after, while `EnsureRequirements` can still add
                 // the repartitions a `Partitioned` join needs.
+                // Pinned so it cannot swap a broadcast join AQE already chose
+                // (see `PinBroadcastJoins`).
                 "join_selection" => {
-                    vec![r, Arc::new(DemoteUnsafeBroadcastJoinRule::default())]
+                    let pinned: Arc<dyn PhysicalOptimizerRule + Send + Sync> =
+                        Arc::new(PinBroadcastJoins::new(r));
+                    vec![pinned, Arc::new(DemoteUnsafeBroadcastJoinRule::default())]
                 }
                 _ => vec![r],
             })

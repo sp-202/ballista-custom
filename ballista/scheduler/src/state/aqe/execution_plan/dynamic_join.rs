@@ -31,11 +31,13 @@ use datafusion::{
     physical_expr_common::physical_expr::fmt_sql,
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-        ExecutionPlanProperties, PlanProperties, apply_expression_roots,
+        ExecutionPlanProperties, Partitioning, PlanProperties, apply_expression_roots,
         joins::{
             CrossJoinExec, HashJoinExec, HashJoinExecBuilder, JoinOn, NestedLoopJoinExec,
             PartitionMode, SortMergeJoinExec, SymmetricHashJoinExec, utils::JoinFilter,
         },
+        repartition::RepartitionExec,
+        sorts::sort::SortExec,
     },
 };
 use log::debug;
@@ -592,10 +594,13 @@ impl DynamicJoinSelectionExec {
         hash_join: &HashJoinExec,
         plan_id: usize,
     ) -> Result<Arc<DynamicJoinSelectionExec>> {
+        let on = hash_join.on().to_vec();
+        let (left, right) =
+            strip_join_distribution(hash_join.left(), hash_join.right(), &on);
         Ok(Arc::new(DynamicJoinSelectionExec {
-            left: Arc::clone(hash_join.left()),
-            right: Arc::clone(hash_join.right()),
-            on: hash_join.on().to_vec(),
+            left,
+            right,
+            on,
             filter: hash_join.filter().cloned(),
             join_type: *hash_join.join_type(),
             projection: hash_join.projection.as_deref().map(|p| p.to_vec()),
@@ -613,35 +618,87 @@ impl DynamicJoinSelectionExec {
     /// as there must not be any unresolved [ExchangeExec], in any if
     /// its children.
     pub(crate) fn upstream_resolved(&self) -> bool {
-        fn has_join_or_unresolved_exchange(plan: &Arc<dyn ExecutionPlan>) -> bool {
-            if let Some(exchange) = plan.downcast_ref::<ExchangeExec>() {
-                // this should be fine, once we find first resolved
-                // exchange it should not have any unresolved shuffles later
-                // nor dynamic joins
-                return !exchange.shuffle_created();
-            };
-
-            plan.downcast_ref::<DynamicJoinSelectionExec>().is_some()
-                || plan
-                    .children()
-                    .iter()
-                    .any(|c| has_join_or_unresolved_exchange(c))
-        }
-
         let left_has_join = has_join_or_unresolved_exchange(&self.left);
         let right_has_join = has_join_or_unresolved_exchange(&self.right);
 
         !(left_has_join || right_has_join)
     }
 
+    /// Plans a broadcast (`CollectLeft`) join before both inputs are resolved,
+    /// when one input already is and is small enough to broadcast: the other
+    /// input then needs no exchange and streams through the join in its own
+    /// stage, as with Spark's broadcast joins. Waiting for both inputs would
+    /// shuffle the large one first only to join it with a known-small table
+    /// (TPC-DS q72 shuffled ~80 GB this way, BS-025).
+    ///
+    /// `None` when both or neither input is resolved, when the resolved input's
+    /// size is unknown, estimated through a join, or over the broadcast threshold,
+    /// or when the join type cannot build from that input.
+    pub(crate) fn early_collect_left(
+        &self,
+        config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        if self.null_aware {
+            return Ok(None);
+        }
+        let build_is_right = match (
+            has_join_or_unresolved_exchange(&self.left),
+            has_join_or_unresolved_exchange(&self.right),
+        ) {
+            (false, true) => false,
+            (true, false) => true,
+            _ => return Ok(None),
+        };
+        let build = if build_is_right {
+            &self.right
+        } else {
+            &self.left
+        };
+        if size_estimated_through_join(build) {
+            return Ok(None);
+        }
+        let bc = config
+            .extensions
+            .get::<BallistaConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let threshold_bytes = bc.broadcast_join_threshold_bytes();
+        if threshold_bytes == 0
+            || !Self::supports_collect_by_thresholds(
+                build.as_ref(),
+                threshold_bytes,
+                bc.broadcast_join_threshold_rows(),
+            )
+        {
+            return Ok(None);
+        }
+        let build_join_type = if build_is_right {
+            self.join_type.swap()
+        } else {
+            self.join_type
+        };
+        if !collect_left_broadcast_safe(build_join_type) {
+            return Ok(None);
+        }
+        let join = self.to_hash_join(PartitionMode::CollectLeft)?;
+        Ok(Some(if build_is_right {
+            join.swap_inputs(PartitionMode::CollectLeft)?
+        } else {
+            join
+        }))
+    }
+
     pub(crate) fn from_sort_join(
         merge_join: &SortMergeJoinExec,
         plan_id: usize,
     ) -> Result<Arc<DynamicJoinSelectionExec>> {
+        let on = merge_join.on().to_vec();
+        let (left, right) =
+            strip_join_distribution(merge_join.left(), merge_join.right(), &on);
         Ok(Arc::new(DynamicJoinSelectionExec {
-            left: Arc::clone(merge_join.left()),
-            right: Arc::clone(merge_join.right()),
-            on: merge_join.on().to_vec(),
+            left,
+            right,
+            on,
             filter: merge_join.filter().clone(),
             join_type: merge_join.join_type(),
             projection: None,
@@ -652,6 +709,69 @@ impl DynamicJoinSelectionExec {
             plan_id,
         }))
     }
+}
+
+/// Whether `plan` holds an exchange whose shuffle has not been created yet, or a
+/// join still to be decided: the input is not resolved.
+fn has_join_or_unresolved_exchange(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if let Some(exchange) = plan.downcast_ref::<ExchangeExec>() {
+        // this should be fine, once we find first resolved
+        // exchange it should not have any unresolved shuffles later
+        // nor dynamic joins
+        return !exchange.shuffle_created();
+    };
+
+    plan.downcast_ref::<DynamicJoinSelectionExec>().is_some()
+        || plan
+            .children()
+            .iter()
+            .any(|c| has_join_or_unresolved_exchange(c))
+}
+
+/// Removes, from each input of a join, the hash repartition on that input's
+/// join keys (and a sort on top of it) that the planner added for a
+/// partitioned or sort-merge join. The dynamic join decides the distribution
+/// itself: it adds exchanges only if it picks a shuffled join, and sort
+/// enforcement re-adds the sorts a sort-merge join needs. Left in place, the
+/// planned repartitions make the inputs look already shuffled, so the join
+/// would never consider a broadcast (BS-025).
+fn strip_join_distribution(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    on: &JoinOn,
+) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+    let left_keys: Vec<_> = on.iter().map(|(l, _)| Arc::clone(l)).collect();
+    let right_keys: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
+    (
+        strip_key_distribution(left, &left_keys),
+        strip_key_distribution(right, &right_keys),
+    )
+}
+
+fn strip_key_distribution(
+    input: &Arc<dyn ExecutionPlan>,
+    keys: &[Arc<dyn PhysicalExpr>],
+) -> Arc<dyn ExecutionPlan> {
+    let repartitions_on_keys = |plan: &Arc<dyn ExecutionPlan>| {
+        plan.downcast_ref::<RepartitionExec>()
+            .and_then(|repartition| match repartition.partitioning() {
+                Partitioning::Hash(exprs, _)
+                    if exprs.len() == keys.len()
+                        && exprs.iter().zip(keys).all(|(a, b)| a.eq(b)) =>
+                {
+                    Some(Arc::clone(repartition.input()))
+                }
+                _ => None,
+            })
+    };
+    if let Some(sort) = input.downcast_ref::<SortExec>()
+        && sort.preserve_partitioning()
+        && sort.fetch().is_none()
+        && let Some(stripped) = repartitions_on_keys(sort.input())
+    {
+        return stripped;
+    }
+    repartitions_on_keys(input).unwrap_or_else(|| Arc::clone(input))
 }
 
 /// Whether to shuffle only the prospective build side now and re-decide the

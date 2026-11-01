@@ -33,7 +33,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
 | [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
 | [BS-024](#bs-024) | 🟢 | S1 | `UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23) | 03 |
-| [BS-025](#bs-025) | 🔴 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
+| [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
+| [BS-026](#bs-026) | 🔴 | S3 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 
 ---
 
@@ -344,7 +345,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Not covered:** the pipelined (streaming shuffle) writer has no such check yet.
 
 ## BS-025
-**AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk** · 🔴 open · step 07
+**AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk** · 🟢 fixed · step 07
 - **Evidence:** TPC-DS SF10 q72 on Spark Connect: after 5 minutes the job held 78 GB of
   shuffle data (sort-shuffle writers spilled ~6 GB per input partition) and `/home` was down
   to 12 GB; stopped by hand. The other 98 queries match Spark.
@@ -362,4 +363,31 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   needs no exchange and streams through in the same stage, as in Spark.
 - **Also seen:** stopping the client did not stop the job (BS-012); only stopping the cluster
   freed the disk.
+- **Second cause:** the planner's sort-merge and partitioned joins arrive with a hash
+  repartition (and sort) on the join keys under each input. Kept under the dynamic join, they
+  made both inputs look already shuffled, so a broadcast was never considered.
+- **Fix:** (1) the dynamic join drops the planned repartition/sort on each input's join keys;
+  it adds exchanges itself if it picks a shuffled join. (2) `early_collect_left`: when exactly
+  one input is resolved, its size is measured (not estimated through a join), under the
+  broadcast threshold, and the join type can build from it, the join is planned as a
+  broadcast at once and the other input streams through it in its own stage.
+  (3) `PinBroadcastJoins` hides `CollectLeft` joins from DataFusion's `join_selection`, which
+  otherwise swapped them on estimates (collecting the large side) and failed on joins that
+  already carry a dynamic filter.
+- **Verified:** q72 117 s, exact match with Spark, `/work` stays under 30 KB; the job runs the
+  big join and all nine broadcast joins in one stage, as Spark does. TPC-H 22/22 and TPC-DS
+  99/99 match Spark; the 78 TPC-DS queries timed in both runs take 60.5 s instead of 121.3 s
+  (q14 18.7 → 5.8 s, q21 5.6 → 0.5 s). Slower: q23 (BS-026).
+
+## BS-026
+**Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025)** · 🔴 open · step 07
+- **Evidence:** TPC-DS SF10 q23 takes 13–17 s (three runs) instead of 10.3 s before BS-025.
+  Its two slowest stages join store_sales (28.8M rows) to customer (500K rows), now broadcast,
+  where both sides were shuffled before. All other queries got faster or stayed the same.
+- **Cause:** a `CollectLeft` join's build side is read and hashed by every task: a scan build
+  side is read as one partition by each of the stage's 28 tasks, a broadcast exchange is
+  fetched by each. Spark builds the hash relation once and ships it to executors.
+- **Plan:** build each broadcast hash table once per executor and share it across that
+  executor's tasks of the stage (keyed by job, stage and build plan); consider a lower
+  threshold for scan build sides until then.
 
