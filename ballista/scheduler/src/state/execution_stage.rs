@@ -931,7 +931,12 @@ impl RunningStage {
             }));
     }
 
-    /// update and upsert the task metrics to the stage metrics
+    /// Update and upsert the task metrics to the stage metrics.
+    ///
+    /// Metrics are positional, one entry per operator that reports metrics. A task
+    /// whose entries do not line up with the stage's has its metrics dropped with a
+    /// warning rather than failing the update: an error here would discard the
+    /// task's completion with it and the stage would never finish (BS-022).
     pub fn update_task_metrics(
         &mut self,
         task_id: usize,
@@ -947,14 +952,14 @@ impl RunningStage {
 
         let new_metrics_set = if let Some(combined_metrics) = &mut self.stage_metrics {
             if metrics.len() != combined_metrics.len() {
-                return Err(BallistaError::Internal(format!(
-                    "Error updating task metrics to stage {}, task metrics array size {} does not equal \
-                with the stage metrics array size {} for task {}",
+                warn!(
+                    "Dropping metrics of task {task_id} in stage {}: {} operator metrics, \
+                     the stage has {}",
                     self.stage_id,
                     metrics.len(),
                     combined_metrics.len(),
-                    task_id
-                )));
+                );
+                return Ok(());
             }
             let metrics_values_array = metrics
                 .into_iter()
@@ -1756,6 +1761,27 @@ mod tests {
 
         // Should gracefully reject the update, not panic.
         assert!(!result);
+    }
+
+    #[test]
+    fn test_update_task_metrics_mismatched_length_is_dropped_not_an_error() {
+        let mut stage = make_running_stage(2);
+        append_running_task(&mut stage, 0, "executor-1", vec![0]);
+        append_running_task(&mut stage, 1, "executor-1", vec![1]);
+        stage
+            .update_task_metrics(0, vec![make_operator_metrics_set(100, 10)])
+            .unwrap();
+        // One more operator than the stage: dropped, the update still succeeds.
+        stage
+            .update_task_metrics(
+                1,
+                vec![
+                    make_operator_metrics_set(200, 20),
+                    make_operator_metrics_set(200, 20),
+                ],
+            )
+            .unwrap();
+        assert_eq!(stage.stage_metrics.as_ref().unwrap().len(), 1);
     }
 
     #[test]

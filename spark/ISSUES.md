@@ -30,6 +30,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-019](#bs-019) | 🟢 | S4 | DataFusion fork's hash-join code is not `cargo fmt` clean | 06 |
 | [BS-020](#bs-020) | 🟢 | S1 | Managed tables written on executors are invisible to queries (node-local warehouse) | 05 |
 | [BS-021](#bs-021) | 🟢 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
+| [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
 
 ---
 
@@ -283,4 +284,20 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** on the cluster, managed table (1000 rows) directory removed on drop,
   external table's files kept, re-created table reads 0 rows; unit test covers local
   and object-store deletion.
+
+## BS-022
+**Job hangs when a union branch is empty at runtime (task metrics mismatch)** · 🟢 fixed · step 05
+- **Evidence:** TPC-DS q23 (second SELECT) hung on Spark Connect: stage 38 showed all
+  tasks succeeded but stayed Running; the scheduler logged `task metrics array size 8
+  does not equal with the stage metrics array size 9` for each rejected task. Minimal
+  repro: `UNION ALL` of two aggregates where one branch's filter matches nothing
+  (`ws_quantity > 1000`), so AQE turns that branch into `EmptyExec`.
+- **Cause:** a task whose partitions skip that branch got its `EmptyExec` (no metrics)
+  replaced by a 0-partition memory scan (has metrics), so its metrics list was one
+  longer than its siblings'. The scheduler turned the mismatch into an error and dropped
+  the whole status update, task completion included, so the stage never finished.
+- **Fix:** the stand-in is a new `EmptyPartitionsExec` (Ballista codec keeps its partition
+  count; no metrics, like `EmptyExec`), so task metrics match the stage plan; and a
+  metrics mismatch now drops only that task's metrics with a warning.
+- **Verified:** repro returns the same rows as Spark; scheduler/core tests pass.
 

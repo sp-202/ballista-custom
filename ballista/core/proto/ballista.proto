@@ -65,7 +65,14 @@ message BallistaPhysicalPlanNode {
     DistributedExplainAnalyzeExecNode distributed_explain_analyze = 17;
     PipelinedShuffleWriterExecNode pipelined_shuffle_writer = 18;
     PipelinedShuffleReaderExecNode pipelined_shuffle_reader = 19;
+    EmptyPartitionsExecNode empty_partitions = 20;
   }
+}
+
+// A leaf producing no rows from `partitions` partitions (see `EmptyPartitionsExec`).
+message EmptyPartitionsExecNode {
+  datafusion_common.Schema schema = 1;
+  uint32 partitions = 2;
 }
 
 // Root of a stage in a pipelined job. Instead of writing shuffle files, it

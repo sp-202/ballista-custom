@@ -37,7 +37,9 @@
 //! subtrees never share state and there's no traversal-order dependency.
 
 use ballista_core::execution_plans::plan_algebra::as_partition_sliceable;
-use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
+use ballista_core::execution_plans::{
+    EmptyPartitionsExec, RangeShuffleReaderExec, ShuffleReaderExec,
+};
 use datafusion::common::internal_err;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{
@@ -382,17 +384,18 @@ fn select_output_partitions(
     // duplicated-output bug this whole function is meant to prevent.
     //
     // Workaround for the empty-slice case: swap in a 0-partition
-    // `MemorySourceConfig` (which DOES roundtrip its partition list).
+    // `EmptyPartitionsExec`, which Ballista's codec roundtrips with its
+    // partition count. Like the leaf it replaces it reports no metrics, so
+    // the task reports the same metrics slots as the stage plan (a
+    // metrics-reporting stub here made such tasks' metrics one longer than
+    // their siblings' and the stage hung, BS-022).
     // For non-empty slices we return `None` and let the generic recursion
     // leave the leaf as-is — currently safe because the only shape emitted
     // is `partitions == 1` and UnionExec routing gives sub-slices of `[0]`
     // (identity, no restriction needed) or `[]` (handled by this branch).
     if plan.is::<PlaceholderRowExec>() || plan.is::<EmptyExec>() {
         if indices.is_empty() {
-            let Ok(stub) = MemorySourceConfig::try_new(&[], plan.schema(), None) else {
-                return Ok(None);
-            };
-            return Ok(Some(DataSourceExec::from_data_source(stub)));
+            return Ok(Some(Arc::new(EmptyPartitionsExec::new(plan.schema(), 0))));
         }
         return Ok(None);
     }
@@ -583,6 +586,31 @@ mod tests {
     /// `k`. Applying the parent's index directly to every child (the pre-
     /// port behaviour) would route every partition into every child and
     /// most would land out of range, emptying every scan.
+    /// A union branch the task does not poll whose leaf is an `EmptyExec` is
+    /// restricted to a 0-partition leaf that, like `EmptyExec`, reports no metrics:
+    /// the task's metrics then line up with the stage plan's (BS-022).
+    #[test]
+    fn unpolled_empty_leaf_keeps_the_stage_metrics_slots() {
+        use ballista_core::utils::collect_plan_metrics;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let scan = scan_with_file_groups(2);
+        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(scan.schema()));
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![scan, empty]).unwrap();
+        let restricted = restrict_plan_to_partitions(union.clone(), &[0]).unwrap();
+
+        let children = restricted.children();
+        let leaf = children[1]
+            .downcast_ref::<EmptyPartitionsExec>()
+            .expect("unpolled EmptyExec becomes EmptyPartitionsExec");
+        assert_eq!(leaf.partitions(), 0);
+        assert_eq!(
+            collect_plan_metrics(restricted.as_ref()).len(),
+            collect_plan_metrics(union.as_ref()).len()
+        );
+    }
+
     #[test]
     fn union_partition_maps_to_the_right_childs_local_group() {
         let union: Arc<dyn ExecutionPlan> =

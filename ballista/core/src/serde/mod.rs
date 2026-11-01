@@ -57,13 +57,13 @@ use std::{convert::TryInto, io::Cursor};
 
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    BufferExec, BufferMode, ChaosExec, CoalescePlan, FinalizedPartitionState, InputOrder,
-    OrderedRangeRepartitionExec, PartitionGroup, PartitionedBoundedWindowAggExec,
-    PerPartitionFilterExec, PipelinedShuffleReaderExec, PipelinedShuffleWriterExec,
-    PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec, RangeShuffleWriterExec,
-    RuntimeStatsExec, ScalarOp, ShuffleReaderExec, ShuffleWriterExec,
-    SortShuffleWriterExec, UnorderedRangeRepartitionExec, UnresolvedShuffleExec,
-    WindowApply,
+    BufferExec, BufferMode, ChaosExec, CoalescePlan, EmptyPartitionsExec,
+    FinalizedPartitionState, InputOrder, OrderedRangeRepartitionExec, PartitionGroup,
+    PartitionedBoundedWindowAggExec, PerPartitionFilterExec, PipelinedShuffleReaderExec,
+    PipelinedShuffleWriterExec, PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec,
+    RangeShuffleWriterExec, RuntimeStatsExec, ScalarOp, ShuffleReaderExec,
+    ShuffleWriterExec, SortShuffleWriterExec, UnorderedRangeRepartitionExec,
+    UnresolvedShuffleExec, WindowApply,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -918,6 +918,13 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 };
                 Ok(Arc::new(exec))
             }
+            PhysicalPlanType::EmptyPartitions(node) => {
+                let schema: SchemaRef = Arc::new(convert_required!(node.schema)?);
+                Ok(Arc::new(EmptyPartitionsExec::new(
+                    schema,
+                    node.partitions as usize,
+                )))
+            }
             PhysicalPlanType::ChaosExec(chaos_exec) => {
                 let input = match inputs {
                     [input] => input.clone(),
@@ -1426,6 +1433,22 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             })?;
 
             Ok(())
+        } else if let Some(exec) = node.downcast_ref::<EmptyPartitionsExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::EmptyPartitions(
+                    protobuf::EmptyPartitionsExecNode {
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        partitions: exec.partitions() as u32,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode empty partitions execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
         } else if let Some(exec) = node.downcast_ref::<ChaosExec>() {
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ChaosExec(
@@ -1850,6 +1873,30 @@ mod test {
             decoded_exec.coalesce.is_none(),
             "absent coalesce field must decode to None (codec inertness)"
         );
+    }
+
+    #[test]
+    fn test_empty_partitions_exec_roundtrip_keeps_partition_count() {
+        let schema = create_test_schema();
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(EmptyPartitionsExec::new(schema.clone(), 0)),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded
+            .downcast_ref::<EmptyPartitionsExec>()
+            .expect("Expected EmptyPartitionsExec");
+        assert_eq!(decoded.partitions(), 0);
+        assert_eq!(decoded.schema().as_ref(), schema.as_ref());
+        assert!(decoded.metrics().is_none());
     }
 
     fn pipelined_location(

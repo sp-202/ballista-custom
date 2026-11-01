@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -79,7 +79,17 @@ pub mod ballista_physical_plan_node {
         PipelinedShuffleWriter(super::PipelinedShuffleWriterExecNode),
         #[prost(message, tag = "19")]
         PipelinedShuffleReader(super::PipelinedShuffleReaderExecNode),
+        #[prost(message, tag = "20")]
+        EmptyPartitions(super::EmptyPartitionsExecNode),
     }
+}
+/// A leaf producing no rows from `partitions` partitions (see `EmptyPartitionsExec`).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EmptyPartitionsExecNode {
+    #[prost(message, optional, tag = "1")]
+    pub schema: ::core::option::Option<::datafusion_proto_common::Schema>,
+    #[prost(uint32, tag = "2")]
+    pub partitions: u32,
 }
 /// Root of a stage in a pipelined job. Instead of writing shuffle files, it
 /// routes its input into bounded in-memory queues that consumer tasks stream
