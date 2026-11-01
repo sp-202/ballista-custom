@@ -44,8 +44,5 @@ the Ballista integration crates, DataFusion's `sql` feature declared, and a
 
 ## Known gaps (not yet handled)
 
-- Executors use Ballista's default runtime environment, so object stores
-  configured through Sail settings (S3, GCS, Azure, HDFS) are not yet
-  registered on executors.
 - DDL such as `DROP VIEW` returns one row `value: true`; Spark returns an
   empty result with no columns.

@@ -17,5 +17,6 @@ ballista-spark-codec = { workspace = true }
 ballista-spark-session = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
+datafusion = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }

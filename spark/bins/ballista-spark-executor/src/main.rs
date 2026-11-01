@@ -13,7 +13,8 @@ use ballista_executor::config::Config;
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_executor::health::spawn_health_server;
 use ballista_spark_codec::SparkPhysicalCodec;
-use ballista_spark_session::execution_session_config;
+use ballista_spark_session::{execution_session_config, object_store_registry};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,17 @@ async fn run() -> ballista_core::error::Result<()> {
     let mut config: ExecutorProcessConfig = opt.try_into()?;
     config.override_physical_codec = Some(SparkPhysicalCodec::shared());
     config.override_config_producer = Some(Arc::new(execution_session_config));
+    // Ballista's default runtime, with Sail's object stores (BS-011).
+    let registry = object_store_registry();
+    let work_dir = config.work_dir.clone();
+    config.override_runtime_producer = Some(Arc::new(move |_| {
+        let builder = RuntimeEnvBuilder::new().with_object_store_registry(registry.clone());
+        match &work_dir {
+            Some(dir) => builder.with_temp_file_path(dir.clone()),
+            None => builder,
+        }
+        .build_arc()
+    }));
 
     let log_filter = std::env::var(EnvFilter::DEFAULT_ENV)
         .map(EnvFilter::new)

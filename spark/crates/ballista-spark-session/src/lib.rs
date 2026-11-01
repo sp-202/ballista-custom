@@ -18,7 +18,9 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
 use sail_common::config::AppConfig;
+use datafusion::execution::object_store::ObjectStoreRegistry;
 use sail_common::runtime::RuntimeHandle;
+use sail_object_store::DynamicObjectStoreRegistry;
 use sail_common_datafusion::session::repartition::RepartitionBufferConfig;
 use sail_delta_lake::session_extension::DeltaTableCache;
 use sail_session::session_factory::{
@@ -108,4 +110,19 @@ pub fn execution_session_config() -> SessionConfig {
     SessionConfig::new_with_ballista()
         .with_extension(Arc::new(DeltaTableCache::default()))
         .with_extension(Arc::new(RepartitionBufferConfig::default()))
+}
+
+/// The object store registry for Spark jobs on Ballista's scheduler and executors.
+///
+/// S3, GCS, Azure, HDFS and HTTP stores are created on first use from the table
+/// URL and the usual environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`), as in Sail's
+/// own runtime, so a path the Spark Connect server can read is readable on every
+/// node (BS-011). Create one per process and share it, so store clients and their
+/// connections are reused across sessions.
+pub fn object_store_registry() -> Arc<dyn ObjectStoreRegistry> {
+    let handle = tokio::runtime::Handle::current();
+    Arc::new(DynamicObjectStoreRegistry::new(RuntimeHandle::new(
+        handle.clone(),
+        handle,
+    )))
 }

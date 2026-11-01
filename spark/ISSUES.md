@@ -19,7 +19,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-008](#bs-008) | 🔴 | S4 | DDL returns a `value: true` row instead of no columns | 04 |
 | [BS-009](#bs-009) | ⚪ | S4 | Decimal averages truncated instead of HALF_UP | 04 |
 | [BS-010](#bs-010) | 🟢 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
-| [BS-011](#bs-011) | 🔴 | S2 | Executors don't register object stores from Sail settings | 05 |
+| [BS-011](#bs-011) | 🟢 | S2 | Executors don't register object stores from Sail settings | 05 |
 | [BS-012](#bs-012) | 🟢 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
@@ -130,11 +130,17 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   submission. Checked in `tests/connect_operations.py`.
 
 ## BS-011
-**Executors don't register object stores from Sail settings** · 🔴 open · step 05
+**Executors don't register object stores from Sail settings** · 🟢 fixed · step 05
 - **Cause:** executors use Ballista's default runtime environment; Sail registers S3,
   GCS, Azure, HDFS stores through its own `RuntimeEnvFactory`.
-- **Plan:** executor runtime producer that adds Sail's object store registry while keeping
-  Ballista's memory pool and spill settings.
+- **Fix:** `ballista_spark_session::object_store_registry()` (Sail's
+  `DynamicObjectStoreRegistry`, one per process): the Spark executor's runtime producer is
+  Ballista's default plus that registry (spill dir, memory pools unchanged); the Spark
+  scheduler's session builder is Ballista's default with it, so table-path checks resolve too.
+  Stores are configured from the environment (`AWS_*`, `GOOGLE_*`, `AZURE_*`) on every node.
+- **Verified:** SeaweedFS S3 (`cluster/spark/compose.s3.yml`): write 1M rows to
+  `s3://spark-test/...`, read back exact count and sum, `groupBy`; TPC-H 22/22 and TPC-DS 99/99
+  on local files with unchanged timings (14.5 s, 145.8 s).
 
 ## BS-012
 **Closing a Spark session doesn't cancel its Ballista jobs** · 🟢 fixed · step 02

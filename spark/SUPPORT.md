@@ -74,7 +74,7 @@ decimal averages differ in the last digit (BS-009).
 |---|---|---|
 | Parquet on a local or shared path | ✅ | TPC-H, TPC-DS |
 | Table path invisible to the scheduler fails instead of returning empty | ✅ | BS-017 |
-| Object stores (S3, GCS, Azure) configured from Spark settings | ❌ | executors don't register them (BS-011) |
+| Object stores (S3, GCS, Azure, HDFS) | ✅ S3 tested | BS-011; configured from `AWS_*` / `GOOGLE_*` / `AZURE_*` environment on every node; `tests/connect_operations.py --s3-path` |
 | Shared warehouse (`spark.sql.warehouse.dir`) | ✅ | BS-020; must be the same mount on server and executors |
 | Atomic writes (commit protocol, no partial files on failure) | ❌ | tasks write final files directly; step 05 |
 | Driver-side writes (`BallistaSubplanExec`) | ⚠️ | single partition, untested under load (BS-013) |

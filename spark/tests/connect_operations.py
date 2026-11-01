@@ -113,6 +113,15 @@ def test_repartition(spark):
               f"sum={row.s} count={row.c}")
 
 
+def test_object_store(spark, path):
+    """Write to and read back from an object store (BS-011). Needs the store
+    configured on every node, e.g. AWS_* settings for S3."""
+    spark.range(0, 1_000_000, 1, 8).write.mode("overwrite").parquet(path)
+    row = spark.read.parquet(path).agg(F.sum("id").alias("s"), F.count("*").alias("c")).collect()[0]
+    check(f"write and read back {path}", row.s == 499_999_500_000 and row.c == 1_000_000,
+          f"sum={row.s} count={row.c}")
+
+
 def test_interrupts(spark, scheduler):
     query = slow_query(spark)
 
@@ -208,12 +217,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--remote", default="sc://localhost:15002")
     p.add_argument("--scheduler", default="http://localhost:4040")
+    p.add_argument("--s3-path", help="e.g. s3://spark-test/ops; skipped when not given")
     args = p.parse_args()
 
     spark = SparkSession.builder.remote(args.remote).getOrCreate()
     test_explain(spark)
     test_range(spark)
     test_repartition(spark)
+    if args.s3_path:
+        test_object_store(spark, args.s3_path)
     test_interrupts(spark, args.scheduler)
     test_stop_cancels_jobs(args.remote, args.scheduler)
     test_reattach(args.remote)

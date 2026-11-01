@@ -1260,6 +1260,7 @@ dependencies = [
  "ballista-spark-python",
  "ballista-spark-session",
  "clap",
+ "datafusion",
  "log",
  "tokio",
  "tracing-subscriber",
@@ -1301,6 +1302,7 @@ dependencies = [
  "ballista-spark-python",
  "ballista-spark-session",
  "clap",
+ "datafusion",
  "tokio",
  "tracing-subscriber",
 ]
@@ -1314,8 +1316,10 @@ dependencies = [
  "sail-common",
  "sail-common-datafusion",
  "sail-delta-lake",
+ "sail-object-store",
  "sail-session",
  "sail-spark-connect",
+ "tokio",
 ]
 
 [[package]]
