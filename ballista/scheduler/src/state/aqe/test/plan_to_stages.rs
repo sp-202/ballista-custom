@@ -512,3 +512,46 @@ async fn newly_built_adaptive_graph_has_expected_state()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn finished_adaptive_graph_reports_all_but_its_output_stage_as_intermediate()
+-> ballista_core::error::Result<()> {
+    use crate::test_utils::{mock_completed_task, mock_executor};
+
+    let ctx = mock_context();
+    ctx.register_batch("t", mock_batch()?)?;
+    let q = "select min(a) as c0, max(b) as c1, c as c2 from t group by c order by c2";
+    let logical_plan = ctx.sql(q).await?.logical_plan().clone();
+    let job_id: JobId = "job-id-intermediate".into();
+    let mut graph =
+        AdaptiveExecutionGraph::try_new("scheduler-1", &job_id, "", &ctx, &logical_plan, 7)
+            .await?;
+    // Nothing is known to be intermediate before the job has produced output.
+    assert!(graph.intermediate_stage_ids().is_empty());
+
+    let executor = mock_executor("executor-1".to_string());
+    graph.revive();
+    while let Some(task) = graph.pop_next_task(&executor.id)? {
+        let status = mock_completed_task(task, &executor.id);
+        graph.update_task_status(&executor, vec![status], 1, 1)?;
+        graph.revive();
+    }
+    assert!(graph.is_successful());
+
+    let output_stages: HashSet<usize> = graph
+        .output_locations()
+        .iter()
+        .map(|location| location.partition_id.stage_id)
+        .collect();
+    assert_eq!(output_stages.len(), 1);
+    let mut expected: Vec<u32> = graph
+        .stages()
+        .keys()
+        .filter(|stage_id| !output_stages.contains(stage_id))
+        .map(|stage_id| *stage_id as u32)
+        .collect();
+    expected.sort_unstable();
+    assert!(!expected.is_empty(), "a group-by job has a shuffle stage");
+    assert_eq!(graph.intermediate_stage_ids(), expected);
+    Ok(())
+}

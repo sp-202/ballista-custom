@@ -1541,6 +1541,32 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         &self.stages
     }
 
+    /// Every stage but the one whose output the job returns, including stages
+    /// retired by a replan. Adaptive stages are created without output links
+    /// (the default implementation's test), so the final stage is the one the
+    /// job's output locations point at. Empty until the job has produced output,
+    /// e.g. for a pipelined job: its data then waits for the whole-job cleanup.
+    fn intermediate_stage_ids(&self) -> Vec<u32> {
+        let final_stages: HashSet<usize> = self
+            .output_locations
+            .iter()
+            .map(|location| location.partition_id.stage_id)
+            .collect();
+        if final_stages.is_empty() {
+            return vec![];
+        }
+        let mut ids: Vec<u32> = self
+            .stages
+            .keys()
+            .chain(self.retired_stages.iter())
+            .filter(|stage_id| !final_stages.contains(stage_id))
+            .map(|stage_id| *stage_id as u32)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     fn stage_count(&self) -> usize {
         self.stages.len()
     }

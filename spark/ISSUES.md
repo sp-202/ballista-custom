@@ -31,6 +31,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-020](#bs-020) | 🟢 | S1 | Managed tables written on executors are invisible to queries (node-local warehouse) | 05 |
 | [BS-021](#bs-021) | 🟢 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
 | [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
+| [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
 
 ---
 
@@ -300,4 +301,19 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   count; no metrics, like `EmptyExec`), so task metrics match the stage plan; and a
   metrics mismatch now drops only that task's metrics with a warning.
 - **Verified:** repro returns the same rows as Spark; scheduler/core tests pass.
+
+## BS-023
+**Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk** · 🟢 fixed · step 05
+- **Evidence:** a TPC-DS SF10 run on Spark Connect filled `/home` (executor `/work` in the
+  container layer): about 49 GB in 74–76 job directories per executor; from q39 on queries
+  failed with `No space left on device`, from q61 tasks were rejected. After q1–q5 alone each
+  executor held 3.6–4.2 GB; no `Remove intermediate data` log line ever appeared.
+- **Cause:** on success the scheduler deletes intermediate stages at once and the whole job
+  after `finished_job_data_clean_up_interval_seconds` (300 s). Intermediate stages are the
+  ones with output links, but the adaptive graph creates every stage without them, so the
+  list was always empty. A fast run produced data faster than the 300 s cleanup removed it.
+- **Fix:** `AdaptiveExecutionGraph::intermediate_stage_ids` returns every stage (and every
+  stage retired by a replan) except the one the job's output locations point at.
+- **Verified:** after q1–q5 each executor keeps only the final stage (116K / 44K); whole-job
+  cleanup still removes the rest after 300 s; no deleted-but-open files in the executor.
 
