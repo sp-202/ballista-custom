@@ -449,7 +449,23 @@ impl CatalogCommand {
                 display.tables().to_record_batch(rows)?
             }
             CatalogCommand::DropTable { table, options } => {
+                // Like Spark's `DropTableCommand`, dropping a managed table also deletes
+                // its data; an external table (any table with a `LOCATION`) keeps it.
+                let managed_location = match manager.get_table_or_view(&table).await {
+                    Ok(status) => match status.kind {
+                        TableKind::Table {
+                            location: Some(location),
+                            is_external: false,
+                            ..
+                        } => Some(location),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
                 manager.drop_table(&table, options).await?;
+                if let Some(location) = managed_location {
+                    delete_table_data(ctx, &location).await?;
+                }
                 display.bools().to_record_batch(vec![true])?
             }
             CatalogCommand::RenameTable {
@@ -1243,6 +1259,58 @@ impl CreateTableColumnView for sail_common_datafusion::catalog::TableColumnStatu
     }
 }
 
+/// Deletes the data of a dropped managed table: its local directory, or every object
+/// under its location in an object store. A location that is already gone is fine.
+async fn delete_table_data(ctx: &TaskContext, location: &str) -> CatalogResult<()> {
+    use futures::{StreamExt, TryStreamExt};
+
+    if let Some(dir) = local_table_dir(location)? {
+        if dir.parent().is_none() {
+            return Err(CatalogError::External(format!(
+                "DROP TABLE will not delete the filesystem root: {}",
+                dir.display()
+            )));
+        }
+        return tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CatalogError::External(format!(
+                "failed to delete table directory {}: {e}",
+                dir.display()
+            ))),
+        })
+        .await
+        .map_err(|e| CatalogError::External(format!("DROP TABLE task failed: {e}")))?;
+    }
+    let url = url::Url::parse(location)
+        .map_err(|e| CatalogError::External(format!("invalid table location {location}: {e}")))?;
+    let prefix = object_store::path::Path::from_url_path(url.path())
+        .map_err(|e| CatalogError::External(format!("invalid table location {location}: {e}")))?;
+    if prefix.as_ref().is_empty() {
+        return Err(CatalogError::External(format!(
+            "DROP TABLE will not delete a bucket root: {location}"
+        )));
+    }
+    let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(
+        &url[..url::Position::BeforePath],
+    )
+    .map_err(|e| CatalogError::External(e.to_string()))?;
+    let store = ctx
+        .runtime_env()
+        .object_store(&store_url)
+        .map_err(|e| CatalogError::External(e.to_string()))?;
+    let locations = store
+        .list(Some(&prefix))
+        .map_ok(|meta| meta.location)
+        .boxed();
+    store
+        .delete_stream(locations)
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| CatalogError::External(format!("failed to delete {location}: {e}")))?;
+    Ok(())
+}
+
 /// Resolves a table location to the local directory that Sail's own table I/O reads and writes:
 /// a `file:` URI is converted to a path (percent-decoded, `localhost` authority accepted), a bare
 /// path is taken literally, and a relative path is resolved against the current directory.
@@ -1860,5 +1928,51 @@ mod tests {
         for location in ["", "file://otherhost/tmp/t"] {
             assert!(local_table_dir(location).is_err(), "{location}");
         }
+    }
+
+    #[tokio::test]
+    async fn delete_table_data_removes_local_dir_and_store_prefix() -> CatalogResult<()> {
+        use datafusion::execution::TaskContext;
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+        let ctx = TaskContext::default();
+        let tmp = tempfile::tempdir().map_err(|e| CatalogError::External(e.to_string()))?;
+        let dir = tmp.path().join("t");
+        std::fs::create_dir_all(dir.join("part=1"))
+            .map_err(|e| CatalogError::External(e.to_string()))?;
+        std::fs::write(dir.join("part=1/a.parquet"), b"x")
+            .map_err(|e| CatalogError::External(e.to_string()))?;
+        let location = format!("file://{}", dir.display());
+        delete_table_data(&ctx, &location).await?;
+        assert!(!dir.exists());
+        assert!(tmp.path().exists());
+        // Already gone is fine.
+        delete_table_data(&ctx, &location).await?;
+
+        let store = Arc::new(InMemory::new());
+        for key in ["t/a.parquet", "t/b/c.parquet", "t2/keep.parquet"] {
+            store
+                .put(&Path::from(key), PutPayload::from_static(b"x"))
+                .await
+                .map_err(|e| CatalogError::External(e.to_string()))?;
+        }
+        let url =
+            url::Url::parse("memory://").map_err(|e| CatalogError::External(e.to_string()))?;
+        ctx.runtime_env().register_object_store(&url, store.clone());
+        delete_table_data(&ctx, "memory:///t").await?;
+        let left: Vec<String> = {
+            use futures::TryStreamExt;
+            store
+                .list(None)
+                .map_ok(|m| m.location.to_string())
+                .try_collect()
+                .await
+                .map_err(|e| CatalogError::External(e.to_string()))?
+        };
+        assert_eq!(left, vec!["t2/keep.parquet".to_string()]);
+        assert!(delete_table_data(&ctx, "memory:///").await.is_err());
+        Ok(())
     }
 }

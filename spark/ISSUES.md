@@ -29,7 +29,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-018](#bs-018) | 🔴 | S2 | Hash join: one key larger than memory still fails after 4 spill levels | 06 |
 | [BS-019](#bs-019) | 🟢 | S4 | DataFusion fork's hash-join code is not `cargo fmt` clean | 06 |
 | [BS-020](#bs-020) | 🟢 | S1 | Managed tables written on executors are invisible to queries (node-local warehouse) | 05 |
-| [BS-021](#bs-021) | 🔴 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
+| [BS-021](#bs-021) | 🟢 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
 
 ---
 
@@ -269,7 +269,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** insert 1000 + 2 rows → `count 1002, sum 499503`; CTAS → correct.
 
 ## BS-021
-**`DROP TABLE` leaves a managed table's files in the warehouse** · 🔴 open · step 05
+**`DROP TABLE` leaves a managed table's files in the warehouse** · 🟢 fixed · step 05
 - **Evidence:** after `DROP TABLE` of two managed tables, both directories stayed in
   `cluster/spark/warehouse`. Spark deletes a managed table's data on drop (external
   tables keep theirs).
@@ -277,4 +277,10 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   old files are not read back.
 - **Plan:** delete the directory of a managed (non-external) table on drop, in the
   catalog command, after the catalog entry is removed.
+- **Fix:** `DropTable` reads the table first; for a managed table with a location it
+  deletes the local directory (`remove_dir_all`, missing is fine, never `/`) or every
+  object under the prefix (never a bucket root) after the catalog entry is removed.
+- **Verified:** on the cluster, managed table (1000 rows) directory removed on drop,
+  external table's files kept, re-created table reads 0 rows; unit test covers local
+  and object-store deletion.
 

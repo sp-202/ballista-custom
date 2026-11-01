@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
 url = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
 log = { workspace = true }
 
 sail-common-datafusion = { path = "../sail-common-datafusion" }

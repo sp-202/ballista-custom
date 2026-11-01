@@ -34,6 +34,7 @@ has to be re-applied when updating from upstream.
 
 | `sail-data-source/src/url.rs`, `listing/source.rs`, `Cargo.toml` | `resolve_listing_urls(.., check_exists)`: direct reads fail with `[PATH_NOT_FOUND]` when a path does not exist or a glob matches nothing; catalog-table reads skip the check (test dev-dependency `tempfile`) | Upstream treats a missing path as an empty directory, so `spark.read.parquet("/missing")` returned 0 rows instead of Spark's error (BS-017) |
 | `sail-spark-connect/src/session_manager.rs` | `SparkSessionMutator::with_default_conf` | Server-side Spark settings for every session (`ballista-connect --conf`), e.g. a shared `spark.sql.warehouse.dir` (BS-020) |
+| `sail-catalog/src/command.rs`, `Cargo.toml` | `DropTable` deletes a managed table's data (local directory or object-store prefix) after removing the catalog entry; external tables keep theirs (deps `futures`, `object_store`) | Spark's `DropTableCommand` deletes managed table data; upstream left the files behind (BS-021) |
 Workspace-level: `Cargo.toml` is derived from Sail's root manifest (same
 dependency versions, lints and release profile) with an explicit member list,
 the Ballista integration crates, DataFusion's `sql` feature declared, and a
