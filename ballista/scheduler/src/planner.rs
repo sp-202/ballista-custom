@@ -28,8 +28,8 @@ use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::execution_plans::sort_shuffle::SortShuffleConfig;
 use ballista_core::{
     execution_plans::{
-        RangeShuffleReaderExec, ShuffleReaderExec, ShuffleWriterExec,
-        SortShuffleWriterExec, UnresolvedShuffleExec,
+        EmptyPartitionsExec, RangeShuffleReaderExec, ShuffleReaderExec,
+        ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
     },
     serde::scheduler::PartitionLocation,
 };
@@ -836,24 +836,24 @@ pub fn rollback_resolved_shuffles(
     Ok(replace_children_if_necessary(stage, new_children)?)
 }
 
-/// Rewrites every multi-partition [`EmptyExec`] into a round-robin [`RepartitionExec`]
-/// over a single-partition [`EmptyExec`], which is an equivalent plan whose partition
-/// count survives serialization.
+/// Rewrites every multi-partition [`EmptyExec`] into an [`EmptyPartitionsExec`] with
+/// the same partition count, an equivalent leaf whose partition count survives
+/// serialization.
 ///
 /// `datafusion-proto` encodes an `EmptyExec` as its schema alone, so a multi-partition
 /// `EmptyExec` decodes on the executor with a single partition
 /// (<https://github.com/apache/datafusion/issues/23642>). A stage is sized from the
 /// scheduler-side partition count, so every task above partition 0 would then fail with
-/// `EmptyExec invalid partition N (expected less than 1)`. A `RepartitionExec` carries
-/// its partitioning on the wire, so the count arrives intact.
+/// `EmptyExec invalid partition N (expected less than 1)`.
+///
+/// The replacement must stay a leaf. A round-robin `RepartitionExec` over a
+/// single-partition `EmptyExec` also keeps the count, but per-task restriction cannot
+/// slice a repartition: inside a `UNION ALL` the task's plan then had more partitions
+/// than its slice, and the shuffle writer wrote the extra ones over other partitions'
+/// files, duplicating or losing rows (BS-024).
 ///
 /// This runs at the point the stage plan is built for the wire, after all physical
 /// optimizer rules, so no later rule can collapse the rewrite.
-///
-/// Retained even though upstream #23642 preserves the partition count on the wire:
-/// the round-robin re-wrap is a defensive belt-and-suspenders that also normalises
-/// legacy plans decoded from persisted job state, so keep it until we have a
-/// migration story for those.
 fn make_empty_exec_serde_safe(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -867,11 +867,10 @@ fn make_empty_exec_serde_safe(
             if partition_count <= 1 {
                 return Ok(Transformed::no(node));
             }
-            let single: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(empty.schema()));
-            Ok(Transformed::yes(Arc::new(RepartitionExec::try_new(
-                single,
-                Partitioning::RoundRobinBatch(partition_count),
-            )?)))
+            Ok(Transformed::yes(Arc::new(EmptyPartitionsExec::new(
+                empty.schema(),
+                partition_count,
+            ))))
         })?
         .data)
 }
@@ -970,10 +969,7 @@ mod test {
 
         let rewritten = make_empty_exec_serde_safe(plan).unwrap();
 
-        assert_plan!(rewritten.as_ref(), @r"
-        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-          EmptyExec
-        ");
+        assert_plan!(rewritten.as_ref(), @"EmptyPartitionsExec: partitions=4");
     }
 
     #[test]

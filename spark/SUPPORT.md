@@ -51,7 +51,7 @@ decimal averages differ in the last digit (BS-009).
 | SELECT, joins (inner, left outer, full outer), CTEs | ✅ | TPC-H; TPC-DS q1, q5, q40, q49, q51 |
 | Subqueries: scalar, `IN (SELECT …)`, `EXISTS` | ✅ | TPC-H q2/q4/q17/q20–22; TPC-DS q10, q14, q16, q33, q35, q45 |
 | `UNION ALL`, `INTERSECT` | ✅ | TPC-DS q2, q4, q5, q8, q11, q14, q33, q38 |
-| `UNION ALL` with a branch empty at runtime | ⚠️ | hang fixed (BS-022), but q23 loses a row (BS-024) |
+| `UNION ALL` with a branch empty at runtime | ✅ | BS-022 (hang), BS-024 (duplicated or lost rows) |
 | `EXCEPT` | ❔ | in q87, not reached yet |
 | `ROLLUP`, `GROUPING()` | ✅ | TPC-DS q5, q14, q18, q22, q27, q36 |
 | Window functions (`rank()`, aggregates `OVER`) | ✅ | TPC-DS q36, q44, q49, q51 |

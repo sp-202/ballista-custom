@@ -32,7 +32,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-021](#bs-021) | 🟢 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
 | [BS-022](#bs-022) | 🟢 | S1 | Job hangs when a union branch is empty at runtime (task metrics mismatch) | 05 |
 | [BS-023](#bs-023) | 🟢 | S1 | Adaptive jobs never free intermediate shuffle data early; TPC-DS filled the disk | 05 |
-| [BS-024](#bs-024) | 🔴 | S1 | TPC-DS q23 (second SELECT) loses a row on Spark Connect | 03 |
+| [BS-024](#bs-024) | 🟢 | S1 | `UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23) | 03 |
 
 ---
 
@@ -319,8 +319,26 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   cleanup still removes the rest after 300 s; no deleted-but-open files in the executor.
 
 ## BS-024
-**TPC-DS q23 (second SELECT) loses a row on Spark Connect** · 🔴 open · step 03
+**`UNION ALL` with a branch empty at runtime duplicates or loses rows (TPC-DS q23)** · 🟢 fixed · step 03
 - **Evidence:** TPC-DS SF10 q23's second SELECT returns `Thompson, Fidel, 5834.01` only;
   Spark also returns `Barnes, Lowell, 202.14`. The first SELECT matches (6036.15). This is
   the query that hung before BS-022; its plan has a `UNION ALL` branch that AQE turns empty.
+- **Second symptom:** `SELECT count(*), sum(c)` over `store_sales` agg `UNION ALL` an
+  aggregate of `web_sales WHERE ws_quantity > 1000` (empty) returned 174,857 / 130,867 rows
+  on two runs; Spark returns 102,000. Each branch alone was right.
+- **Cause:** AQE turned the empty branch into a 28-partition `EmptyExec`. Because DataFusion's
+  protobuf drops `EmptyExec`'s partition count, `make_empty_exec_serde_safe` rewrote it as
+  `RepartitionExec(RoundRobinBatch(28))` over a 1-partition `EmptyExec`. Per-task
+  restriction cannot slice a repartition, so each task's union had 28 partitions on top of
+  its share (36 instead of 8). The pass-through shuffle writer drains every local
+  partition and maps those past the task's slice to their own index, so a task wrote two
+  partitions to the same shuffle file: the reader read the file twice (duplicates: exactly
+  20 of 28 partitions here) or the empty write won (q23's lost row).
+- **Fix:** the rewrite produces `EmptyPartitionsExec(N)`, a leaf that keeps its partition
+  count on the wire; restriction slices `EmptyExec(N)` / `EmptyPartitionsExec` to the task's
+  share; a restricted union child with more partitions than its share is an error; the
+  pass-through writer fails a task whose plan has a different partition count than its
+  slice instead of writing over other partitions' files.
+- **Verified:** union repro 102,000 rows twice; q23 second SELECT returns both rows.
+- **Not covered:** the pipelined (streaming shuffle) writer has no such check yet.
 

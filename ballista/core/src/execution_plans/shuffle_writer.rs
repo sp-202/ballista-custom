@@ -95,6 +95,24 @@ pub(crate) enum GlobalPartitionMap {
 }
 
 impl GlobalPartitionMap {
+    /// Errors when a passthrough map has a slice that does not match the plan's
+    /// `local_partitions`: local partitions past the slice would be written under
+    /// their own index, i.e. into other partitions' files (BS-024).
+    pub(crate) fn check_covers(&self, local_partitions: usize) -> Result<()> {
+        match self {
+            GlobalPartitionMap::PassThrough(slice)
+                if !slice.is_empty() && slice.len() != local_partitions =>
+            {
+                Err(DataFusionError::Internal(format!(
+                    "shuffle writer input has {local_partitions} partition(s) but the \
+                     task owns {} output partition(s)",
+                    slice.len()
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn resolve(&self, local: usize) -> u64 {
         match self {
             GlobalPartitionMap::Collapsed => 0,
@@ -584,6 +602,7 @@ impl ShuffleWriterExec {
             // and deadlocks the scatter side.
             let num_partitions =
                 plan.properties().output_partitioning().partition_count();
+            partition_map.check_covers(num_partitions)?;
             let mut handles = JoinSet::new();
             for local_input_partition in 0..num_partitions {
                 // Each drain owns its own metric bucket, keyed by the
@@ -1076,6 +1095,21 @@ fn collect_window_state_against_slice(
 #[allow(dead_code, unused_imports)] // clippy false positive with local imports
 mod tests {
     use super::*;
+
+    #[test]
+    fn passthrough_map_must_cover_every_local_partition() {
+        let map = GlobalPartitionMap::PassThrough(vec![8, 9, 10]);
+        assert!(map.check_covers(3).is_ok());
+        assert!(map.check_covers(5).is_err());
+        assert!(map.check_covers(2).is_err());
+        // No slice stamped: identity, any count.
+        assert!(
+            GlobalPartitionMap::PassThrough(vec![])
+                .check_covers(5)
+                .is_ok()
+        );
+        assert!(GlobalPartitionMap::KSpace.check_covers(5).is_ok());
+    }
     use crate::error::BallistaError;
     use crate::execution_plans::ChaosExec;
     use datafusion::arrow::array::{

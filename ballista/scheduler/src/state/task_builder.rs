@@ -118,7 +118,22 @@ fn restrict(
             .into_iter()
             .cloned()
             .zip(per_child)
-            .map(|(child, sub)| restrict(child, &sub, false))
+            .map(|(child, sub)| {
+                let restricted = restrict(child, &sub, false)?;
+                // The union's partitions are its children's, concatenated, and the
+                // task's writer maps them one to one onto `partitions`. A child that
+                // keeps more partitions than its share (a repartition does) would
+                // make the writer write rows under other partitions' ids.
+                let count = restricted.properties().output_partitioning().partition_count();
+                if count != sub.len() {
+                    return internal_err!(
+                        "cannot restrict UnionExec child {} to {} partition(s): it has {count}",
+                        restricted.name(),
+                        sub.len()
+                    );
+                }
+                Ok(restricted)
+            })
             .collect::<Result<Vec<_>>>()?;
         return replace_children_if_necessary(plan, new_children);
     }
@@ -397,7 +412,23 @@ fn select_output_partitions(
         if indices.is_empty() {
             return Ok(Some(Arc::new(EmptyPartitionsExec::new(plan.schema(), 0))));
         }
+        // An empty leaf has nothing to select: any slice of it is that many empty
+        // partitions.
+        if plan.is::<EmptyExec>()
+            && indices.len() != plan.properties().output_partitioning().partition_count()
+        {
+            return Ok(Some(Arc::new(EmptyPartitionsExec::new(
+                plan.schema(),
+                indices.len(),
+            ))));
+        }
         return Ok(None);
+    }
+    if plan.is::<EmptyPartitionsExec>() {
+        return Ok(Some(Arc::new(EmptyPartitionsExec::new(
+            plan.schema(),
+            indices.len(),
+        ))));
     }
 
     Ok(None)
@@ -450,6 +481,55 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A union whose second branch is a 28-partition empty leaf, sliced the way a
+    /// 7-task stage slices its 56 partitions: every task's plan must have exactly
+    /// its 8 partitions, or the writer writes rows under other partitions' ids
+    /// (BS-024).
+    #[test]
+    fn union_with_empty_branch_restricts_to_the_slice_length() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let reader = shuffle_reader(28);
+        let schema = reader.schema();
+        let empty_branches: Vec<Arc<dyn ExecutionPlan>> = vec![
+            Arc::new(EmptyExec::new(schema.clone()).with_partitions(28)),
+            Arc::new(EmptyPartitionsExec::new(schema, 28)),
+        ];
+        for empty in empty_branches {
+            let union: Arc<dyn ExecutionPlan> =
+                UnionExec::try_new(vec![reader.clone(), empty]).unwrap();
+            for start in (0..56).step_by(8) {
+                let slice: Vec<usize> = (start..start + 8).collect();
+                let restricted =
+                    restrict_plan_to_partitions(union.clone(), &slice).unwrap();
+                assert_eq!(
+                    restricted
+                        .properties()
+                        .output_partitioning()
+                        .partition_count(),
+                    8,
+                    "slice {start}..{}",
+                    start + 8
+                );
+            }
+        }
+    }
+
+    /// A repartition keeps all its outputs whatever the slice, so a union child
+    /// topped by one cannot be restricted; that must be an error, not a plan with
+    /// more partitions than the task owns.
+    #[test]
+    fn union_child_that_cannot_be_sliced_is_an_error() {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        let reader = shuffle_reader(4);
+        let repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(shuffle_reader(4), Partitioning::RoundRobinBatch(4))
+                .unwrap(),
+        );
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![reader, repartitioned]).unwrap();
+        assert!(restrict_plan_to_partitions(union, &[0, 5]).is_err());
     }
 
     #[test]

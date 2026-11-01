@@ -523,9 +523,15 @@ async fn finished_adaptive_graph_reports_all_but_its_output_stage_as_intermediat
     let q = "select min(a) as c0, max(b) as c1, c as c2 from t group by c order by c2";
     let logical_plan = ctx.sql(q).await?.logical_plan().clone();
     let job_id: JobId = "job-id-intermediate".into();
-    let mut graph =
-        AdaptiveExecutionGraph::try_new("scheduler-1", &job_id, "", &ctx, &logical_plan, 7)
-            .await?;
+    let mut graph = AdaptiveExecutionGraph::try_new(
+        "scheduler-1",
+        &job_id,
+        "",
+        &ctx,
+        &logical_plan,
+        7,
+    )
+    .await?;
     // Nothing is known to be intermediate before the job has produced output.
     assert!(graph.intermediate_stage_ids().is_empty());
 

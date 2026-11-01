@@ -72,9 +72,8 @@ async fn should_propagate_empty_stage() -> datafusion::error::Result<()> {
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ r"
-    ShuffleWriterExec: partitioning: RoundRobinBatch(2)
-      RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-        EmptyExec
+    ShuffleWriterExec: partitioning: UnknownPartitioning(2)
+      EmptyPartitionsExec: partitions=2
     ");
     planner.finalise_stage_internal(1, mock_partitions_with_statistics_no_data())?;
 
@@ -147,9 +146,8 @@ async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<
     let stages = planner.runnable_stages()?.unwrap();
     assert_eq!(1, stages.len());
     assert_plan!(stages.first().unwrap().plan.as_ref(),  @ r"
-    ShuffleWriterExec: partitioning: RoundRobinBatch(2)
-      RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-        EmptyExec
+    ShuffleWriterExec: partitioning: UnknownPartitioning(2)
+      EmptyPartitionsExec: partitions=2
     ");
     planner.finalise_stage_internal(1, mock_partitions_with_statistics_no_data())?;
 
