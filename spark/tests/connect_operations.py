@@ -100,6 +100,19 @@ def test_range(spark):
               f"sum={row.s} count={row.c}")
 
 
+def test_repartition(spark):
+    """repartition / coalesce change partitioning, never the rows (BS-010)."""
+    df = spark.range(0, 1_000_000, 1, 4)
+    for name, d in [
+        ("repartition(16)", df.repartition(16)),
+        ("repartition(16, k)", df.withColumn("k", F.col("id") % 100).repartition(16, "k")),
+        ("coalesce(2)", df.coalesce(2)),
+    ]:
+        row = d.agg(F.sum("id").alias("s"), F.count("*").alias("c")).collect()[0]
+        check(f"{name} keeps every row", row.s == 499_999_500_000 and row.c == 1_000_000,
+              f"sum={row.s} count={row.c}")
+
+
 def test_interrupts(spark, scheduler):
     query = slow_query(spark)
 
@@ -200,6 +213,7 @@ def main():
     spark = SparkSession.builder.remote(args.remote).getOrCreate()
     test_explain(spark)
     test_range(spark)
+    test_repartition(spark)
     test_interrupts(spark, args.scheduler)
     test_stop_cancels_jobs(args.remote, args.scheduler)
     test_reattach(args.remote)

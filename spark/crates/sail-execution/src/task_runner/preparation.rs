@@ -56,7 +56,7 @@ impl TaskPreparation {
         canceled: &CancellationToken,
         context: Arc<TaskContext>,
     ) -> ExecutionResult<SendableRecordBatchStream> {
-        let plan = proto_to_physical_plan(&context, &RemoteExecutionCodec, proto)?;
+        let plan = proto_to_physical_plan(&context, &RemoteExecutionCodec::new(), proto)?;
         let plan = self.rewrite_file_scans(plan)?;
         let plan = self.rewrite_shuffle(
             key,
@@ -153,7 +153,7 @@ impl TaskPreparation {
         };
         let plan = result.data()?;
         let schema = plan.schema();
-        let partitioning = output.shuffle_partitioning(&context, &schema, &RemoteExecutionCodec)?;
+        let partitioning = output.shuffle_partitioning(&context, &schema, &RemoteExecutionCodec::new())?;
         let writer = streams.writer(key.clone(), output.clone(), schema.clone());
         Ok(Arc::new(ShuffleWriteExec::new(plan, writer, partitioning)))
     }

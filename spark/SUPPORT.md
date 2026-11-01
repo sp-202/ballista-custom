@@ -36,7 +36,8 @@ decimal averages differ in the last digit (BS-009).
 | `spark.read.parquet(path)`, temp views | ✅ | TPC-DS runner registers 24 tables this way |
 | `spark.read` of a missing path raises `PATH_NOT_FOUND` | ✅ | BS-017 |
 | Server-side Spark conf (`ballista-connect --conf k=v`) | ✅ | BS-020 |
-| `df.repartition(n)` as a stage boundary | ❌ | BS-010 |
+| `df.repartition(n)`, `repartition(n, cols)`, `coalesce(n)` | ✅ | BS-010, BS-030; `tests/connect_operations.py`. `coalesce(n)` costs a shuffle (Spark's does not) |
+| `spark_partition_id()` | ⚠️ | ids are task-local (BS-029) |
 | Closing a session cancels its jobs | ✅ | BS-012; `tests/connect_operations.py` |
 | `df.explain()` (all modes) | ✅ | `tests/connect_operations.py` |
 | `spark.interruptAll` / `interruptTag`: job stopped, client gets `OPERATION_CANCELED` | ✅ | BS-012; `tests/connect_operations.py` |

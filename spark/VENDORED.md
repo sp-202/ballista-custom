@@ -29,6 +29,7 @@ has to be re-applied when updating from upstream.
 | `sail-session/src/session_manager/mod.rs` | `create_session_manager_with_job_runner_factory`; `create_session_manager` delegates to it | Same |
 | `sail-spark-connect/src/session_manager.rs` | `create_spark_session_manager_with_factories` | Same |
 | `sail-spark-connect/src/session.rs`, `service/plan_executor.rs`, `error.rs` | Remember interrupted operation ids; reattaching to one fails with `[OPERATION_CANCELED]` (`SparkError::OperationCanceled`); errors whose message starts with `[ERROR_CLASS]` carry it as `errorClass` | PySpark then raises `SparkException` with `getCondition() == "OPERATION_CANCELED"` after an interrupt, as with Spark, instead of "operation not found" |
+| `sail-execution/src/proto/codec.rs` (+ `driver/job_scheduler/mod.rs`, `task_runner/preparation.rs`) | `RemoteExecutionCodec` is a struct with an optional weak outer codec (`with_nested_codec`, `new()`); every nested plan inside a Sail node is encoded and decoded with it | Sail nodes can hold Ballista nodes (shuffle readers, `SelectPartitionsExec`), which only Ballista's composite codec can encode (BS-030) |
 | `sail-spark-connect/src/entrypoint.rs` | `serve_with_factories`; shared `serve_session_manager` used by both serve functions | Same |
 | `sail-common-datafusion/src/error.rs` | Handle `DataFusionError::SQL` | Ballista enables DataFusion's `sql` feature, which adds this variant |
 | `sail-plan/src/resolver/expression/wildcard.rs` | Build wildcard options with `sqlparser` AST types | Under the `sql` feature DataFusion uses `sqlparser` types instead of `datafusion_expr::sql`; the rename/replace items are display-only (DataFusion evaluates `planned_expressions`), so results are unchanged |
@@ -43,9 +44,6 @@ the Ballista integration crates, DataFusion's `sql` feature declared, and a
 
 ## Known gaps (not yet handled)
 
-- `ExplicitRepartitionExec` with round-robin partitioning (Spark
-  `df.repartition(n)`) is not rewritten to a standard operator by Sail's
-  optimizer; Ballista does not treat it as a shuffle boundary.
 - Executors use Ballista's default runtime environment, so object stores
   configured through Sail settings (S3, GCS, Azure, HDFS) are not yet
   registered on executors.

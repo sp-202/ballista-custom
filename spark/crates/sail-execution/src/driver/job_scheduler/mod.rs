@@ -34,7 +34,7 @@ impl JobScheduler {
             options,
             jobs: IndexMap::new(),
             job_id_generator: IdGenerator::new(),
-            codec: Box::new(RemoteExecutionCodec),
+            codec: Box::new(RemoteExecutionCodec::new()),
             event_reporter,
         }
     }

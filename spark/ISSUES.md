@@ -18,7 +18,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-007](#bs-007) | 🟢 | S3 | Spark Connect jobs run without AQE | 03 |
 | [BS-008](#bs-008) | 🔴 | S4 | DDL returns a `value: true` row instead of no columns | 04 |
 | [BS-009](#bs-009) | ⚪ | S4 | Decimal averages truncated instead of HALF_UP | 04 |
-| [BS-010](#bs-010) | 🔴 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
+| [BS-010](#bs-010) | 🟢 | S2 | `df.repartition(n)` is not a Ballista stage boundary | 03 |
 | [BS-011](#bs-011) | 🔴 | S2 | Executors don't register object stores from Sail settings | 05 |
 | [BS-012](#bs-012) | 🟢 | S3 | Closing a Spark session doesn't cancel its Ballista jobs | 02 |
 | [BS-013](#bs-013) | 🔴 | S2 | `BallistaSubplanExec` is single-partition; untested under driver-side writes | 05 |
@@ -37,6 +37,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-026](#bs-026) | 🔴 | S4 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 | [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
 | [BS-028](#bs-028) | 🟡 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
+| [BS-029](#bs-029) | 🔴 | S3 | `spark_partition_id()` returns task-local partition ids | 02 |
+| [BS-030](#bs-030) | 🟢 | S1 | `df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize | 02 |
 
 ---
 
@@ -120,10 +122,12 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Plan:** HALF_UP in the Spark function layer; within comparator tolerance meanwhile.
 
 ## BS-010
-**`df.repartition(n)` is not a Ballista stage boundary** · 🔴 open · step 03
+**`df.repartition(n)` is not a Ballista stage boundary** · 🟢 fixed · step 03
 - **Cause:** Sail's optimizer leaves round-robin `ExplicitRepartitionExec` for its own job
-  graph; Ballista's planner splits stages at DataFusion repartition operators only.
-- **Plan:** rewrite to a Ballista-supported repartition when submitting to Ballista.
+  graph; Ballista's planner splits stages at DataFusion repartition operators only. The job
+  failed: "no codec can encode plan node ExplicitRepartitionExec".
+- **Fix:** the Spark job runner rewrites it to `RepartitionExec(RoundRobinBatch(n))` before
+  submission. Checked in `tests/connect_operations.py`.
 
 ## BS-011
 **Executors don't register object stores from Sail settings** · 🔴 open · step 05
@@ -444,4 +448,33 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   1.1 billion rows pass through nine broadcast joins. Next needs per-operator time in that
   stage, which the UI does not report yet (step 11, "operator metrics"); a local DataFusion
   `EXPLAIN ANALYZE` of q72 did not finish in 15 minutes (its own planner picks another plan).
+
+## BS-029
+**`spark_partition_id()` returns task-local partition ids** · 🔴 open · step 02
+- **Evidence:** `spark.range(0, 10**6, 1, 4).repartition(16)` grouped by `spark_partition_id()`
+  shows 4 ids, not 16. Rows and sums are right.
+- **Cause:** a task runs its slice of a stage's partitions as partitions `0..k` of its own
+  plan; Sail's `SparkPartitionIdExec` reports the index it is executed with.
+- **Plan:** let the restricted task plan carry each local partition's global id (the writer
+  already has them as `global_output_partition_ids`) and have partition-dependent operators
+  read it.
+
+## BS-030
+**`df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize** · 🟢 fixed · step 02
+- **Evidence:** `spark.range(0, 10**6, 1, 4).coalesce(2)` summed half the rows once it ran;
+  before that, the task failed with "no codec can encode plan node CoalesceExec … sail:
+  unsupported physical plan node: SelectPartitionsExec".
+- **Cause 1:** Sail's codec encodes the children it embeds (`CoalesceExec`,
+  `SparkPartitionIdExec`, ~50 node types) with itself, so any Ballista node below a Sail node
+  (a shuffle reader, `SelectPartitionsExec`) could not be shipped.
+- **Cause 2:** `CoalesceExec` merges input partitions inside a stage. Ballista gives each task
+  a slice of the stage's partitions and assumes operators keep partition numbers, so a task
+  read the wrong inputs.
+- **Fix:** `RemoteExecutionCodec::with_nested_codec`: Sail encodes and decodes nested plans
+  with the composite codec (`SparkPhysicalCodec::shared`, built with `Arc::new_cyclic`). The
+  runner rewrites `CoalesceExec` to a round-robin `RepartitionExec`, a stage boundary (Spark
+  coalesces without a shuffle; here it costs one).
+- **Verified:** sums and counts exact for `repartition(16)`, `repartition(16, k)`,
+  `coalesce(2)`; codec round-trip test for a Sail node over a Ballista node; TPC-H 22/22,
+  TPC-DS 99/99.
 

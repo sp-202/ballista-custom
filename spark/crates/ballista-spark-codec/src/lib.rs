@@ -65,16 +65,24 @@ impl Default for SparkPhysicalCodec {
 
 impl SparkPhysicalCodec {
     pub fn new() -> Self {
-        let sail = Arc::new(RemoteExecutionCodec);
+        Self::with_sail(Arc::new(RemoteExecutionCodec::new()))
+    }
+
+    fn with_sail(sail: Arc<RemoteExecutionCodec>) -> Self {
         Self {
             ballista: BallistaPhysicalExtensionCodec::new(sail.clone()),
             sail,
         }
     }
 
-    /// The codec as the trait object Ballista's configs expect.
+    /// The codec as the trait object Ballista's configs expect. Plans nested in
+    /// Sail's nodes are encoded with this composite codec too, so they may hold
+    /// Ballista nodes (a shuffle reader under `CoalesceExec`).
     pub fn shared() -> Arc<dyn PhysicalExtensionCodec> {
-        Arc::new(Self::new())
+        Arc::<Self>::new_cyclic(|composite| {
+            let nested: std::sync::Weak<dyn PhysicalExtensionCodec> = composite.clone();
+            Self::with_sail(Arc::new(RemoteExecutionCodec::with_nested_codec(nested)))
+        })
     }
 
     fn codec(&self, origin: Origin) -> &dyn PhysicalExtensionCodec {

@@ -1286,6 +1286,7 @@ dependencies = [
  "sail-common",
  "sail-common-datafusion",
  "sail-execution",
+ "sail-physical-plan",
  "sail-session",
  "tonic",
 ]

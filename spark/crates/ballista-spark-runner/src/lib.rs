@@ -20,11 +20,15 @@ pub mod submit;
 use std::sync::Arc;
 
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning, displayable, execute_stream};
 use datafusion::prelude::SessionContext;
 use sail_common::actor::ActorSystem;
 use sail_common_datafusion::session::job::JobRunner;
+use sail_physical_plan::coalesce::CoalesceExec;
+use sail_physical_plan::repartition::ExplicitRepartitionExec;
 use sail_session::error::SessionResult;
 use sail_session::session_factory::{
     SessionJobRunner, SessionJobRunnerFactory, SessionJobRunnerInfo,
@@ -54,6 +58,7 @@ impl JobRunner for BallistaJobRunner {
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
         let session_config = ctx.copied_config();
+        let plan = round_robin_as_repartition(plan)?;
         if placement::has_driver_stage(&plan) {
             let local = placement::place(plan, &self.submitter, &session_config)?;
             log::debug!(
@@ -88,6 +93,40 @@ impl JobRunner for BallistaJobRunner {
             self.submitter.session_id()
         );
     }
+}
+
+/// Rewrites Sail's operators that change the partition count inside a stage
+/// to DataFusion's round-robin `RepartitionExec`, at which Ballista splits stages:
+///
+/// - round-robin `ExplicitRepartitionExec` (`df.repartition(n)`), which Sail
+///   keeps for its own job graph (BS-010);
+/// - `CoalesceExec` (`df.coalesce(n)`), which merges input partitions within a
+///   stage. Ballista gives each task a slice of a stage's partitions and assumes
+///   operators keep partition numbers, so a task would read the wrong inputs and
+///   lose rows. Spark coalesces without a shuffle; here it costs one.
+fn round_robin_as_repartition(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let round_robin = |input: &Arc<dyn ExecutionPlan>, n: usize| -> Result<_> {
+        Ok(Transformed::yes(Arc::new(RepartitionExec::try_new(
+            Arc::clone(input),
+            Partitioning::RoundRobinBatch(n),
+        )?) as Arc<dyn ExecutionPlan>))
+    };
+    Ok(plan
+        .transform_up(|node| {
+            if let Some(explicit) = node.downcast_ref::<ExplicitRepartitionExec>()
+                && let Partitioning::RoundRobinBatch(n) =
+                    explicit.properties().output_partitioning()
+            {
+                return round_robin(explicit.input(), *n);
+            }
+            if let Some(coalesce) = node.downcast_ref::<CoalesceExec>() {
+                return round_robin(coalesce.input(), coalesce.output_partitions());
+            }
+            Ok(Transformed::no(node))
+        })?
+        .data)
 }
 
 /// Creates a [`BallistaJobRunner`] for each Spark session.

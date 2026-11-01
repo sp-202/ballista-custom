@@ -16,6 +16,7 @@ sail-common = { workspace = true }
 sail-common-datafusion = { workspace = true }
 sail-session = { workspace = true }
 sail-execution = { workspace = true }
+sail-physical-plan = { path = "../sail-physical-plan" }
 futures = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }

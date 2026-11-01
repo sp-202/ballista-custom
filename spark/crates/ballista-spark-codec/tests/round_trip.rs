@@ -89,3 +89,24 @@ fn empty_payload_is_rejected() {
         .unwrap_or_default();
     assert!(err.contains("empty extension plan node"), "{err}");
 }
+
+/// A Sail node whose child is a Ballista node: Sail's codec embeds its children,
+/// so it must encode them with the composite codec, not with itself.
+#[test]
+fn sail_node_over_ballista_node_round_trips() -> Result<()> {
+    use ballista_core::execution_plans::SelectPartitionsExec;
+    use sail_physical_plan::coalesce::CoalesceExec;
+
+    let select = SelectPartitionsExec::try_new(sail_range(8)?, vec![4, 5, 6, 7])?;
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(CoalesceExec::new(Arc::new(select), 2));
+    let codec = SparkPhysicalCodec::shared();
+    let bytes = physical_plan_to_bytes_with_extension_codec(plan.clone(), codec.as_ref())?;
+    let ctx = SessionContext::new();
+    let decoded =
+        physical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), codec.as_ref())?;
+    let before = displayable(plan.as_ref()).indent(true).to_string();
+    let after = displayable(decoded.as_ref()).indent(true).to_string();
+    assert_eq!(before, after);
+    assert!(after.contains("SelectPartitionsExec"), "{after}");
+    Ok(())
+}
