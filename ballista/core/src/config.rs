@@ -130,6 +130,14 @@ pub const BALLISTA_BROADCAST_JOIN_THRESHOLD_ROWS: &str =
 pub const BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES: &str =
     "ballista.optimizer.hash_join_max_build_partition_bytes";
 
+/// Configuration key making AQE run a shuffled inner or outer join that carries a
+/// non-equi filter as a sort-merge join rather than a hash join, as Spark does for every shuffled
+/// join. When many rows share a join key the hash join evaluates the filter on each
+/// matching pair it gathers from the hash table's chains; a sort-merge join walks
+/// the same pairs key group by key group (TPC-DS q72: 104 s vs 36 s).
+pub const BALLISTA_SORT_MERGE_FILTERED_JOINS: &str =
+    "ballista.optimizer.sort_merge_filtered_joins";
+
 /// Configuration key controlling whether AQE stages a join's prospective build
 /// side as its own shuffle before deciding how to run the join. When a build
 /// side's size is only an estimate and the probe side is far larger, shuffling
@@ -394,6 +402,11 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          which makes AQE use a hash join regardless of build size.".to_string(),
                          DataType::UInt64,
                          Some((64 * 1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_SORT_MERGE_FILTERED_JOINS.to_string(),
+                         "Runs a shuffled inner or outer join with a non-equi filter as a \
+                          sort-merge join instead of a hash join under AQE. Enabled by default.".to_string(),
+                         DataType::Boolean,
+                         Some(true.to_string())),
         ConfigEntry::new(BALLISTA_STAGE_BUILD_SIDE.to_string(),
                          "Stages a join's prospective build side as its own shuffle before \
                           choosing the join strategy. Applies only when that side's size is \
@@ -941,6 +954,12 @@ impl BallistaConfig {
     /// Maximum per-partition hash-join build-side bytes before falling back to SMJ.
     pub fn hash_join_max_build_partition_bytes(&self) -> usize {
         self.get_usize_setting(BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES)
+    }
+
+    /// Returns whether AQE runs a shuffled inner or outer join with a non-equi
+    /// filter as a sort-merge join.
+    pub fn sort_merge_filtered_joins(&self) -> bool {
+        self.get_bool_setting(BALLISTA_SORT_MERGE_FILTERED_JOINS)
     }
 
     /// Returns whether AQE stages a join's prospective build side as its own

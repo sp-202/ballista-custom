@@ -36,7 +36,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
 | [BS-026](#bs-026) | 🔴 | S3 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 | [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
-| [BS-028](#bs-028) | 🔴 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
+| [BS-028](#bs-028) | 🟡 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
 
 ---
 
@@ -419,14 +419,25 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** sums and counts exact for 3, 8, 56 and 100 partitions and 2 billion rows.
 
 ## BS-028
-**TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s)** · 🔴 open · step 07
+**TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s)** · 🟡 in progress (now 71 s) · step 07
 - **Evidence:** SF10, 16 cores each, same machine (runs of 2026-11-01; Comet's of 2026-10-12
   used the `datafusion-benchmarks` copy of the query). With q72 excluded Ballista's TPC-DS
   total is 76.8 s against Comet's 123.8 s and Spark's 305.1 s; q72 alone decides the total.
 - **Shape (after BS-025):** stage 5 joins the shuffled catalog_sales (14.4M rows) and inventory
   (133M rows) with a partitioned hash join on `item_sk` with filter
   `inv_quantity_on_hand < cs_quantity`, then streams through nine broadcast joins.
-- **To find out:** where the time goes in that stage (the join's filter evaluation over
-  matching pairs, the build side, or the broadcast joins after it); how Spark's plan reaches
-  17 s; rerun Comet with this repository's query text.
+- **Found:** Spark runs the same join order, with a sort-merge join for catalog_sales ×
+  inventory and no runtime filters. The join emits 1.12 billion rows; about 140 catalog_sales
+  rows share each item key. Timed alone in DataFusion 55 (16 partitions): hash join 104.2 s,
+  sort-merge join 35.6 s. The hash join evaluates the filter on every pair it gathers from
+  its hash chains; the sort-merge join walks the pairs key group by key group.
+- **Fix 1:** AQE runs a shuffled inner or outer join with a non-equi filter as a sort-merge
+  join (`ballista.optimizer.sort_merge_filtered_joins`, default on), as Spark does for every
+  shuffled join. Semi and anti joins keep the hash join: they stop at the first match, and
+  sort-merge made TPC-H q21 1.94 → 2.76 s and TPC-DS q16 0.31 → 0.66 s.
+- **Result:** q72 125 → 71 s, q23 19.3 → 12.5 s; TPC-DS 210 → 145 s; TPC-H unchanged (15.3 s);
+  22/22 and 99/99 match Spark, no query more than 1.5× slower.
+- **Left:** 71 s against Spark's 17 s. DataFusion's sort-merge join alone takes 36 s here, then
+  1.1 billion rows pass through nine broadcast joins. Next: per-operator time in that stage;
+  rerun Comet with this repository's query text.
 

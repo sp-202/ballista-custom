@@ -407,13 +407,27 @@ impl DynamicJoinSelectionExec {
                     .map(JoinSelectionAction::LateCollectLeft)
             }
             // Both inputs are already shuffled, so broadcasting would pay for
-            // the shuffle and the broadcast. Decide hash-vs-sort on build fit.
+            // the shuffle and the broadcast. Decide hash-vs-sort on build fit,
+            // and use sort-merge for an inner or outer join with a non-equi
+            // filter (BS-028). Semi and anti joins stop at the first match, so
+            // their filter cost stays small and sorting only adds work.
             (
                 JoinInputState::Repartitioned,
                 PartitionMode::Partitioned | PartitionMode::CollectLeft,
-            ) if hash_build_fits(max_build_bytes, build_max_partition_bytes) => self
-                .to_hash_join(PartitionMode::Partitioned)
-                .map(JoinSelectionAction::Hash),
+            ) if hash_build_fits(max_build_bytes, build_max_partition_bytes)
+                && !(bc.sort_merge_filtered_joins()
+                    && self.filter.is_some()
+                    && matches!(
+                        self.join_type,
+                        JoinType::Inner
+                            | JoinType::Left
+                            | JoinType::Right
+                            | JoinType::Full
+                    )) =>
+            {
+                self.to_hash_join(PartitionMode::Partitioned)
+                    .map(JoinSelectionAction::Hash)
+            }
             (
                 JoinInputState::Repartitioned,
                 PartitionMode::Partitioned | PartitionMode::CollectLeft,
@@ -2010,6 +2024,58 @@ mod tests {
             .to_string();
         assert!(rendered.contains("HashJoinExec"), "{rendered}");
         assert!(rendered.contains("mode=Partitioned"), "{rendered}");
+    }
+
+    // A shuffled inner or outer join with a non-equi filter runs as a sort-merge
+    // join even when its build side fits (BS-028); semi joins and unfiltered
+    // joins keep the hash join.
+    #[test]
+    fn filtered_inner_join_uses_sort_merge_join() {
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::common::JoinSide;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_plan::joins::utils::ColumnIndex;
+
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("l", 0)),
+                Operator::Lt,
+                Arc::new(Column::new("r", 1)),
+            )),
+            vec![
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                },
+            ],
+            Arc::new(Schema::new(vec![
+                Field::new("l", DataType::Int64, true),
+                Field::new("r", DataType::Int64, true),
+            ])),
+        );
+        let resolve = |join_type, filter: Option<JoinFilter>| {
+            let mut exec =
+                repartitioned_join_between_exchanges(&[50 * MB], PROBE_PARTITION_BYTES);
+            exec.join_type = join_type;
+            exec.filter = filter;
+            let action = exec
+                .to_actual_join(&config_with_max_build(200 * MB))
+                .unwrap();
+            displayable(resolved_plan(&action).as_ref())
+                .indent(false)
+                .to_string()
+        };
+        let inner = resolve(JoinType::Inner, Some(filter.clone()));
+        assert!(inner.contains("SortMergeJoinExec"), "{inner}");
+        let semi = resolve(JoinType::LeftSemi, Some(filter));
+        assert!(semi.contains("HashJoinExec"), "{semi}");
+        let unfiltered = resolve(JoinType::Inner, None);
+        assert!(unfiltered.contains("HashJoinExec"), "{unfiltered}");
     }
 
     /// Builds a `DynamicJoinSelectionExec` in `Repartitioned` state whose *both*

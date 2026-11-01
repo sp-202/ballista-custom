@@ -114,7 +114,7 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
-1. BS-028 — q72 takes 124 s (Spark 17 s, Comet 2.2 s).
+1. BS-028 — q72 now 71 s (was 124 s; Spark 17 s, Comet 2.2 s).
 2. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
 3. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
 4. AQE: skew join splitting.
