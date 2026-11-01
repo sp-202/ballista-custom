@@ -455,10 +455,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 let task_context = {
                     let function_registry = task.function_registry;
 
+                    let mut session_config = task.session_config;
+                    crate::dynamic_pruning::enable_join_filters(&mut session_config);
                     Arc::new(TaskContext::new(
                         Some(task_identity.clone()),
                         task.session_id,
-                        task.session_config,
+                        session_config,
                         function_registry.scalar_functions.clone(),
                         function_registry.higher_order_functions.clone(),
                         function_registry.aggregate_functions.clone(),

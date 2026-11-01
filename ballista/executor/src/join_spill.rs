@@ -43,20 +43,22 @@ use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{JoinSide, Result, internal_err};
 use datafusion::execution::{SendableRecordBatchStream, SpillFile, TaskContext};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_plan::joins::{HashJoinExec, JoinSpillHook, PartitionMode};
-use datafusion::physical_plan::{ExecutionPlan, SpillManager};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 use datafusion::physical_plan::spill::InProgressSpillFile;
+use datafusion::physical_plan::{ExecutionPlan, SpillManager};
 use log::{debug, info};
 use parking_lot::Mutex;
 
 /// Gives every partitioned [`HashJoinExec`] in `plan` that has no spill hook its own
 /// [`BallistaJoinSpillHook`]. Call once per task plan, before execution: the hook binds
 /// the task's runtime when the join starts executing.
-pub fn with_join_spill_hooks(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+pub fn with_join_spill_hooks(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     with_join_spill_hooks_from(plan, || Arc::new(BallistaJoinSpillHook::default()))
 }
 
@@ -151,7 +153,11 @@ impl BallistaJoinSpillHook {
                 "hash join spill hook used before the task context was bound"
             );
         };
-        let compression = context.session_config().options().execution.spill_compression;
+        let compression = context
+            .session_config()
+            .options()
+            .execution
+            .spill_compression;
         let manager = Arc::new(
             SpillManager::new(
                 context.runtime_env(),
@@ -182,15 +188,12 @@ impl JoinSpillHook for BallistaJoinSpillHook {
         };
         let build_side = matches!(side, JoinSide::Left);
         let manager = self.manager(build_side, &first.schema())?;
-        let slot = Arc::clone(
-            self.buckets
-                .lock()
-                .entry((bucket, build_side))
-                .or_default(),
-        );
+        let slot =
+            Arc::clone(self.buckets.lock().entry((bucket, build_side)).or_default());
         let mut files = slot.lock();
         if files.open.is_none() {
-            files.open = Some(manager.create_in_progress_file("Ballista hash join spill")?);
+            files.open =
+                Some(manager.create_in_progress_file("Ballista hash join spill")?);
         }
         if let Some(open) = files.open.as_mut() {
             for batch in batches {
@@ -238,7 +241,10 @@ impl JoinSpillHook for BallistaJoinSpillHook {
 
     // The hash join uses only the bucket methods above. Returning `None` here makes
     // any other operator fall back to DataFusion's own spill files.
-    fn spill_batches(&self, _batches: &[RecordBatch]) -> Result<Option<Arc<dyn SpillFile>>> {
+    fn spill_batches(
+        &self,
+        _batches: &[RecordBatch],
+    ) -> Result<Option<Arc<dyn SpillFile>>> {
         Ok(None)
     }
 
@@ -331,8 +337,14 @@ mod tests {
 
         let build = rows(hook.read_partition_spills(1, JoinSide::Left)?).await;
         assert_eq!(build, (0..15).chain(100..103).collect::<Vec<_>>());
-        assert_eq!(rows(hook.read_partition_spills(1, JoinSide::Right)?).await, (500..504).collect::<Vec<_>>());
-        assert_eq!(rows(hook.read_partition_spills(2, JoinSide::Left)?).await, vec![900, 901]);
+        assert_eq!(
+            rows(hook.read_partition_spills(1, JoinSide::Right)?).await,
+            (500..504).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows(hook.read_partition_spills(2, JoinSide::Left)?).await,
+            vec![900, 901]
+        );
         // Read once: a bucket is gone after it has been read.
         assert!(hook.read_partition_spills(1, JoinSide::Left)?.is_empty());
         assert!(hook.read_partition_spills(3, JoinSide::Right)?.is_empty());
@@ -355,7 +367,11 @@ mod tests {
         let left = hook.read_partition_spills(7, JoinSide::Left)?;
         let right = hook.read_partition_spills(7, JoinSide::Right)?;
         assert_eq!(rows(left).await.len() + rows(right).await.len(), 20_000);
-        assert_eq!(disk.used_disk_space(), 0, "spill files must be released once read");
+        assert_eq!(
+            disk.used_disk_space(),
+            0,
+            "spill files must be released once read"
+        );
         Ok(())
     }
 
@@ -397,22 +413,40 @@ mod tests {
             .with_target_partitions(4)
             .with_batch_size(256)
             .set_bool("datafusion.optimizer.prefer_hash_join", true)
-            .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 0)
-            .set_usize("datafusion.optimizer.hash_join_single_partition_threshold_rows", 0);
-        config.options_mut().execution.hash_join_spill_pressure_threshold = 1e-12;
+            .set_usize(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            )
+            .set_usize(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                0,
+            );
+        config
+            .options_mut()
+            .execution
+            .hash_join_spill_pressure_threshold = 1e-12;
         let ctx = SessionContext::new_with_config_rt(config, Arc::clone(&runtime));
 
         // l: 200k rows, key = id % 50_000 (4 rows per key); r: one row per key.
         let l: Vec<Vec<RecordBatch>> = (0..4)
-            .map(|p| (0..50).map(|b| batch(p * 50_000 + b * 1_000, 1_000)).collect())
+            .map(|p| {
+                (0..50)
+                    .map(|b| batch(p * 50_000 + b * 1_000, 1_000))
+                    .collect()
+            })
             .collect();
         let r: Vec<Vec<RecordBatch>> = (0..2)
-            .map(|p| (0..25).map(|b| batch(p * 25_000 + b * 1_000, 1_000)).collect())
+            .map(|p| {
+                (0..25)
+                    .map(|b| batch(p * 25_000 + b * 1_000, 1_000))
+                    .collect()
+            })
             .collect();
         let schema = l[0][0].schema();
         ctx.register_table("l", Arc::new(MemTable::try_new(Arc::clone(&schema), l)?))?;
         ctx.register_table("r", Arc::new(MemTable::try_new(schema, r)?))?;
-        let sql = "select count(*), sum(l.v), sum(r.v) from l join r on l.k % 50000 = r.k";
+        let sql =
+            "select count(*), sum(l.v), sum(r.v) from l join r on l.k % 50000 = r.k";
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
         let shown = displayable(plan.as_ref()).indent(true).to_string();
         assert!(shown.contains("HashJoinExec: mode=Partitioned"), "{shown}");
@@ -431,10 +465,14 @@ mod tests {
 
         assert_eq!(
             datafusion::arrow::util::pretty::pretty_format_batches(&actual)?.to_string(),
-            datafusion::arrow::util::pretty::pretty_format_batches(&expected)?.to_string()
+            datafusion::arrow::util::pretty::pretty_format_batches(&expected)?
+                .to_string()
         );
         let (rows, bytes, files) = hook.spilled();
-        assert!(rows > 0 && bytes > 0 && files > 0, "must spill: {rows} rows");
+        assert!(
+            rows > 0 && bytes > 0 && files > 0,
+            "must spill: {rows} rows"
+        );
         assert_eq!(
             runtime.disk_manager.used_disk_space(),
             0,

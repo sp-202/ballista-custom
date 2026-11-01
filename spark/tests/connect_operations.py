@@ -160,6 +160,41 @@ def test_iceberg(spark, warehouse):
         check("iceberg operations", False, str(e).splitlines()[0][:200])
 
 
+def scan_rows(scheduler, table):
+    """Rows output by the scans of `table` in the newest job, from the scheduler's metrics."""
+    import re
+    jobs = json.load(urllib.request.urlopen(f"{scheduler}/api/jobs"))
+    job = max(jobs, key=lambda j: j["start_time"])["job_id"]
+    stages = json.load(urllib.request.urlopen(
+        f"{scheduler}/api/job/{job}/stages?plan_format=metrics"))["stages"]
+    rows = []
+    for stage in stages:
+        for line in (stage.get("stage_plan") or "").splitlines():
+            if "DataSourceExec" in line and f"/{table}/" in line:
+                m = re.search(r"output_rows=([\d.]+) ?([KM]?)", line)
+                rows.append(float(m.group(1)) * {"": 1, "K": 1e3, "M": 1e6}[m.group(2)])
+    return rows
+
+
+def test_dynamic_partition_pruning(spark, scheduler, warehouse):
+    """A broadcast join prunes the partitioned fact table to the dimension's keys,
+    as Spark's dynamic partition pruning does: 2 of 20 partitions are read."""
+    import uuid
+    path = f"{warehouse}/ops_dpp_{uuid.uuid4().hex[:8]}"
+    spark.range(0, 2_000_000, 1, 8).select((F.col("id") % 20).alias("d"), F.col("id").alias("v")) \
+        .write.partitionBy("d").parquet(path + "/fact")
+    spark.range(0, 20).select(F.col("id").alias("d"), F.col("id").isin(7, 12).alias("flag")) \
+        .write.parquet(path + "/dim")
+    spark.read.parquet(path + "/fact").createOrReplaceTempView("ops_fact")
+    spark.read.parquet(path + "/dim").createOrReplaceTempView("ops_dim")
+    row = spark.sql("SELECT count(*), sum(v) FROM ops_fact JOIN ops_dim USING (d) "
+                    "WHERE ops_dim.flag").collect()[0]
+    check("dynamic partition pruning: answer", tuple(row) == (200_000, 199_999_900_000), str(tuple(row)))
+    rows = scan_rows(scheduler, "fact")
+    check("dynamic partition pruning: fact scan reads 2 of 20 partitions",
+          rows and sum(rows) == 200_000, f"scan rows {rows}")
+
+
 def test_object_store(spark, path):
     """Write to and read back from an object store (BS-011). Needs the store
     configured on every node, e.g. AWS_* settings for S3."""
@@ -277,6 +312,7 @@ def main():
     test_skew_join(spark)
     if args.warehouse:
         test_iceberg(spark, args.warehouse)
+        test_dynamic_partition_pruning(spark, args.scheduler, args.warehouse)
     if args.s3_path:
         test_object_store(spark, args.s3_path)
     test_interrupts(spark, args.scheduler)

@@ -373,6 +373,8 @@ pub mod collect;
 /// Command-line configuration for the executor binary.
 #[cfg(feature = "build-binary")]
 pub mod config;
+
+pub mod dynamic_pruning;
 /// Extension point for custom query stage execution engines.
 pub mod execution_engine;
 /// Pull-based task execution loop that polls the scheduler for work.

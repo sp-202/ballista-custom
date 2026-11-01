@@ -197,6 +197,11 @@ pub const BALLISTA_PARALLEL_WINDOW_ENABLED: &str =
 /// with the whole matching partition of the other side. Mirrors Spark's
 /// `spark.sql.adaptive.skewJoin.enabled` (default on).
 pub const BALLISTA_SKEW_JOIN_ENABLED: &str = "ballista.planner.skew_join.enabled";
+/// Prunes the probe-side scan of a broadcast (`CollectLeft`) hash join with the
+/// build side's join keys, inside each task. Spark's dynamic partition pruning
+/// (`spark.sql.optimizer.dynamicPartitionPruning.enabled`, broadcast reuse only).
+pub const BALLISTA_DYNAMIC_PARTITION_PRUNING_ENABLED: &str =
+    "ballista.executor.dynamic_partition_pruning.enabled";
 /// A partition is skewed when larger than this factor times the median
 /// partition size of its side (and than the threshold below). Mirrors
 /// `spark.sql.adaptive.skewJoin.skewedPartitionFactor`.
@@ -505,6 +510,14 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                         matching window shapes.".to_string(),
                         DataType::Boolean,
                         Some(false.to_string())),
+        ConfigEntry::new(
+            BALLISTA_DYNAMIC_PARTITION_PRUNING_ENABLED.to_string(),
+            "Prunes the probe-side scan of a broadcast hash join with the build \
+             side's keys (Spark's dynamic partition pruning)."
+                .to_string(),
+            DataType::Boolean,
+            Some(true.to_string()),
+        ),
         ConfigEntry::new(
             BALLISTA_SKEW_JOIN_ENABLED.to_string(),
             "Splits skewed partitions of shuffled joins (Spark's \
@@ -992,6 +1005,11 @@ impl BallistaConfig {
     /// Maximum per-partition hash-join build-side bytes before falling back to SMJ.
     pub fn hash_join_max_build_partition_bytes(&self) -> usize {
         self.get_usize_setting(BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES)
+    }
+
+    /// Returns whether executors prune broadcast-join probe scans at runtime.
+    pub fn dynamic_partition_pruning_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_DYNAMIC_PARTITION_PRUNING_ENABLED)
     }
 
     /// Returns whether AQE splits skewed partitions of shuffled joins.

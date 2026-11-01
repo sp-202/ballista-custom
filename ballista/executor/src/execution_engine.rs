@@ -27,9 +27,9 @@ use ballista_core::execution_plans::{
     PipelinedShuffleReaderExec, PipelinedShuffleWriterExec, RangeShuffleReaderExec,
     RangeShuffleWriterExec, ShuffleReaderExec, ShuffleWriterExec,
 };
+use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::{ShuffleWritePartition, TaskColumnStats};
 use ballista_core::serde::scheduler::PartitionStats;
-use ballista_core::extension::SessionConfigExt;
 use ballista_core::{JobId, utils};
 use datafusion::arrow::array::{
     Array, StringArray, StructArray, UInt32Array, UInt64Array,
@@ -218,6 +218,14 @@ impl ExecutionEngine for DefaultExecutionEngine {
         // when their build side does not fit in memory.
         let plan = if join_spill {
             crate::join_spill::with_join_spill_hooks(plan)?
+        } else {
+            plan
+        };
+
+        // Prune broadcast-join probe scans with the build side's keys (Spark's
+        // dynamic partition pruning); see `crate::dynamic_pruning`.
+        let plan = if config.ballista_config().dynamic_partition_pruning_enabled() {
+            crate::dynamic_pruning::push_join_filters(plan, config)?
         } else {
             plan
         };

@@ -41,6 +41,9 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-030](#bs-030) | 🟢 | S1 | `df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize | 02 |
 | [BS-031](#bs-031) | 🔴 | S1 | Delta `MERGE` intermittently loses rows (unsorted input to the partitioned writer) | 05 |
 | [BS-032](#bs-032) | 🟢 | S1 | Iceberg `UPDATE` / `MERGE` fail: scans lose virtual columns in serialization | 05 |
+| [BS-033](#bs-033) | 🟢 | S3 | No dynamic partition pruning: broadcast joins read the whole fact table | 07 |
+| [BS-034](#bs-034) | 🔴 | S3 | File writes run in one task; partitioned writes run out of memory | 05 |
+| [BS-035](#bs-035) | 🔴 | S2 | `bucketBy` writes unsupported (no co-located bucketed joins) | 05 |
 
 ---
 
@@ -541,3 +544,51 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** write, append, overwrite, partitioned write, `UPDATE`, `DELETE`, `MERGE` give
   Spark's counts (`tests/connect_operations.py`); TPC-H 22/22 (14.9 s), TPC-DS 99/99
   (148.9 s), unchanged.
+
+## BS-033
+**No dynamic partition pruning: broadcast joins read the whole fact table** · 🟢 fixed 2026-11-01 · step 07
+- **Evidence:** fact table of 10M rows partitioned by `d` (20 values), joined with a dimension
+  whose filter keeps `d` in (7, 12). Spark 3.5.8 plans `PartitionFilters: [dynamicpruning…]` and
+  reads 2 partitions. Ballista's fact scan had no predicate: 10M rows, 18 MB, every file.
+- **Cause:** Ballista turns DataFusion's dynamic filters off (`extension.rs`,
+  apache/datafusion-ballista#1375): a filter cannot cross a stage boundary, and DataFusion's
+  protobuf does not carry the link between a hash join and its filter, so a decoded join never
+  publishes one. Second, the parquet opener's per-file pruner (which folds partition values
+  into the filter and skips the file unopened) is only built for files carrying a statistics
+  struct, and Sail lists files without statistics.
+- **Fix:** `ballista/executor/src/dynamic_pruning.rs`. After a task plan is decoded, the
+  executor reruns DataFusion's post-optimization filter pushdown for `CollectLeft` (broadcast)
+  joins, as Spark does DPP only by reusing a broadcast by default. A `CollectLeft` join publishes
+  its filter only after all its probe partitions report, and an unpolled partition never
+  reports, so a join is rewritten only when every partition is polled: reached from the writer
+  through operators that drive all inputs, entering joins by their build side, with no
+  partitioned or sort-merge join below. `Partitioned` joins get no filter (theirs routes by
+  partition index, which a task's restricted plan renumbers). Scans under a rewritten join
+  get all-unknown file statistics so the per-file pruner runs. Switch:
+  `ballista.executor.dynamic_partition_pruning.enabled` (default true).
+- **Verified:** the fact scan now opens 4 of 47 file ranges and reads 1M rows / 1.8 MB (was
+  10M / 18 MB); answers equal vanilla Spark on the same files for full scan, projection, static
+  partition filter, row-group filter and the DPP join. TPC-H 22/22 (15.8 s), TPC-DS 99/99
+  (149.6 s; q82 0.69 → 0.35 s, q39 1.93 → 1.13 s from row-group pruning). `tests/connect_operations.py`
+  checks the answer and that the fact scan outputs only the 2 matching partitions.
+
+## BS-034
+**File writes run in one task; partitioned writes run out of memory** · 🔴 open · step 05
+- **Evidence:** `df.write.partitionBy("d").parquet(path)` of 10M rows with 100 values of `d`
+  failed with `ResourcesExhausted`; with 20 values it works. The job's last stage is one task:
+  `ShuffleReaderExec → CoalescePartitionsExec → DataSinkExec(ParquetSink)`. Spark writes from
+  every task.
+- **Cause:** DataFusion's `DataSinkExec` requires a single input partition and demultiplexes
+  rows to files itself, so every row passes through one task, which keeps an open writer
+  per partition value.
+- **Plan:** a per-partition write node (each task writes its own files with the same sink)
+  feeding a single commit node that sums the counts. Overwrite currently deletes the target
+  first inside the write's stage (`BarrierExec`); with writes in an earlier stage the commit
+  node must instead delete the old files after all writes succeed, keeping the files this job
+  wrote (`ParquetSink::written`).
+
+## BS-035
+**`bucketBy` writes unsupported (no co-located bucketed joins)** · 🔴 open · step 05
+- **Evidence:** `df.write.bucketBy(8, "k").saveAsTable(...)`: `bucketing for writing listing
+  data source` (Sail `listing/source.rs`). Joins of co-partitioned inputs inside one query
+  already avoid an extra exchange (two aggregates on the join key join without a shuffle).

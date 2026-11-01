@@ -76,6 +76,9 @@ decimal averages differ in the last digit (BS-009).
 | Feature | Status | Evidence / gap |
 |---|---|---|
 | Parquet on a local or shared path | ✅ | TPC-H, TPC-DS |
+| Projection pushdown, partition filters, row-group and page pruning | ✅ | 2026-11-01, 10M-row partitioned table: one column reads 18 MB of 372 MB; `d = 7` reads 1 partition; `id < 100000` keeps 1.6M of 10M rows after page pruning; answers equal Spark |
+| Partitioned parquet write (`partitionBy`) | ⚠️ | works, but in one task; many partition values run out of memory (BS-034) |
+| `bucketBy` | ❌ | BS-035 |
 | Table path invisible to the scheduler fails instead of returning empty | ✅ | BS-017 |
 | Object stores (S3, GCS, Azure, HDFS) | ✅ S3 tested | BS-011; configured from `AWS_*` / `GOOGLE_*` / `AZURE_*` environment on every node; `tests/connect_operations.py --s3-path` |
 | Shared warehouse (`spark.sql.warehouse.dir`) | ✅ | BS-020; must be the same mount on server and executors |
@@ -106,7 +109,7 @@ decimal averages differ in the last digit (BS-009).
 | Split skewed join partitions | on (5× median and > 256 MB) | ✅ | `optimizer_rule/skew_join.rs`, Spark's `OptimizeSkewedJoin` (same thresholds, map-range splits, split sides per join type). Applies when the join's stage hash-shuffles its output; a join feeding a global aggregate or the result stays unsplit. `tests/connect_operations.py` (776 MB partition split, answer exact). Not triggered by TPC-H/TPC-DS SF10 |
 | Local shuffle reader after switching to broadcast | on | ❌ | step 07 |
 | Rebalance skew (`REBALANCE` hint) | on | ❌ | step 07 |
-| Dynamic partition pruning | on | ⚠️ | DataFusion dynamic filters only |
+| Dynamic partition pruning | on (broadcast reuse only) | ✅ | BS-033: broadcast joins prune the probe scan by partition value, statistics, row group and page; per-task, executor-side. `tests/connect_operations.py` |
 
 ## 7. Operations and observability
 
@@ -118,6 +121,7 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
+0. BS-034 — distributed file writes (in progress).
 1. Iceberg beyond path tables: REST catalog, time travel, metadata tables, schema evolution.
 2. AQE skew join: also split joins whose stage does not repartition (Spark validates the whole plan).
 3. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
