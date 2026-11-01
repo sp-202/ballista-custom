@@ -10,7 +10,7 @@
 //!   [`execution_session_config`] is Ballista's configuration plus the session
 //!   extensions that Sail operators read while they run.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use datafusion::common::Result;
@@ -40,10 +40,21 @@ pub struct BallistaSparkSessionMutator {
 
 impl BallistaSparkSessionMutator {
     pub fn new(config: Arc<AppConfig>) -> Self {
+        let default_conf = SERVER_SPARK_CONF.get().cloned().unwrap_or_default();
         Self {
-            spark: SparkSessionMutator::new(config),
+            spark: SparkSessionMutator::new(config).with_default_conf(default_conf),
         }
     }
+}
+
+/// Spark configuration the server applies to every session (`ballista-connect --conf`).
+static SERVER_SPARK_CONF: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Sets the Spark configuration applied to every new session, like `--conf` for Spark's
+/// `start-connect-server.sh`. Call once, before the server starts; later calls are ignored
+/// because the session factory is a plain function that cannot carry its own settings.
+pub fn set_server_spark_conf(conf: Vec<(String, String)>) {
+    let _ = SERVER_SPARK_CONF.set(conf);
 }
 
 impl ServerSessionMutator for BallistaSparkSessionMutator {

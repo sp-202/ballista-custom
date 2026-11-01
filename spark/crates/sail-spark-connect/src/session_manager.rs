@@ -23,6 +23,7 @@ use sail_session::session_manager::{
 };
 
 use crate::error::SparkResult;
+use crate::config::ConfigKeyValue;
 use crate::session::{SparkSession, SparkSessionOptions};
 
 /// The session mutator that makes a server session a Spark session.
@@ -33,11 +34,22 @@ use crate::session::{SparkSession, SparkSessionOptions};
 /// [`create_spark_session_manager_with_factory`].
 pub struct SparkSessionMutator {
     config: Arc<AppConfig>,
+    default_conf: Vec<(String, String)>,
 }
 
 impl SparkSessionMutator {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            default_conf: vec![],
+        }
+    }
+
+    /// Spark configuration set on every new session before the client's own settings,
+    /// like `--conf` for Spark's `start-connect-server.sh` (e.g. `spark.sql.warehouse.dir`).
+    pub fn with_default_conf(mut self, default_conf: Vec<(String, String)>) -> Self {
+        self.default_conf = default_conf;
+        self
     }
 }
 
@@ -63,6 +75,17 @@ impl ServerSessionMutator for SparkSessionMutator {
             )
             .map_err(|e| internal_datafusion_err!("{e}"))?,
         );
+        spark
+            .set_config(
+                self.default_conf
+                    .iter()
+                    .map(|(key, value)| ConfigKeyValue {
+                        key: key.clone(),
+                        value: Some(value.clone()),
+                    })
+                    .collect(),
+            )
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
         let config_service = SessionConfigService::new(spark.clone());
         // Seed the DataFusion `execution.time_zone` from the resolved Spark session timezone at
         // session creation. `SparkSession::try_new` sets `spark.sql.session.timeZone` to the

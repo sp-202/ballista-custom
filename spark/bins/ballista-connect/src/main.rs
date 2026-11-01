@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ballista_spark_runner::{BallistaClusterOptions, BallistaJobRunnerFactory};
 use ballista_spark_session::spark_session_factory;
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 use sail_common::config::{AppConfig, ExecutionMode};
 use sail_common::runtime::RuntimeManager;
 use sail_spark_connect::entrypoint::serve_with_factories;
@@ -35,6 +35,44 @@ struct Args {
     /// Ballista scheduler gRPC URL.
     #[arg(long, default_value = "http://localhost:50050")]
     scheduler_url: String,
+    /// Spark configuration for every session, as `key=value` (repeatable), like
+    /// `start-connect-server.sh --conf`. Set `spark.sql.warehouse.dir` to storage that
+    /// the server and every executor share.
+    #[arg(long = "conf", value_parser = parse_conf)]
+    conf: Vec<(String, String)>,
+}
+
+fn parse_conf(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => {
+            Ok((key.trim().to_string(), value.trim().to_string()))
+        }
+        _ => Err(format!("expected key=value, got `{s}`")),
+    }
+}
+
+/// Warns when managed tables would be written to storage that only one machine sees.
+/// Executors write table files, and the server lists them when planning reads, so a
+/// node-local warehouse makes tables written on one executor invisible to queries
+/// (Spark has the same requirement: the warehouse must be on shared storage).
+fn check_warehouse(conf: &[(String, String)]) {
+    let warehouse = conf
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "spark.sql.warehouse.dir")
+        .map(|(_, value)| value.as_str());
+    match warehouse {
+        None => warn!(
+            "spark.sql.warehouse.dir is not set: managed tables go to `spark-warehouse` \
+             relative to each process's working directory, so executors and this server \
+             do not see the same files. Set --conf spark.sql.warehouse.dir to shared storage."
+        ),
+        Some(dir) if !dir.contains("://") || dir.starts_with("file://") => info!(
+            "Warehouse {dir} is a local path: it must be the same shared mount on this \
+             server and every executor."
+        ),
+        Some(dir) => info!("Warehouse: {dir}"),
+    }
 }
 
 /// Initializes Sail telemetry (also required by its session manager) and
@@ -66,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before any threads exist: the Spark front end calls into Python.
     ballista_spark_python::bootstrap()?;
     let args = Args::parse();
+    ballista_spark_session::set_server_spark_conf(args.conf.clone());
 
     let mut config = AppConfig::load()?;
     config.mode = ExecutionMode::Local;
@@ -74,6 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RuntimeManager::try_new(&config.runtime)?;
     let primary = runtime.handle().primary().clone();
     let _telemetry = primary.block_on(async { TelemetryGuard::try_new(&config) })?;
+
+    check_warehouse(&args.conf);
 
     let job_runner_factory = Box::new(BallistaJobRunnerFactory::new(
         BallistaClusterOptions::new(args.scheduler_url.clone()),

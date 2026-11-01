@@ -25,9 +25,11 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-014](#bs-014) | 🔴 | S3 | Redundant shuffles from the front end's repartitions | 03 |
 | [BS-015](#bs-015) | 🔴 | S3 | Uneven file-partition assignment makes one scan task a straggler | 07 |
 | [BS-016](#bs-016) | 🟢 | S2 | Hash join build side cannot spill (DataFusion 55) | 06 |
-| [BS-017](#bs-017) | 🔴 | S1 | Table path missing on the scheduler returns empty results, no error | 05 |
+| [BS-017](#bs-017) | 🟢 | S1 | Table path missing on the scheduler returns empty results, no error | 05 |
 | [BS-018](#bs-018) | 🔴 | S2 | Hash join: one key larger than memory still fails after 4 spill levels | 06 |
-| [BS-019](#bs-019) | 🔴 | S4 | DataFusion fork's hash-join code is not `cargo fmt` clean | 06 |
+| [BS-019](#bs-019) | 🟢 | S4 | DataFusion fork's hash-join code is not `cargo fmt` clean | 06 |
+| [BS-020](#bs-020) | 🟢 | S1 | Managed tables written on executors are invisible to queries (node-local warehouse) | 05 |
+| [BS-021](#bs-021) | 🔴 | S3 | `DROP TABLE` leaves a managed table's files in the warehouse | 05 |
 
 ---
 
@@ -202,7 +204,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   forced everywhere (`hash_join_max_build_partition_bytes=0`): 22/22 match Spark.
 
 ## BS-017
-**Table path missing on the scheduler returns empty results, no error** · 🔴 open · step 05
+**Table path missing on the scheduler returns empty results, no error** · 🟢 fixed · step 05
 - **Evidence:** the Spark compose scheduler lacked the `~/Documents/tpch` mount
   (executors had it). Ballista SQL-path queries over those tables completed with
   0 rows instead of failing.
@@ -210,6 +212,20 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   directory lists as an empty table.
 - **Plan:** fail planning when a registered table's location does not exist, as Spark
   does (`Path does not exist`). Mount fixed in `cluster/spark/compose.yml`.
+- **Reproduced 2026-11-01:** SF1 copied where only the client container sees it; TPC-H
+  Q6 returned one row with an empty `revenue` (correct: 123141078.23), no error.
+- **Fix (Ballista SQL path):** before planning a logical-plan job the scheduler checks
+  every listing table's location (`state/table_paths.rs`, including subqueries): a local
+  path must exist (an existing empty directory is an empty table), an object-store
+  location must be an object or a prefix of one. Otherwise `[PATH_NOT_FOUND] Path does
+  not exist`. Setting `ballista.planner.require_table_paths` (default true).
+- **Same bug on the Spark Connect path:** `spark.read.parquet("/missing").count()`
+  returned 0. Sail treated a missing path as an empty directory. Fixed in the copied
+  `sail-data-source` like Spark's `DataSource.checkAndGlobPathIfNecessary`: direct reads
+  (`spark.read`, ``parquet.`path` ``) fail on a missing path or a glob matching nothing;
+  catalog-table reads skip the check (a new managed table has no directory yet).
+- **Verified:** repro now fails with `PATH_NOT_FOUND`; TPC-H SF10 22/22 vs Spark on both
+  the Ballista SQL path and Spark Connect.
 
 ## BS-018
 **Hash join: one key larger than memory still fails after 4 spill levels** · 🔴 open · step 06
@@ -227,11 +243,38 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   most cases.
 
 ## BS-019
-**DataFusion fork's hash-join code is not `cargo fmt` clean** · 🔴 open · step 06
+**DataFusion fork's hash-join code is not `cargo fmt` clean** · 🟢 fixed · step 06
 - **Evidence:** `cargo fmt -p datafusion-physical-plan -- --check` on
   `~/Documents/datafusion` (`df-55.2.0-ballista`) reports diffs in
   `hash_join/exec.rs` (including the fixes in `443183b7c`, `bd2b42f8b`) and in
   `aggregates/grouped_hash_stream.rs`, code that was already in the fork.
 - **Plan:** run `cargo fmt` as its own commit on both fork branches, so later fix diffs
   stay readable and the fork could be offered upstream.
+- **Fixed:** formatting-only commits `ad47fc6ee`, `05ec5fe64` (`df-55.2.0-ballista`) and
+  `a7b9ce9c8`, `6c2df7367` (`df-55.2.0-comet`); 1703 physical-plan tests pass.
+
+## BS-020
+**Managed tables written on executors are invisible to queries (node-local warehouse)** · 🟢 fixed · step 05
+- **Evidence:** via Spark Connect, `CREATE TABLE t (a int) USING parquet`, `INSERT` 2
+  rows, `SELECT count(*)` → **0**. The default warehouse is `spark-warehouse` relative to
+  each process; executor-2 wrote `/spark-warehouse/t-…` on its own disk, while the Spark
+  Connect server lists its own disk when planning the read.
+- **Spark:** the same requirement holds (the warehouse must be shared storage, e.g. HDFS
+  or S3); `spark.sql.warehouse.dir` is a static setting given to the server.
+- **Fix:** `ballista-connect --conf key=value` (repeatable) sets Spark configuration for
+  every session, like `start-connect-server.sh --conf`; the server warns at startup when
+  `spark.sql.warehouse.dir` is unset and notes that a local path must be the same shared
+  mount everywhere. The cluster mounts `cluster/spark/warehouse` at `/warehouse` in the
+  server and both executors.
+- **Verified:** insert 1000 + 2 rows → `count 1002, sum 499503`; CTAS → correct.
+
+## BS-021
+**`DROP TABLE` leaves a managed table's files in the warehouse** · 🔴 open · step 05
+- **Evidence:** after `DROP TABLE` of two managed tables, both directories stayed in
+  `cluster/spark/warehouse`. Spark deletes a managed table's data on drop (external
+  tables keep theirs).
+- **Impact:** disk use only: a re-created table gets a new `name-<uuid>` directory, so
+  old files are not read back.
+- **Plan:** delete the directory of a managed (non-external) table on drop, in the
+  catalog command, after the catalog entry is removed.
 
