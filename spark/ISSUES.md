@@ -39,6 +39,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-028](#bs-028) | 🟡 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
 | [BS-029](#bs-029) | 🔴 | S3 | `spark_partition_id()` returns task-local partition ids | 02 |
 | [BS-030](#bs-030) | 🟢 | S1 | `df.coalesce(n)` loses rows; Sail nodes over Ballista nodes fail to serialize | 02 |
+| [BS-031](#bs-031) | 🔴 | S1 | Delta `MERGE` intermittently loses rows (unsorted input to the partitioned writer) | 05 |
 
 ---
 
@@ -163,6 +164,12 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Risk:** driver-only parents (e.g. `DeltaCommitExec`, `FileDeleteExec`) expecting
   N input partitions may misbehave.
 - **Plan:** Delta/Iceberg write tests through Spark Connect; preserve partitioning if needed.
+- **Tested 2026-11-01 (Delta):** create, append, overwrite, partitioned write, `UPDATE`,
+  `DELETE` correct. `DELETE` and `MERGE` first failed with "cannot restrict UnionExec child
+  DeltaRemoveActionsExec": AQE had no equivalent of the static planner's `can_stay_inline`, so
+  a union branch with a fixed partition count stayed in the union's stage. AQE now gives such
+  a branch its own stage (`DistributedExchangeRule`). `MERGE` then runs but loses rows
+  intermittently: BS-031.
 
 ## BS-014
 **Redundant shuffles from the front end's repartitions** · 🔴 open · step 03
@@ -483,4 +490,23 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Verified:** sums and counts exact for `repartition(16)`, `repartition(16, k)`,
   `coalesce(2)`; codec round-trip test for a Sail node over a Ballista node; TPC-H 22/22,
   TPC-DS 99/99.
+
+## BS-031
+**Delta `MERGE` intermittently loses rows (unsorted input to the partitioned writer)** · 🔴 open · step 05
+- **Evidence:** 100,000-row Delta table partitioned by `k`, then `UPDATE`, `DELETE`, `MERGE` of
+  20 source rows. Expected 90,004 rows, 20 with k=99. Six runs: four correct, two returned
+  84,303 and 82,509 rows (each `k` short by ~700). Fresh and reused table paths alike.
+- **Found in the failed run's table:** the MERGE commit added 1,250 files, but ~5,000 parquet
+  files were written; 3,823 are on disk and in no commit. The job's 1,296 output actions match
+  the commit, so actions are lost in the writers, not between job and commit.
+- **Plan shape (job with 24 stages):** Sail's MERGE plan shares subplans, which Ballista runs
+  as separate stages (the same full join 4 times). Stage 13 hash-shuffles the 90,004 merge rows
+  without sorting; stage 17 reads them through `RangeShuffleReaderExec` that claims ordering
+  `k ASC` and feeds `DeltaWriterExec`, which writes partitioned output expecting input sorted by
+  the partition column. Unsorted `k` makes it start a new file at every change of `k` (the
+  thousands of files) and, apparently, report only some of them.
+- **Next:** find where the exchange's ordering claim comes from (range shuffle reader over a
+  hash-partitioned, unsorted upstream); make the writer's sort requirement hold or make the
+  reader not claim it; check whether `DeltaWriterExec` drops add actions for repeated partition
+  values; add the MERGE sequence above to `tests/connect_operations.py`.
 

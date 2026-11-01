@@ -66,7 +66,9 @@ decimal averages differ in the last digit (BS-009).
 | `TRUNCATE TABLE` | ❔ | implemented in Sail, not tested here |
 | DDL result shape (no columns, as in Spark) | ❌ | returns one `value: true` row (BS-008) |
 | Catalogs: Hive Metastore, Glue, Iceberg REST, Unity | ❔ | available in Sail; step 05 |
-| Delta / Iceberg reads and `MERGE` / `UPDATE` / `DELETE` | ❔ | available in Sail; step 05 |
+| Delta write, append, overwrite, partitioned write, `UPDATE`, `DELETE` | ✅ | tested 2026-11-01 (BS-013) |
+| Delta `MERGE` | ❌ | intermittently loses rows (BS-031) |
+| Iceberg | ❔ | available in Sail; step 05 |
 
 ## 4. Data sources and writes
 
@@ -115,6 +117,7 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
-1. BS-028 — q72 now 71 s (was 124 s; Spark 17 s, Comet 2.2 s).
-2. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
-3. AQE: skew join splitting.
+1. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
+2. BS-028 — q72 now 71 s (was 124 s; Spark 17 s, Comet 2.2 s).
+3. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
+4. AQE: skew join splitting.

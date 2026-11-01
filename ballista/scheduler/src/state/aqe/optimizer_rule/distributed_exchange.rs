@@ -16,14 +16,15 @@
 // under the License.
 
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
+use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::config::BallistaConfig;
 use ballista_core::execution_plans::{
-    OrderedRangeRepartitionExec, RangeFilterExec, UnorderedRangeRepartitionExec,
-    preserves_partitioning,
+    EmptyPartitionsExec, OrderedRangeRepartitionExec, RangeFilterExec,
+    UnorderedRangeRepartitionExec, preserves_partitioning,
 };
 use datafusion::common::plan_err;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -32,6 +33,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions, execution_plan,
 };
@@ -47,6 +49,29 @@ enum ExchangeStatus {
 #[derive(Debug, Clone, Default)]
 pub struct DistributedExchangeRule {
     plan_id_generator: Arc<AtomicUsize>,
+}
+
+/// Whether per-task restriction can reduce `branch` to zero partitions, so it can
+/// stay in its union's stage. Exchanges become shuffle readers, which restrict
+/// cleanly, so each is stood in for by a leaf with its partition count and the
+/// real rewriter is asked.
+fn union_branch_restricts_away(branch: &Arc<dyn ExecutionPlan>) -> bool {
+    let probe = branch.clone().transform_down(|plan| {
+        let Some(exchange) = plan.downcast_ref::<ExchangeExec>() else {
+            return Ok(Transformed::no(plan));
+        };
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyPartitionsExec::new(
+            plan.schema(),
+            exchange
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+        ));
+        Ok(Transformed::new(leaf, true, TreeNodeRecursion::Jump))
+    });
+    probe
+        .and_then(|probe| restrict_plan_to_partitions(probe.data, &[]))
+        .is_ok_and(|p| p.properties().output_partitioning().partition_count() == 0)
 }
 
 impl DistributedExchangeRule {
@@ -92,6 +117,44 @@ impl DistributedExchangeRule {
                 vec![left, right],
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )?));
+        }
+
+        // A union branch that per-task restriction cannot reduce to zero
+        // partitions (an operator reporting a fixed partition count, e.g. Sail's
+        // `DeltaRemoveActionsExec` in DELETE and MERGE) gets its own stage, as in
+        // the static planner (`can_stay_inline`). Otherwise every task would run
+        // it, or the task fails restricting the union.
+        // Range-repartitioned branches are rejected further down.
+        let mut range_branch = false;
+        if execution_plan.is::<UnionExec>() {
+            for child in execution_plan.children() {
+                range_branch |= can_be_range_repartitioned(child)?;
+            }
+        }
+        if execution_plan.is::<UnionExec>() && !range_branch {
+            let mut changed = false;
+            let children = execution_plan
+                .children()
+                .into_iter()
+                .map(|child| {
+                    if child.is::<ExchangeExec>() || union_branch_restricts_away(child) {
+                        return Arc::clone(child);
+                    }
+                    changed = true;
+                    Arc::new(ExchangeExec::new(
+                        Arc::clone(child),
+                        None,
+                        self.plan_id_generator
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    )) as Arc<dyn ExecutionPlan>
+                })
+                .collect::<Vec<_>>();
+            if changed {
+                return Ok(Transformed::yes(execution_plan.replace_children(
+                    children,
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?));
+            }
         }
 
         if let Some(coalesce) = execution_plan.downcast_ref::<CoalescePartitionsExec>() {
