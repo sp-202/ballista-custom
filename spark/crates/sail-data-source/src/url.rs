@@ -330,7 +330,7 @@ impl<'a> RawGlobUrl<'a> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GlobUrl {
     pub base: Url,
     pub glob: Option<Pattern>,
@@ -527,19 +527,73 @@ impl TryFrom<GlobUrl> for ListingTableUrl {
     }
 }
 
+/// Resolves the locations to list for a read. With `check_exists`, a location that does
+/// not exist fails with `PATH_NOT_FOUND`, as Spark checks direct reads
+/// (`spark.read`, ``parquet.`path` ``); Spark skips the check for catalog tables, whose
+/// location may not exist until the first write.
 pub async fn resolve_listing_urls(
     ctx: &dyn Session,
     paths: Vec<String>,
+    check_exists: bool,
 ) -> Result<Vec<ListingTableUrl>> {
     let mut urls = vec![];
     for path in paths {
         for url in GlobUrl::parse(&path)? {
             let url = rewrite_directory_url(url, ctx).await?;
+            // Check before the default hidden-file glob is attached, so an empty
+            // directory still counts as existing. Without the check a missing path is
+            // treated as an empty directory and the read silently returns no rows.
+            if check_exists {
+                let user_glob = url.glob.is_some();
+                let checked: ListingTableUrl = url.clone().try_into()?;
+                if !listing_url_exists(ctx, &checked, user_glob).await? {
+                    return plan_err!("[PATH_NOT_FOUND] Path does not exist: {path}.");
+                }
+            }
             let url = attach_default_glob(url)?;
             urls.push(url.try_into()?);
         }
     }
     Ok(urls)
+}
+
+/// Whether a location to read exists, as Spark's `DataSource.checkAndGlobPathIfNecessary`
+/// checks: a glob the user wrote must match a file; a file or directory must exist
+/// (an existing empty directory is an empty table).
+async fn listing_url_exists(
+    ctx: &dyn Session,
+    url: &ListingTableUrl,
+    user_glob: bool,
+) -> Result<bool> {
+    use futures::StreamExt;
+
+    let store = ctx.runtime_env().object_store(url)?;
+    if user_glob {
+        return Ok(url
+            .list_all_files(ctx, store.as_ref(), "")
+            .await?
+            .next()
+            .await
+            .transpose()?
+            .is_some());
+    }
+    if url.scheme() == "file" {
+        return Ok(url
+            .get_url()
+            .to_file_path()
+            .is_ok_and(|path| path.exists()));
+    }
+    // Object stores have no directories: the location exists when it is an object or a
+    // prefix of one.
+    if store.head(url.prefix()).await.is_ok() {
+        return Ok(true);
+    }
+    Ok(store
+        .list(Some(url.prefix()))
+        .next()
+        .await
+        .transpose()?
+        .is_some())
 }
 
 fn fill_directory_root_path(mut path: String) -> Result<String> {
@@ -663,6 +717,39 @@ pub async fn rewrite_directory_url(mut url: GlobUrl, session: &dyn Session) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn urls_exist(paths: &[&str]) -> Result<()> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let state = ctx.state();
+        resolve_listing_urls(&state, paths.iter().map(|p| p.to_string()).collect(), true)
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn test_check_listing_urls_exist() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("a.parquet"), b"x")?;
+        std::fs::create_dir(dir.path().join("empty"))?;
+
+        // An existing file, directory, empty directory, and glob with a match.
+        urls_exist(&[&format!("{root}/a.parquet")]).await?;
+        urls_exist(&[root]).await?;
+        urls_exist(&[&format!("{root}/empty")]).await?;
+        urls_exist(&[&format!("{root}/*.parquet")]).await?;
+
+        // Without the check (catalog tables) a missing location is an empty table.
+        let ctx = datafusion::prelude::SessionContext::new();
+        resolve_listing_urls(&ctx.state(), vec![format!("{root}/missing")], false).await?;
+
+        // A missing path and a glob without a match fail like Spark.
+        for missing in [format!("{root}/missing.parquet"), format!("{root}/*.csv")] {
+            let err = urls_exist(&[root, &missing]).await.unwrap_err();
+            assert!(err.to_string().contains("[PATH_NOT_FOUND]"), "{err}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_pattern_segment_parser() {

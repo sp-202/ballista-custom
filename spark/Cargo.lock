@@ -7522,6 +7522,7 @@ dependencies = [
  "sail-physical-plan",
  "sail-sql-analyzer",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",

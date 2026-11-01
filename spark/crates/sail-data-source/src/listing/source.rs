@@ -163,7 +163,7 @@ impl<T: FormatFactory> DataSource for ListingDataSource<T> {
     ) -> Result<Arc<dyn TableSource>> {
         let SourceInfo {
             paths,
-            lakehouse_table: _,
+            lakehouse_table,
             schema,
             constraints,
             partition_by,
@@ -178,7 +178,8 @@ impl<T: FormatFactory> DataSource for ListingDataSource<T> {
             .path_glob_filter()
             .map(PathGlobFilter::parse)
             .transpose()?;
-        let urls = resolve_listing_urls(ctx, paths).await?;
+        // Direct reads (`spark.read`) check their paths; catalog-table reads do not.
+        let urls = resolve_listing_urls(ctx, paths, lakehouse_table.is_none()).await?;
         let sampled_files = sample_listing_files(ctx, &urls, path_glob_filter.as_ref()).await?;
         let compression = read_format.infer_compression(ctx, &sampled_files).await?;
 
