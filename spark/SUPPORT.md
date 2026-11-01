@@ -19,6 +19,7 @@ Last updated 2026-11-01.
 | TPC-H SF10, 22 queries | Connect | ✅ 22/22 | same; re-verified after BS-017 |
 | TPC-DS SF10, 99 queries | Connect | ✅ 99/99 | runs of 2026-11-01 after BS-022/023/024/025; `compare_answers.py` |
 | TPC-DS SF10 | SQL | ❔ not run | |
+| Nightly TPC-H + TPC-DS comparison | Connect | ✅ `conformance/nightly.py`, dated reports | first run 2026-11-01: 22/22, 99/99 |
 | Spark `sql-tests` suite | both | ❔ not run | step 01 |
 
 TPC-DS queries are the spec's, with two rewrites Spark itself needs: `+ 30 days` →
@@ -113,6 +114,7 @@ decimal averages differ in the last digit (BS-009).
 | Authentication, TLS on Connect | ❌ | step 10 |
 
 ## 8. Next, in order
-1. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
-2. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
-3. AQE: skew join splitting.
+1. BS-028 — q72 takes 124 s (Spark 17 s, Comet 2.2 s).
+2. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
+3. AQE: coalescing on by default with `spark.sql.adaptive.*` and `spark.sql.shuffle.partitions` mapped.
+4. AQE: skew join splitting.

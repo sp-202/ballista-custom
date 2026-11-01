@@ -36,6 +36,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-025](#bs-025) | 🟢 | S2 | AQE waits for both join inputs before broadcasting; TPC-DS q72 shuffles ~80 GB and fills the disk | 07 |
 | [BS-026](#bs-026) | 🔴 | S3 | Every task rebuilds a broadcast join's hash table from scratch (TPC-DS q23 ~40% slower after BS-025) | 07 |
 | [BS-027](#bs-027) | 🟢 | S1 | `spark.range(..., numPartitions)` results multiplied: every task ran all of the range's partitions | 02 |
+| [BS-028](#bs-028) | 🔴 | S3 | TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s) | 07 |
 
 ---
 
@@ -416,4 +417,16 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   codec and reports no metrics, so task and stage plans keep the same metrics slots.
   `UNION ALL` branches over such leaves can now stay in the union's stage (one stage fewer).
 - **Verified:** sums and counts exact for 3, 8, 56 and 100 partitions and 2 billion rows.
+
+## BS-028
+**TPC-DS q72 takes 124 s (vanilla Spark 17 s, Spark + Comet 2.2 s)** · 🔴 open · step 07
+- **Evidence:** SF10, 16 cores each, same machine (runs of 2026-11-01; Comet's of 2026-10-12
+  used the `datafusion-benchmarks` copy of the query). With q72 excluded Ballista's TPC-DS
+  total is 76.8 s against Comet's 123.8 s and Spark's 305.1 s; q72 alone decides the total.
+- **Shape (after BS-025):** stage 5 joins the shuffled catalog_sales (14.4M rows) and inventory
+  (133M rows) with a partitioned hash join on `item_sk` with filter
+  `inv_quantity_on_hand < cs_quantity`, then streams through nine broadcast joins.
+- **To find out:** where the time goes in that stage (the join's filter evaluation over
+  matching pairs, the build side, or the broadcast joins after it); how Spark's plan reaches
+  17 s; rerun Comet with this repository's query text.
 
