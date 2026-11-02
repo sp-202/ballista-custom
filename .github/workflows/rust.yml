@@ -1,0 +1,334 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Ballista Rust
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "ballista/**"
+      - "ballista-cli/**"
+      - "benchmarks/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "ci/scripts/**"
+      - ".github/actions/setup-builder/**"
+      - ".github/actions/setup-macos-builder/**"
+      - ".github/actions/setup-windows-builder/**"
+      - ".github/actions/setup-rust-runtime/**"
+      - ".github/workflows/rust.yml"
+      # docs-only changes cannot affect this job; exclusions are applied last
+      - "!**/*.md"
+  pull_request:
+    paths:
+      - "ballista/**"
+      - "ballista-cli/**"
+      - "benchmarks/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "ci/scripts/**"
+      - ".github/actions/setup-builder/**"
+      - ".github/actions/setup-macos-builder/**"
+      - ".github/actions/setup-windows-builder/**"
+      - ".github/actions/setup-rust-runtime/**"
+      - ".github/workflows/rust.yml"
+      # docs-only changes cannot affect this job; exclusions are applied last
+      - "!**/*.md"
+  # manual trigger
+  # https://docs.github.com/en/actions/managing-workflow-runs/manually-running-a-workflow
+  workflow_dispatch:
+
+jobs:
+  # Check crate compiles and base cargo check passes
+  build-lib:
+    name: cargo check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-macos-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: cargo check
+        run: |
+          # Adding `--locked` here to assert that the `Cargo.lock` file is up to
+          # date with the manifest. When this fails, please make sure to commit
+          # the changes to `Cargo.lock` after building with the updated manifest.
+          cargo check --profile ci --workspace --all-targets --locked
+
+  linux-test:
+    name: test linux crates
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run tests
+        run: |
+          export PATH=$PATH:$HOME/d/protoc/bin
+          # The Flight SQL frontend is a non-default feature; enable it here so
+          # its end-to-end tests are not compiled away.
+          cargo test --profile ci --features=testcontainers,ballista-scheduler/flight-sql,ballista-result-service/prometheus-metrics
+
+  # Run `cargo doc` to ensure the rustdoc is clean
+  rustdoc:
+    name: cargo doc
+    needs: build-lib
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-macos-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run cargo doc
+        run: ci/scripts/rust_docs.sh
+
+  linux-build-workspace:
+    name: check linux workspace
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Try to compile when `--no-default-features` is selected
+        run: |
+          export PATH=$PATH:$HOME/d/protoc/bin
+          cargo check --profile ci -p ballista-scheduler -p ballista-executor -p ballista-core -p ballista --no-default-features --locked
+
+  ballista-test:
+    name: test linux ballista
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run Ballista tests
+        run: |
+          export PATH=$PATH:$HOME/d/protoc/bin
+          cd ballista
+          # Ensure also compiles in standalone mode
+          cargo test --profile ci --no-default-features --features standalone --locked
+
+  macos-test:
+    name: macos test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-macos-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run tests
+        shell: bash
+        run: |
+          export PATH=$PATH:$HOME/d/protoc/bin
+          cargo test --profile ci --locked
+
+  # verify that the benchmark queries return the correct results
+  verify-benchmark-results:
+    name: verify benchmark results (amd64)
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Verify that benchmark queries return expected results
+        run: |
+          cargo test --package ballista-benchmarks --profile release-nonlto --features=ci --locked -- --test-threads=1
+
+  lint:
+    name: Lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup component add rustfmt
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run
+        run: ci/scripts/rust_fmt.sh
+
+  clippy:
+    name: Clippy
+    runs-on: macos-latest
+    env:
+      # Disable full debug symbol generation to speed up CI build and keep memory down
+      # "1" means line tables only, which is useful for panic tracebacks.
+      RUSTFLAGS: "-C debuginfo=1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-macos-builder
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Run clippy
+        run: ci/scripts/rust_clippy.sh
+
+  cargo-toml-formatting-checks:
+    name: Check Cargo.toml formatting
+    runs-on: macos-latest
+    env:
+      # Disable full debug symbol generation to speed up CI build and keep memory down
+      # "1" means line tables only, which is useful for panic tracebacks.
+      RUSTFLAGS: "-C debuginfo=1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Install taplo
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: taplo-cli@0.10.0
+
+      - name: Check Cargo.toml formatting
+        run: |
+          # if you encounter an error, run 'ci/scripts/rust_toml_fmt.sh --write'
+          # (or 'taplo format') locally to fix the formatting, then commit the result.
+          ci/scripts/rust_toml_fmt.sh
+
+  cargo-machete:
+    name: Check for unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-machete@0.9.2
+
+      - name: Check for unused dependencies
+        run: |
+          # if a reported dependency is a false positive (e.g. only referenced
+          # through macros or generated code), add it to the crate's
+          # `[package.metadata.cargo-machete]` ignored list with a comment.
+          ci/scripts/rust_machete.sh
+
+  datafusion-proto-sync-check:
+    name: Check vendored DataFusion proto is in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Check vendored DataFusion proto matches pinned crate
+        run: ci/scripts/rust_proto_check.sh
+
+  config-docs-check:
+    name: Check generated config docs are in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+      - name: Check generated config docs match the config registry
+        run: ci/scripts/rust_config_docs_check.sh
+
+# Coverage job was failing. https://github.com/apache/arrow-datafusion/issues/590 tracks re-instating it
+
+# coverage:
+#   name: Coverage
+#   runs-on: ubuntu-latest
+#   strategy:
+#     matrix:
+#       arch: [amd64]
+#       rust: [stable]
+#   steps:
+#     - uses: actions/checkout@v7.0.1
+#       with:
+#         submodules: true
+#     - name: Cache Cargo
+#       uses: actions/cache@v4
+#       with:
+#         path: /home/runner/.cargo
+#         # this key is not equal because the user is different than on a container (runner vs github)
+#         key: cargo-coverage-cache-
+#     - name: Cache Rust dependencies
+#       uses: actions/cache@v4
+#       with:
+#         path: /home/runner/target
+#         # this key is not equal because coverage uses different compilation flags.
+#         key: ${{ runner.os }}-${{ matrix.arch }}-target-coverage-cache-${{ matrix.rust }}-
+#     - name: Run coverage
+#       run: |
+#         export ARROW_TEST_DATA=$(pwd)/testing/data
+#         export PARQUET_TEST_DATA=$(pwd)/parquet-testing/data
+
+#         # 2020-11-15: There is a cargo-tarpaulin regression in 0.17.0
+#         # see https://github.com/xd009642/tarpaulin/issues/618
+#         cargo install --version 0.16.0 cargo-tarpaulin
+#         cargo tarpaulin --out Xml
+#       env:
+#         CARGO_HOME: "/home/runner/.cargo"
+#         CARGO_TARGET_DIR: "/home/runner/target"
+#     - name: Report coverage
+#       continue-on-error: true
+#       run: bash <(curl -s https://codecov.io/bash)

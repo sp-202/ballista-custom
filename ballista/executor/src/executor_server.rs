@@ -1,0 +1,1079 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Executor gRPC server for push-based task scheduling.
+//!
+//! This module implements the executor-side gRPC service that receives tasks
+//! from the scheduler in push-based scheduling mode. It handles task execution,
+//! heartbeat communication, and status reporting.
+
+use ballista_core::BALLISTA_VERSION;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+
+use log::{debug, error, info, warn};
+use tonic::transport::Channel;
+use tonic::transport::server::TcpIncoming;
+use tonic::{Request, Response, Status};
+
+use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::PipelinedShuffleWriterExec;
+use ballista_core::extension::EndpointOverrideFn;
+use ballista_core::serde::BallistaCodec;
+use ballista_core::serde::protobuf::{
+    CancelTasksParams, CancelTasksResult, ExecutorMetric, ExecutorStatus,
+    HeartBeatParams, LaunchMultiTaskParams, LaunchMultiTaskResult, LaunchTaskParams,
+    LaunchTaskResult, RegisterExecutorParams, RemoveJobDataParams, RemoveJobDataResult,
+    StopExecutorParams, StopExecutorResult, TaskStatus, UpdateTaskStatusParams,
+    executor_grpc_server::{ExecutorGrpc, ExecutorGrpcServer},
+    executor_metric, executor_status,
+    scheduler_grpc_client::SchedulerGrpcClient,
+};
+use ballista_core::serde::scheduler::TaskDefinition;
+use ballista_core::serde::scheduler::TaskKey;
+
+use ballista_core::serde::scheduler::from_proto::{
+    get_task_definition, get_task_definition_vec,
+};
+use ballista_core::utils::{
+    create_grpc_client_endpoint, create_grpc_server, create_grpc_server_incoming,
+};
+
+use dashmap::DashMap;
+use datafusion::execution::TaskContext;
+use datafusion_proto::{logical_plan::AsLogicalPlan, physical_plan::AsExecutionPlan};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::task::JoinHandle;
+
+use crate::cpu_bound_executor::DedicatedExecutor;
+use crate::executor::Executor;
+use crate::executor_process::{ExecutorProcessConfig, remove_job_data};
+use crate::health::ExecutorHealth;
+use crate::metrics::{ExecutorMemoryMetrics, ExecutorMetricCollectionPolicy};
+use crate::shutdown::ShutdownNotifier;
+use crate::{TaskCompletionExtras, TaskExecutionTimes, as_task_status};
+
+/// Number of consecutive heartbeat failures after which the executor
+/// initiates its own shutdown, letting k8s (or the operator) restart the
+/// pod. The typical trigger is a `FailedPrecondition` from a newer
+/// scheduler on a bumped `BALLISTA_PROTOCOL_VERSION`; a restart will keep
+/// crash-looping until the executor image is bumped to match.
+const HEARTBEAT_FAILURE_TERMINATION_THRESHOLD: u32 = 5;
+
+type ServerHandle = JoinHandle<Result<(), BallistaError>>;
+type SchedulerClients = Arc<DashMap<String, SchedulerGrpcClient<Channel>>>;
+
+/// Wrap TaskDefinition with its scheduler callback endpoint so task updates
+/// return to the scheduler that launched the task.
+#[derive(Debug)]
+struct CuratorTaskDefinition {
+    scheduler_endpoint: String,
+    task: TaskDefinition,
+}
+
+/// Wrap TaskStatus with its scheduler callback endpoint so task updates return
+/// to the scheduler that launched the task.
+#[derive(Debug)]
+struct CuratorTaskStatus {
+    scheduler_endpoint: String,
+    task_status: TaskStatus,
+}
+
+/// Starts the executor gRPC server and registers with the scheduler.
+///
+/// This function initializes the push-based task scheduling infrastructure:
+/// - Creates the executor gRPC server for receiving tasks
+/// - Registers the executor with the scheduler
+/// - Starts the heartbeat loop
+/// - Starts the task runner pool
+///
+/// Returns a handle to the server task that can be awaited for completion.
+pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
+    scheduler: SchedulerGrpcClient<Channel>,
+    config: Arc<ExecutorProcessConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<T, U>,
+    stop_send: mpsc::Sender<bool>,
+    shutdown_noti: &ShutdownNotifier,
+    health: ExecutorHealth,
+) -> Result<ServerHandle, BallistaError> {
+    // The listening socket is bound here rather than inside the spawned task,
+    // because registration with the scheduler makes the scheduler dial this
+    // port back to check connectivity. Binding lazily inside the server future
+    // let that callback lose the race and get ECONNREFUSED, which fails
+    // registration and takes the executor down with it.
+    let addr = format!("{}:{}", config.bind_host, executor.metadata.grpc_port);
+    let addr = addr.parse().unwrap();
+    let incoming = create_grpc_server_incoming(addr, &config.grpc_server_config)?;
+    info!("Ballista v{BALLISTA_VERSION} Rust Executor Grpc Server listening on {addr:?}");
+    startup_with_incoming(
+        scheduler,
+        config,
+        executor,
+        codec,
+        stop_send,
+        shutdown_noti,
+        health,
+        incoming,
+    )
+    .await
+}
+
+/// Like [`startup`], but serves the executor gRPC service on `incoming`, a
+/// socket the caller has already bound to `executor.metadata.grpc_port`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn startup_with_incoming<
+    T: 'static + AsLogicalPlan,
+    U: 'static + AsExecutionPlan,
+>(
+    mut scheduler: SchedulerGrpcClient<Channel>,
+    config: Arc<ExecutorProcessConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<T, U>,
+    stop_send: mpsc::Sender<bool>,
+    shutdown_noti: &ShutdownNotifier,
+    health: ExecutorHealth,
+    incoming: TcpIncoming,
+) -> Result<ServerHandle, BallistaError> {
+    let channel_buf_size = executor.vcores * 50;
+    let (tx_task, rx_task) = mpsc::channel::<CuratorTaskDefinition>(channel_buf_size);
+    let (tx_task_status, rx_task_status) =
+        mpsc::channel::<CuratorTaskStatus>(channel_buf_size);
+
+    let executor_server = ExecutorServer::new(
+        scheduler.clone(),
+        executor.clone(),
+        ExecutorEnv {
+            tx_task,
+            tx_task_status,
+            tx_stop: stop_send,
+        },
+        codec,
+        config.grpc_max_encoding_message_size as usize,
+        config.grpc_max_decoding_message_size as usize,
+        config.override_create_grpc_client_endpoint.clone(),
+        config.metric_collection_policy,
+        health,
+    );
+
+    // 1. Start executor grpc service on the already-bound socket
+    let server = {
+        let grpc_server_config = config.grpc_server_config.clone();
+        let server = ExecutorGrpcServer::new(executor_server.clone())
+            .max_encoding_message_size(config.grpc_max_encoding_message_size as usize)
+            .max_decoding_message_size(config.grpc_max_decoding_message_size as usize);
+        let mut grpc_shutdown = shutdown_noti.subscribe_for_shutdown();
+        tokio::spawn(async move {
+            let shutdown_signal = grpc_shutdown.recv();
+            let grpc_server_future = create_grpc_server(&grpc_server_config)
+                .add_service(server)
+                .serve_with_incoming_shutdown(incoming, shutdown_signal);
+            grpc_server_future.await.map_err(|e| {
+                error!("Tonic error, Could not start Executor Grpc Server.");
+                BallistaError::TonicError(e)
+            })
+        })
+    };
+
+    // 2. Do executor registration
+    let executor_server = Arc::new(executor_server);
+    match register_executor(&mut scheduler, executor.clone()).await {
+        Ok(_) => {
+            info!("Executor registration succeed");
+        }
+        Err(error) => {
+            error!("Executor registration failed due to: {error}");
+            // abort the Executor Grpc Future
+            server.abort();
+            return Err(error);
+        }
+    };
+
+    // 3. Start Heartbeater loop
+    {
+        let heartbeater = Heartbeater::new(executor_server.clone());
+        heartbeater.start(shutdown_noti, config.executor_heartbeat_interval_seconds);
+    }
+
+    // 4. Start TaskRunnerPool loop
+    {
+        let task_runner_pool = TaskRunnerPool::new(executor_server.clone());
+        task_runner_pool.start(rx_task, rx_task_status, shutdown_noti);
+    }
+
+    Ok(server)
+}
+
+#[allow(clippy::clone_on_copy)]
+async fn register_executor(
+    scheduler: &mut SchedulerGrpcClient<Channel>,
+    executor: Arc<Executor>,
+) -> Result<(), BallistaError> {
+    let result = scheduler
+        .register_executor(RegisterExecutorParams {
+            metadata: Some(executor.metadata.clone()),
+        })
+        .await?;
+    if result.into_inner().success {
+        Ok(())
+    } else {
+        Err(BallistaError::General(
+            "Executor registration failed!!!".to_owned(),
+        ))
+    }
+}
+
+/// The executor's gRPC server that handles incoming task requests.
+///
+/// This server implements the ExecutorGrpc trait and manages task execution,
+/// cancellation, and status reporting for push-based scheduling.
+#[derive(Clone)]
+pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    /// Timestamp when the server was started (milliseconds since epoch).
+    _start_time: u128,
+    /// The executor instance that runs tasks.
+    executor: Arc<Executor>,
+    /// Environment containing task communication channels.
+    executor_env: ExecutorEnv,
+    /// Codec for serializing/deserializing execution plans.
+    codec: BallistaCodec<T, U>,
+    /// gRPC client for the scheduler this executor registered with.
+    scheduler_to_register: SchedulerGrpcClient<Channel>,
+    /// Cache of scheduler clients for communicating with multiple schedulers.
+    schedulers: SchedulerClients,
+    /// Maximum size for outgoing gRPC messages.
+    grpc_max_encoding_message_size: usize,
+    /// Maximum size for incoming gRPC messages.
+    grpc_max_decoding_message_size: usize,
+    /// Metric collection policy for this specifix executor
+    metric_collection_policy: ExecutorMetricCollectionPolicy,
+    override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// Shared readiness signal reflected by the /readyz probe.
+    health: ExecutorHealth,
+}
+
+#[derive(Clone)]
+struct ExecutorEnv {
+    /// Receive `TaskDefinition` from rpc then send to CPU bound tasks pool `dedicated_executor`.
+    tx_task: mpsc::Sender<CuratorTaskDefinition>,
+    /// Receive `TaskStatus` from CPU bound tasks pool `dedicated_executor` then use rpc send back to scheduler.
+    tx_task_status: mpsc::Sender<CuratorTaskStatus>,
+    /// Receive stop executor request from rpc.
+    tx_stop: mpsc::Sender<bool>,
+}
+
+unsafe impl Sync for ExecutorEnv {}
+
+/// Global flag indicating whether the executor is terminating. This should be
+/// set to `true` when the executor receives a shutdown signal
+pub static TERMINATING: AtomicBool = AtomicBool::new(false);
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T, U> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        scheduler_to_register: SchedulerGrpcClient<Channel>,
+        executor: Arc<Executor>,
+        executor_env: ExecutorEnv,
+        codec: BallistaCodec<T, U>,
+        grpc_max_encoding_message_size: usize,
+        grpc_max_decoding_message_size: usize,
+        override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+        metric_collection_policy: ExecutorMetricCollectionPolicy,
+        health: ExecutorHealth,
+    ) -> Self {
+        Self {
+            _start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            executor,
+            executor_env,
+            codec,
+            scheduler_to_register,
+            schedulers: Default::default(),
+            grpc_max_encoding_message_size,
+            grpc_max_decoding_message_size,
+            override_create_grpc_client_endpoint,
+            metric_collection_policy,
+            health,
+        }
+    }
+
+    async fn get_scheduler_client(
+        &self,
+        scheduler_endpoint: &str,
+    ) -> Result<SchedulerGrpcClient<Channel>, BallistaError> {
+        let scheduler = self
+            .schedulers
+            .get(scheduler_endpoint)
+            .map(|value| value.clone());
+        // If channel does not exist, create a new one
+        if let Some(scheduler) = scheduler {
+            Ok(scheduler)
+        } else {
+            let scheduler_url = format!("http://{scheduler_endpoint}");
+            let mut endpoint = create_grpc_client_endpoint(scheduler_url, None)?;
+
+            if let Some(ref override_fn) = self.override_create_grpc_client_endpoint {
+                endpoint = override_fn(endpoint).map_err(|e| {
+                    BallistaError::GrpcConnectionError(format!(
+                        "Failed to customize endpoint for scheduler {scheduler_endpoint}: {e}"
+                    ))
+                })?;
+            }
+
+            let connection = endpoint.connect().await?;
+            let scheduler = SchedulerGrpcClient::new(connection)
+                .max_encoding_message_size(self.grpc_max_encoding_message_size)
+                .max_decoding_message_size(self.grpc_max_decoding_message_size);
+
+            {
+                self.schedulers
+                    .insert(scheduler_endpoint.to_owned(), scheduler.clone());
+            }
+
+            Ok(scheduler)
+        }
+    }
+
+    /// 1. First Heartbeat to its registration scheduler, if successful then return; else go next.
+    /// 2. Heartbeat to schedulers which has launching tasks to this executor until one succeeds
+    ///
+    /// Returns `true` iff any scheduler acknowledged the heartbeat.
+    async fn heartbeat(&self) -> bool {
+        let heartbeat_params =
+            heartbeat_params(&self.executor, self.metric_collection_policy);
+        let mut scheduler = self.scheduler_to_register.clone();
+        match scheduler
+            .heart_beat_from_executor(heartbeat_params.clone())
+            .await
+        {
+            Ok(_) => {
+                self.health.mark_heartbeat_ok();
+                return true;
+            }
+            Err(e) => {
+                warn!(
+                    "Fail to update heartbeat to its registration scheduler due to {e:?}"
+                );
+            }
+        };
+
+        for mut item in self.schedulers.iter_mut() {
+            let scheduler_endpoint = item.key().clone();
+            let scheduler = item.value_mut();
+
+            match scheduler
+                .heart_beat_from_executor(heartbeat_params.clone())
+                .await
+            {
+                Ok(_) => {
+                    self.health.mark_heartbeat_ok();
+                    return true;
+                }
+                Err(e) => {
+                    warn!(
+                        "Fail to update heartbeat to scheduler {scheduler_endpoint} due to {e:?}"
+                    );
+                }
+            }
+        }
+        self.health.mark_heartbeat_failed();
+        false
+    }
+    /// This method should not return Err. If task fails, a failure task status should be sent
+    /// to the channel to notify the scheduler.
+    async fn run_task(&self, task_identity: String, curator_task: CuratorTaskDefinition) {
+        let start_exec_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        debug!("Start to run task {task_identity}");
+        let task = curator_task.task;
+
+        let task_id = task.task_id;
+        let job_id = task.job_id;
+        let stage_id = task.stage_id;
+        let stage_attempt_num = task.stage_attempt_num;
+        let global_output_partition_ids = task.global_output_partition_ids;
+        let plan = task.plan;
+
+        let key = TaskKey {
+            job_id: job_id.clone(),
+            stage_id,
+            task_id,
+        };
+
+        let pipelined = plan.downcast_ref::<PipelinedShuffleWriterExec>().is_some();
+        let exec = self.executor.execution_engine.create_query_stage_exec(
+            job_id.clone(),
+            stage_id,
+            task_id,
+            global_output_partition_ids,
+            plan,
+            &self.executor.work_dir,
+            &task.session_config,
+        );
+
+        // A pipelined task's `vcores_consumed` is its job's reservation on
+        // this executor, which all the job's tasks here share.
+        let runtime = if pipelined {
+            self.executor.produce_runtime_for_pipelined_task(
+                job_id.as_str(),
+                &task.session_id,
+                &task.session_config,
+                task.vcores_consumed,
+            )
+        } else {
+            self.executor.produce_runtime_for_session(
+                &task.session_id,
+                &task.session_config,
+                task.vcores_consumed,
+            )
+        };
+
+        match (exec, runtime) {
+            (Ok(exec), Ok(runtime)) => {
+                let task_context = {
+                    let function_registry = task.function_registry;
+
+                    Arc::new(TaskContext::new(
+                        Some(task_identity.clone()),
+                        task.session_id,
+                        task.session_config,
+                        function_registry.scalar_functions.clone(),
+                        function_registry.higher_order_functions.clone(),
+                        function_registry.aggregate_functions.clone(),
+                        function_registry.window_functions.clone(),
+                        runtime,
+                    ))
+                };
+
+                info!("Execute task  : [{task_identity}]");
+
+                let task_start = Instant::now();
+                let execution_result = self
+                    .executor
+                    .execute_query_stage(key.clone(), exec.clone(), task_context)
+                    .await;
+                info!(
+                    "Finished task : [{task_identity}] in {:?}",
+                    task_start.elapsed()
+                );
+                debug!(
+                    "Task [{task_identity}], execution statistics: {execution_result:?}"
+                );
+
+                let plan_metrics = exec.collect_plan_metrics();
+                let operator_metrics = plan_metrics
+                    .into_iter()
+                    .map(|m| m.try_into())
+                    .collect::<Result<Vec<_>, BallistaError>>()
+                    .ok();
+                let runtime_stats = exec.collect_runtime_stats_reports();
+                let column_stats = exec.collect_column_stats();
+                // Collect only when the task otherwise succeeded: a failed task's
+                // partial state is meaningless, and its own error is the useful one.
+                // A collection failure fails the task — these are load-bearing for the
+                // downstream stage's prefix merge, so continuing without them would
+                // ship a wrong answer that nothing later detects.
+                let (execution_result, window_state) = match execution_result {
+                    Ok(partitions) => match exec.collect_window_state_reports() {
+                        Ok(reports) => (Ok(partitions), reports),
+                        Err(e) => (Err(e.into()), Vec::new()),
+                    },
+                    Err(e) => (Err(e), Vec::new()),
+                };
+                let executor_id = &self.executor.metadata.id;
+
+                let end_exec_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let task_execution_times = TaskExecutionTimes {
+                    launch_time: task.launch_time,
+                    start_exec_time,
+                    end_exec_time,
+                };
+
+                let task_status = as_task_status(
+                    execution_result,
+                    executor_id.clone(),
+                    stage_attempt_num,
+                    key.clone(),
+                    task_execution_times,
+                    TaskCompletionExtras {
+                        operator_metrics,
+                        runtime_stats,
+                        window_state,
+                        column_stats,
+                    },
+                );
+
+                let _ = self
+                    .executor_env
+                    .tx_task_status
+                    .send(CuratorTaskStatus {
+                        scheduler_endpoint: curator_task.scheduler_endpoint,
+                        task_status,
+                    })
+                    .await;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                let e = BallistaError::from(e);
+                let end_exec_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let task_status = as_task_status(
+                    Err(e),
+                    self.executor.metadata.id.clone(),
+                    stage_attempt_num,
+                    key.clone(),
+                    TaskExecutionTimes {
+                        launch_time: task.launch_time,
+                        start_exec_time,
+                        end_exec_time,
+                    },
+                    TaskCompletionExtras::default(),
+                );
+                let _ = self
+                    .executor_env
+                    .tx_task_status
+                    .send(CuratorTaskStatus {
+                        scheduler_endpoint: curator_task.scheduler_endpoint,
+                        task_status,
+                    })
+                    .await;
+            }
+        };
+    }
+}
+
+/// Heartbeater will run forever until a shutdown notification received.
+struct Heartbeater<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    executor_server: Arc<ExecutorServer<T, U>>,
+}
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> Heartbeater<T, U> {
+    fn new(executor_server: Arc<ExecutorServer<T, U>>) -> Self {
+        Self { executor_server }
+    }
+
+    fn start(
+        &self,
+        shutdown_noti: &ShutdownNotifier,
+        executor_heartbeat_interval_seconds: u64,
+    ) {
+        let executor_server = self.executor_server.clone();
+        let mut heartbeat_shutdown = shutdown_noti.subscribe_for_shutdown();
+        let heartbeat_complete = shutdown_noti.shutdown_complete_tx.clone();
+        let notify_shutdown = shutdown_noti.notify_shutdown.clone();
+        tokio::spawn(async move {
+            info!("Starting heartbeater to send heartbeat the scheduler periodically");
+            let mut consecutive_failures: u32 = 0;
+            // As long as the shutdown notification has not been received
+            while !heartbeat_shutdown.is_shutdown() {
+                if executor_server.heartbeat().await {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= HEARTBEAT_FAILURE_TERMINATION_THRESHOLD {
+                        error!(
+                            "Heartbeat failed {consecutive_failures} consecutive times; \
+                             initiating executor shutdown. Check for scheduler outage \
+                             or BALLISTA_PROTOCOL_VERSION mismatch."
+                        );
+                        let _ = notify_shutdown.send(());
+                        drop(heartbeat_complete);
+                        return;
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(executor_heartbeat_interval_seconds)) => {},
+                    _ = heartbeat_shutdown.recv() => {
+                        info!("Stop heartbeater");
+                        drop(heartbeat_complete);
+                        return;
+                    }
+                };
+            }
+        });
+    }
+}
+
+/// There are two loop(future) running separately in tokio runtime.
+/// First is for sending back task status to scheduler
+/// Second is for receiving task from scheduler and run.
+/// The two loops will run forever until a shutdown notification received.
+struct TaskRunnerPool<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    executor_server: Arc<ExecutorServer<T, U>>,
+}
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T, U> {
+    fn new(executor_server: Arc<ExecutorServer<T, U>>) -> Self {
+        Self { executor_server }
+    }
+
+    fn start(
+        &self,
+        mut rx_task: mpsc::Receiver<CuratorTaskDefinition>,
+        mut rx_task_status: mpsc::Receiver<CuratorTaskStatus>,
+        shutdown_noti: &ShutdownNotifier,
+    ) {
+        //1. loop for task status reporting
+        let executor_server = self.executor_server.clone();
+        let mut tasks_status_shutdown = shutdown_noti.subscribe_for_shutdown();
+        let tasks_status_complete = shutdown_noti.shutdown_complete_tx.clone();
+        tokio::spawn(async move {
+            info!("Starting the task status reporter");
+            // As long as the shutdown notification has not been received
+            while !tasks_status_shutdown.is_shutdown() {
+                let mut curator_task_status_map: HashMap<String, Vec<TaskStatus>> =
+                    HashMap::new();
+                // First try to fetch task status from the channel in *blocking* mode
+                let maybe_task_status: Option<CuratorTaskStatus> = tokio::select! {
+                     task_status = rx_task_status.recv() => task_status,
+                    _ = tasks_status_shutdown.recv() => {
+                        info!("Stop task status reporting loop");
+                        drop(tasks_status_complete);
+                        return;
+                    }
+                };
+
+                let mut fetched_task_num = 0usize;
+                if let Some(task_status) = maybe_task_status {
+                    let task_status_vec = curator_task_status_map
+                        .entry(task_status.scheduler_endpoint)
+                        .or_default();
+                    task_status_vec.push(task_status.task_status);
+                    fetched_task_num += 1;
+                } else {
+                    info!("Channel is closed and will exit the task status report loop.");
+                    drop(tasks_status_complete);
+                    return;
+                }
+
+                // Then try to fetch by non-blocking mode to fetch as much finished tasks as possible
+                loop {
+                    match rx_task_status.try_recv() {
+                        Ok(task_status) => {
+                            let task_status_vec = curator_task_status_map
+                                .entry(task_status.scheduler_endpoint)
+                                .or_default();
+                            task_status_vec.push(task_status.task_status);
+                            fetched_task_num += 1;
+                        }
+                        Err(TryRecvError::Empty) => {
+                            debug!("Fetched {fetched_task_num} tasks status to report");
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            info!(
+                                "Channel is closed and will exit the task status report loop"
+                            );
+                            drop(tasks_status_complete);
+                            return;
+                        }
+                    }
+                }
+
+                for (scheduler_endpoint, tasks_status) in
+                    curator_task_status_map.into_iter()
+                {
+                    match executor_server
+                        .get_scheduler_client(&scheduler_endpoint)
+                        .await
+                    {
+                        Ok(mut scheduler) => {
+                            if let Err(e) = scheduler
+                                .update_task_status(UpdateTaskStatusParams {
+                                    executor_id: executor_server
+                                        .executor
+                                        .metadata
+                                        .id
+                                        .clone(),
+                                    task_status: tasks_status.clone(),
+                                })
+                                .await
+                            {
+                                error!(
+                                    "Fail to update tasks {tasks_status:?} due to {e:?}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Fail to connect to scheduler {scheduler_endpoint} due to {e:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        //2. loop for task fetching and running
+        let executor_server = self.executor_server.clone();
+        let mut task_runner_shutdown = shutdown_noti.subscribe_for_shutdown();
+        let task_runner_complete = shutdown_noti.shutdown_complete_tx.clone();
+        tokio::spawn(async move {
+            info!("Starting the task runner pool");
+
+            // Use a dedicated executor for CPU bound tasks so that the main tokio
+            // executor can still answer requests even when under load
+            let dedicated_executor =
+                DedicatedExecutor::new("task_runner", executor_server.executor.vcores);
+
+            // As long as the shutdown notification has not been received
+            while !task_runner_shutdown.is_shutdown() {
+                let maybe_task: Option<CuratorTaskDefinition> = tokio::select! {
+                     task = rx_task.recv() => task,
+                    _ = task_runner_shutdown.recv() => {
+                        info!("Stop the task runner pool");
+                        drop(task_runner_complete);
+                        return;
+                    }
+                };
+                if let Some(curator_task) = maybe_task {
+                    let task_identity = format!(
+                        "TID {}/{}.{}/{}.{}",
+                        curator_task.task.job_id,
+                        curator_task.task.stage_id,
+                        curator_task.task.stage_attempt_num,
+                        curator_task.task.task_id,
+                        curator_task.task.task_attempt_num,
+                    );
+                    debug!("Received task {:?}", task_identity);
+
+                    let server = executor_server.clone();
+                    dedicated_executor.spawn(async move {
+                        server.run_task(task_identity.clone(), curator_task).await;
+                    });
+                } else {
+                    info!("Channel is closed and will exit the task receive loop");
+                    drop(task_runner_complete);
+                    return;
+                }
+            }
+        });
+    }
+}
+
+#[tonic::async_trait]
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
+    for ExecutorServer<T, U>
+{
+    async fn launch_task(
+        &self,
+        request: Request<LaunchTaskParams>,
+    ) -> Result<Response<LaunchTaskResult>, Status> {
+        let LaunchTaskParams {
+            tasks,
+            scheduler_endpoint,
+        } = request.into_inner();
+        let task_sender = self.executor_env.tx_task.clone();
+        for task in tasks {
+            task_sender
+                .send(CuratorTaskDefinition {
+                    scheduler_endpoint: scheduler_endpoint.clone(),
+                    task: get_task_definition(
+                        task,
+                        self.executor.runtime_producer.clone(),
+                        self.executor.produce_config(),
+                        self.executor.function_registry.scalar_functions.clone(),
+                        self.executor.function_registry.aggregate_functions.clone(),
+                        self.executor.function_registry.window_functions.clone(),
+                        self.executor
+                            .function_registry
+                            .higher_order_functions
+                            .clone(),
+                        self.codec.clone(),
+                    )
+                    .map_err(|e| Status::invalid_argument(format!("{e}")))?,
+                })
+                .await
+                .unwrap();
+        }
+        Ok(Response::new(LaunchTaskResult { success: true }))
+    }
+
+    /// by this interface, it can reduce the deserialization cost for multiple tasks
+    /// belong to the same job stage running on the same one executor
+    async fn launch_multi_task(
+        &self,
+        request: Request<LaunchMultiTaskParams>,
+    ) -> Result<Response<LaunchMultiTaskResult>, Status> {
+        let LaunchMultiTaskParams {
+            multi_tasks,
+            scheduler_endpoint,
+        } = request.into_inner();
+        let task_sender = self.executor_env.tx_task.clone();
+        let mut failed_jobs: HashSet<String> = HashSet::new();
+        for multi_task in multi_tasks {
+            let job_id = multi_task.job_id.clone();
+            let multi_task: Vec<TaskDefinition> = match get_task_definition_vec(
+                multi_task,
+                self.executor.runtime_producer.clone(),
+                self.executor.produce_config(),
+                self.executor.function_registry.scalar_functions.clone(),
+                self.executor.function_registry.aggregate_functions.clone(),
+                self.executor.function_registry.window_functions.clone(),
+                self.executor
+                    .function_registry
+                    .higher_order_functions
+                    .clone(),
+                self.codec.clone(),
+            ) {
+                Ok(tasks) => tasks,
+                Err(e) => {
+                    error!("failed to decode tasks for {job_id} : {e}");
+                    failed_jobs.insert(job_id);
+                    continue;
+                }
+            };
+
+            for task in multi_task {
+                task_sender
+                    .send(CuratorTaskDefinition {
+                        scheduler_endpoint: scheduler_endpoint.clone(),
+                        task,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        Ok(Response::new(LaunchMultiTaskResult {
+            failed_jobs: failed_jobs.into_iter().collect(),
+        }))
+    }
+
+    async fn stop_executor(
+        &self,
+        request: Request<StopExecutorParams>,
+    ) -> Result<Response<StopExecutorResult>, Status> {
+        let stop_request = request.into_inner();
+        if stop_request.executor_id != self.executor.metadata.id {
+            warn!(
+                "The executor id {} in request is different from {}. The stop request will be ignored",
+                stop_request.executor_id, self.executor.metadata.id
+            );
+            return Ok(Response::new(StopExecutorResult {}));
+        }
+        let stop_reason = stop_request.reason;
+        let force = stop_request.force;
+        info!(
+            "Receive stop executor request, reason: {:?}, force {:?}",
+            stop_reason, force
+        );
+        let stop_sender = self.executor_env.tx_stop.clone();
+        stop_sender.send(force).await.unwrap();
+        Ok(Response::new(StopExecutorResult {}))
+    }
+
+    async fn cancel_tasks(
+        &self,
+        request: Request<CancelTasksParams>,
+    ) -> Result<Response<CancelTasksResult>, Status> {
+        let task_infos = request.into_inner().task_infos;
+        info!("Cancelling tasks for {:?}", task_infos);
+
+        let mut cancelled = true;
+
+        for task in task_infos {
+            if let Err(e) = self
+                .executor
+                .cancel_task(
+                    task.job_id.into(),
+                    task.stage_id as usize,
+                    task.task_id as usize,
+                )
+                .await
+            {
+                error!("Error cancelling task: {e:?}");
+                cancelled = false;
+            }
+        }
+
+        Ok(Response::new(CancelTasksResult { cancelled }))
+    }
+
+    async fn remove_job_data(
+        &self,
+        request: Request<RemoveJobDataParams>,
+    ) -> Result<Response<RemoveJobDataResult>, Status> {
+        let params = request.into_inner();
+        let job_id = params.job_id.into();
+
+        self.executor
+            .remove_pipelined_job_data(&job_id, &params.remove_stage_ids);
+        remove_job_data(&self.executor.work_dir, &job_id, &params.remove_stage_ids)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        Ok(Response::new(RemoveJobDataResult {}))
+    }
+}
+
+/// The heartbeat an executor sends to the scheduler, whether it schedules by
+/// push or by pull: its status and its metrics, as selected by the policy.
+pub(crate) fn heartbeat_params(
+    executor: &Executor,
+    policy: ExecutorMetricCollectionPolicy,
+) -> HeartBeatParams {
+    let status = if TERMINATING.load(Ordering::Acquire) {
+        executor_status::Status::Terminating(String::default())
+    } else {
+        executor_status::Status::Active(String::default())
+    };
+
+    HeartBeatParams {
+        executor_id: executor.metadata.id.clone(),
+        metrics: executor_metrics(policy, executor.memory_metrics()),
+        status: Some(ExecutorStatus {
+            status: Some(status),
+        }),
+        metadata: Some(executor.metadata.clone()),
+    }
+}
+
+/// The metrics an executor sends in a heartbeat: host or process memory, as
+/// selected by the policy, and the executor's memory metrics.
+fn executor_metrics(
+    policy: ExecutorMetricCollectionPolicy,
+    memory_metrics: Option<&ExecutorMemoryMetrics>,
+) -> Vec<ExecutorMetric> {
+    let mut metrics = policy.collect();
+    metrics.extend(heartbeat_memory_metrics(policy, memory_metrics));
+    metrics
+}
+
+/// The executor's memory metrics to send in a heartbeat. These are process
+/// metrics, so they're only sent when the policy collects process metrics and
+/// the executor was started with memory metrics.
+fn heartbeat_memory_metrics(
+    policy: ExecutorMetricCollectionPolicy,
+    metrics: Option<&ExecutorMemoryMetrics>,
+) -> Vec<ExecutorMetric> {
+    match (policy, metrics) {
+        (
+            ExecutorMetricCollectionPolicy::ProcessOnly
+            | ExecutorMetricCollectionPolicy::SystemAndProcess,
+            Some(metrics),
+        ) => executor_memory_metrics(metrics),
+        _ => vec![],
+    }
+}
+
+/// Converts a snapshot of executor-wide memory usage into heartbeat metrics.
+///
+/// Reports nothing until the executor has resolved its memory pool. The pool
+/// capacity is left out when the pool is unbounded, and allocated bytes when
+/// the process's allocator doesn't count them.
+fn executor_memory_metrics(metrics: &ExecutorMemoryMetrics) -> Vec<ExecutorMetric> {
+    let Some(usage) = metrics.snapshot() else {
+        return vec![];
+    };
+    let mut values = vec![executor_metric::Metric::MemoryPoolReserved(
+        usage.reserved as u64,
+    )];
+    if let Some(capacity) = usage.pool_size {
+        values.push(executor_metric::Metric::MemoryPoolSize(capacity));
+    }
+    if let Some(allocated) = metrics.allocated_bytes() {
+        values.push(executor_metric::Metric::AllocatedMemory(allocated as u64));
+    }
+    values
+        .into_iter()
+        .map(|metric| ExecutorMetric {
+            metric: Some(metric),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool};
+
+    fn values(metrics: Vec<ExecutorMetric>) -> Vec<executor_metric::Metric> {
+        metrics.into_iter().filter_map(|m| m.metric).collect()
+    }
+
+    #[test]
+    fn reports_nothing_before_the_pool_is_initialized() {
+        let metrics = ExecutorMemoryMetrics::default();
+        assert!(executor_memory_metrics(&metrics).is_empty());
+    }
+
+    #[test]
+    fn reports_reserved_pool_size_and_allocated_bytes() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(Some(4096));
+        metrics.set_allocated_bytes_source(|| 12_345);
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4096));
+        metrics.register(&pool);
+        let reservation = MemoryConsumer::new("r").register(&pool);
+        reservation.try_grow(1000).unwrap();
+
+        assert_eq!(
+            values(executor_memory_metrics(&metrics)),
+            vec![
+                executor_metric::Metric::MemoryPoolReserved(1000),
+                executor_metric::Metric::MemoryPoolSize(4096),
+                executor_metric::Metric::AllocatedMemory(12_345),
+            ]
+        );
+    }
+
+    #[test]
+    fn sends_memory_metrics_only_when_collecting_process_metrics() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(Some(4096));
+
+        for policy in [
+            ExecutorMetricCollectionPolicy::ProcessOnly,
+            ExecutorMetricCollectionPolicy::SystemAndProcess,
+        ] {
+            assert_eq!(heartbeat_memory_metrics(policy, Some(&metrics)).len(), 2);
+        }
+        for policy in [
+            ExecutorMetricCollectionPolicy::SystemOnly,
+            ExecutorMetricCollectionPolicy::Off,
+        ] {
+            assert!(heartbeat_memory_metrics(policy, Some(&metrics)).is_empty());
+        }
+        assert!(
+            heartbeat_memory_metrics(ExecutorMetricCollectionPolicy::ProcessOnly, None)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn omits_pool_size_when_unbounded_and_allocated_without_a_source() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(None);
+
+        assert_eq!(
+            values(executor_memory_metrics(&metrics)),
+            vec![executor_metric::Metric::MemoryPoolReserved(0)]
+        );
+    }
+}

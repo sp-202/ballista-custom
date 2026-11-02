@@ -1,0 +1,368 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Python Release Build
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    paths:
+      - "python/**"
+      # the release tooling is not part of the build
+      - "!python/dev/release/**"
+  push:
+    # Python client release candidates, e.g. python-55.0.0-rc1. The Rust
+    # release tags do not build wheels because the Python client is released
+    # separately, see python/dev/release/README.md
+    tags: [ "python-*-rc*" ]
+
+jobs:
+  test-release:
+    name: Test Python Release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run pytest
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # A release candidate may only depend on crates from crates.io, see
+      # python/dev/release/README.md. Failing here stops the wheels from being
+      # built, so a bad tag never produces artifacts to download.
+      - name: Check python/Cargo.lock for the release candidate
+        if: startsWith(github.ref, 'refs/tags/python-')
+        run: |
+          version=${GITHUB_REF_NAME#python-}
+          python python/dev/release/check-cargo-lock.py "${version%-rc*}" python/Cargo.lock
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      # Use the --no-install-package to only install the dependencies
+      # but do not yet build the rust library
+      - name: Install dependencies
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+
+      # Update output format to enable automatic inline annotations.
+      - name: Run Ruff
+        run: |
+          # Lint the whole repo; ruff uses the nearest pyproject.toml or ruff.toml per file.
+          cd python
+          uv run --no-project ruff check --output-format=github ..
+          uv run --no-project ruff format --check ..
+
+  generate-license:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+      - name: Generate license file
+        run: uv run --no-project python ./dev/create_license.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheel-license
+          path: LICENSE.txt
+
+  build-python-mac:
+    if: github.event_name != 'pull_request'
+    needs: [ generate-license, build, test-release ]
+    name: Mac/Win
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10" ]
+        os: [ macos-latest ]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+        with:
+          # FIXME: temporary workaround, see: https://github.com/swatinem/rust-cache/issues/341
+          cache-bin: ${{ matrix.os != 'macos-latest' }}
+          workspaces: |
+            python -> target
+
+      - run: rm LICENSE.txt
+      - name: Download LICENSE.txt
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-license
+          path: .
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run --no-project maturin build --release --strip
+
+      - name: List Mac wheels
+        if: matrix.os == 'macos-latest'
+        run: find python/target/wheels/
+
+      - name: Archive wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.os  }}
+          path: python/target/wheels/*
+
+  build-manylinux-x86_64:
+    if: github.event_name != 'pull_request'
+    needs: [ generate-license, build, test-release ]
+    name: Manylinux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+
+      - run: rm LICENSE.txt
+      - name: Download LICENSE.txt
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-license
+          path: .
+
+      - run: cat LICENSE.txt
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run --no-project maturin build --release --strip
+
+      - name: Archive wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-manylinux-x86_64
+          path: python/target/wheels/*
+
+  build-manylinux-aarch64:
+    if: github.event_name != 'pull_request'
+    needs: [ generate-license, build, test-release ]
+    name: Manylinux arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+
+      - run: rm LICENSE.txt
+      - name: Download LICENSE.txt
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-license
+          path: .
+
+      - run: cat LICENSE.txt
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run --no-project maturin build --release --strip
+
+      - name: Archive wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-manylinux-aarch64
+          path: python/target/wheels/*
+
+  build-sdist:
+    if: github.event_name != 'pull_request'
+    needs: [ generate-license, build, test-release ]
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #2.9.3
+
+      - run: rm LICENSE.txt
+      - name: Download LICENSE.txt
+        uses: actions/download-artifact@v8
+        with:
+          name: python-wheel-license
+          path: .
+
+      - run: cat LICENSE.txt
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: true
+
+      - name: Build Python package
+        run: |
+          cd python
+          uv sync --dev --no-install-package ballista
+          uv run --no-project maturin sdist --out dist
+
+      - name: Assert sdist build does not generate wheels
+        run: |
+          cd python
+          # `--out dist` causes maturin to place artifacts under python/dist/.
+          # Older maturin versions also wrote to the default python/target/wheels/,
+          # so check both locations.
+          found=$(find dist target/wheels -name '*.whl' 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            echo "Error: Sdist build generated wheels:"
+            echo "$found"
+            exit 1
+          fi
+          echo "No wheels generated (expected)."
+        shell: bash
+
+      - name: Archive sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-sdist
+          path: python/dist/*.tar.gz
+
+  merge-build-artifacts:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs:
+      - build-python-mac
+      - build-manylinux-x86_64
+      - build-manylinux-aarch64
+      - build-sdist
+    steps:
+      - name: Merge Build Artifacts
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: dist
+          pattern: dist-*
+
+  # NOTE: PyPI publish needs to be done manually for now after release passed the vote
+  # release:
+  #   name: Publish in PyPI
+  #   needs: [build-manylinux, build-python-mac-win]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/download-artifact@v8
+  #     - name: Publish to PyPI
+  #       uses: pypa/gh-action-pypi-publish@master
+  #       with:
+  #         user: __token__
+  #         password: ${{ secrets.pypi_password }}

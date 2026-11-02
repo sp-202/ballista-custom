@@ -1,0 +1,316 @@
+<!---
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+# Ballista Architecture
+
+## Overview
+
+Ballista’s primary purpose is to provide a distributed SQL query engine implemented in the Rust programming
+language and using the Apache Arrow memory model.
+
+Ballista also provides a DataFrame API (both in Rust and Python), suitable for constructing ETL pipelines and
+analytical queries. The DataFrame API is inspired by Apache Spark and is currently better suited for ETL/SQL work
+than for data science.
+
+## Design Principles
+
+### Arrow-native
+
+Ballista uses the Apache Arrow memory format during query execution, and Apache Arrow IPC format on disk for
+shuffle files and for exchanging data between executors. Queries can be submitted from Rust and Python clients
+or the Ballista CLI.
+
+### Language Agnostic
+
+Although most of the implementation code is written in Rust, the scheduler and executor APIs are based on open
+standards, including protocol buffers, gRPC, Apache Arrow IPC, and Apache Arrow Flight.
+
+This language agnostic approach will allow Ballista to eventually support UDFs in languages other than Rust,
+including Wasm.
+
+### Extensible
+
+Many Ballista users have their own distributed query engines that use Ballista as a foundation, rather than
+using Ballista directly. This allows the scheduler and executor processes to be extended with support for
+additional data formats, operators, expressions, or custom SQL dialects or other DSLs.
+
+Ballista uses the DataFusion query engine for query execution, but it should be possible to plug in other execution
+engines.
+
+## Deployment Architecture
+
+### Cluster
+
+A Ballista cluster consists of one or more scheduler processes and one or more executor processes. These processes
+can be run as native binaries and are also available as Docker Images, which can be easily deployed with
+[Docker Compose](https://datafusion.apache.org/ballista/user-guide/deployment/docker-compose.html) or
+[Kubernetes](https://datafusion.apache.org/ballista/user-guide/deployment/kubernetes.html).
+
+The following diagram shows the interaction between clients and the scheduler for submitting jobs, and the interaction
+between the executor(s) and the scheduler for fetching tasks and reporting task status.
+
+![Ballista Cluster Diagram](ballista_architecture.excalidraw.svg)
+
+### Scheduler
+
+The scheduler provides the following interfaces:
+
+- gRPC service for submitting and managing jobs
+- REST API for monitoring jobs
+
+The gRPC service is defined in
+[ballista.proto](https://github.com/apache/datafusion-ballista/blob/main/ballista/core/proto/ballista.proto).
+Its principal methods are:
+
+| Method                | Description                                                          |
+| --------------------- | -------------------------------------------------------------------- |
+| ExecuteQuery          | Submit a logical query plan or SQL query for execution               |
+| ExecuteQueryPush      | Same, but streams job status back to the client                      |
+| GetJobStatus          | Get the status of a submitted query                                  |
+| GetJobMetrics         | Get execution metrics for a submitted query                          |
+| CancelJob             | Cancel a running query                                               |
+| RegisterExecutor      | Executors call this method to register themselves with the scheduler |
+| HeartBeatFromExecutor | Executors report liveness and available capacity                     |
+| PollWork              | Pull-based executors ask for the next task                           |
+| UpdateTaskStatus      | Executors report task completion or failure                          |
+
+Jobs are submitted to the scheduler's gRPC service from a client context, either in the form of a logical query
+plan or a SQL string. The scheduler then creates an execution graph, which contains a physical plan broken down into
+stages (pipelines) that can be scheduled independently. This process is explained in detail in the Distributed
+Query Scheduling section of this guide.
+
+### Executor
+
+The executor processes connect to a scheduler and poll for tasks to perform. These tasks are physical plans in
+protocol buffer format. These physical plans are typically executed against multiple partitions of input data. Executors
+can execute multiple partitions of the same plan in parallel.
+
+### Clients
+
+There are multiple clients available for submitting jobs to a Ballista cluster:
+
+- The [Ballista CLI](https://github.com/apache/datafusion-ballista/tree/main/ballista-cli) provides a SQL command-line
+  interface.
+- The Python bindings ([PyBallista](https://github.com/apache/datafusion-ballista/tree/main/python)) provide a session
+  context with support for SQL and DataFrame operations.
+- The [ballista crate](https://crates.io/crates/ballista) provides a native Rust session context with support for
+  SQL and DataFrame operations.
+
+## Distributed Query Scheduling
+
+Distributed query plans are fundamentally different to in-process query plans because we can't just build a
+tree of operators and start executing them. The query now requires co-ordination across executors which means that
+we now need a scheduler.
+
+At a high level, the concept of a distributed query scheduler is not complex. The scheduler needs to examine the
+whole query and break it down into stages that can be executed in isolation (usually in parallel across the executors)
+and then schedule these stages for execution based on the available resources in the cluster. Once each query
+stage completes then any subsequent dependent query stages can be scheduled. This process repeats until all query
+stages have been executed.
+
+### Producing a Distributed Query Plan
+
+Some operators can run in parallel on input partitions and some operators require data to be repartitioned. These
+changes in partitioning are key to planning a distributed query. Changes in partitioning within a plan are sometimes
+called pipeline breakers and these changes in partitioning define the boundaries between query stages.
+
+We will now use the following SQL query to see how this process works.
+
+```sql
+SELECT customer.id, sum(order.amount) as total_amount
+FROM customer JOIN order ON customer.id = order.customer_id
+GROUP BY customer.id
+```
+
+The physical (non-distributed) plan for this query would look something like this:
+
+```
+Projection: #customer.id, #total_amount
+  HashAggregate: groupBy=[customer.id], aggr=[SUM(order.amount) AS total_amount]
+    Join: condition=[customer.id = order.customer_id]
+      Scan: customer
+      Scan: order
+```
+
+Assuming that the customer and order tables are not already partitioned on customer id, we will need to schedule
+execution of the first two query stages to repartition this data. These two query stages can run in parallel.
+
+```
+Query Stage #1: repartition=[customer.id]
+  Scan: customer
+Query Stage #2: repartition=[order.customer_id]
+  Scan: order
+```
+
+Next, we can schedule the join, which will run in parallel for each partition of the two inputs. The next operator
+after the join is the aggregate, which is split into two parts; the aggregate that runs in parallel and then
+the final aggregate that requires a single input partition. We can perform the parallel part of this aggregate
+in the same query stage as the join because this first aggregate does not care how the data is partitioned. This
+gives us our third query stage, which can now be scheduled for execution. The output of this query stage
+remains partitioned by customer id.
+
+```
+Query Stage #3: repartition=[]
+  HashAggregate: groupBy=[customer.id], aggr=[SUM(order.amount) AS total_amount]
+    Join: condition=[customer.id = order.customer_id]
+      Query Stage #1
+      Query Stage #2
+```
+
+The final query stage performs the aggregate of the aggregates, reading from all of the partitions from the previous
+stage.
+
+```
+Query Stage #4:
+  Projection: #customer.id, #total_amount
+    HashAggregate: groupBy=[customer.id], aggr=[SUM(order.amount) AS total_amount]
+      QueryStage #3
+```
+
+To recap, here is the full distributed query plan showing the query stages that are introduced when data needs to be
+repartitioned or exchanged between pipelined operations.
+
+```
+Query Stage #4:
+  Projection: #customer.id, #total_amount
+    HashAggregate: groupBy=[customer.id], aggr=[SUM(order.amount) AS total_amount]
+      Query Stage #3: repartition=[]
+        HashAggregate: groupBy=[customer.id], aggr=[SUM(order.amount) AS total_amount]
+          Join: condition=[customer.id = order.customer_id]
+            Query Stage #1: repartition=[customer.id]
+              Scan: customer
+            Query Stage #2: repartition=[order.customer_id]
+              Scan: order
+```
+
+### Shuffle
+
+Each stage of the execution graph has the same partitioning scheme for all of the operators in the plan. However,
+the output of each stage typically needs to be repartitioned before it can be used as the input to the next stage. An
+example of this is when a query contains multiple joins. Data needs to be partitioned by the join keys before the join
+can be performed.
+
+Each executor will re-partition the output of the stage it is running so that it can be consumed by the next
+stage. This mechanism is known as an Exchange or a Shuffle. The logic for this can be found in the [ShuffleWriterExec]
+and [ShuffleReaderExec] operators.
+
+The shuffle is _blocking_: a stage materializes its output to local storage, and today a downstream stage waits
+for the whole upstream stage to complete before it starts. Waiting on the whole stage is a property of the current
+scheduler rather than of the design — the output of a finished task is readable as soon as its files are closed,
+so a downstream stage could in principle start on partial input when the cluster has capacity to spare. See
+[Shuffle Design](shuffle.md) for why Ballista materializes shuffle output at all, what that costs, and how it
+compares to the pipelined shuffle used by engines such as DataFusion Distributed and Sail.
+
+[shufflewriterexec]: https://github.com/apache/datafusion-ballista/blob/main/ballista/core/src/execution_plans/shuffle_writer.rs
+[shufflereaderexec]: https://github.com/apache/datafusion-ballista/blob/main/ballista/core/src/execution_plans/shuffle_reader.rs
+
+### Multi-partition tasks
+
+Ballista dispatches at the _slice_ level, not the partition level. Each executor advertises a fixed number of
+virtual cores (`vcores`), and the scheduler packs up to that many of a stage's output partitions into a single
+task. All partitions in the slice execute concurrently under one DataFusion plan invocation: scans and shuffle
+readers are rewritten to see only the assigned partition ids, and DataFusion's per-partition `execute(N)`
+contract fans the work across the executor's threads. Slice size is bounded by the executor's free vcore count
+and by `ballista.scheduler.max_partitions_per_task` (`0` = unbounded — the default; fills each task up to the
+executor's free vcore count; `1` = one task per partition, the pre-multi-partition-tasks model).
+
+Compared to Apache Spark, whose unit of dispatch is one task per partition, Ballista's unit is one task per
+slice of partitions bound to a single executor. Spark achieves cluster-scale parallelism the same way — many
+tasks running concurrently across cores — but each task is single-threaded and doesn't share state with its
+neighbours. Ballista's slice model preserves cluster-scale parallelism _and_ adds intra-task shared-memory
+parallelism: partitions inside one slice share DataFusion's per-task memory pool budget, share the collect-left
+build side of a broadcast hash join (one hash table probed by every partition, instead of one materialization
+per task), share segment-tree indices needed for degenerate window aggregates (non-invertible aggregates like
+MIN/MAX, or wide/data-dependent frames where a sliding accumulator degrades to O(n × frame)), and can cooperate
+on shared-memory algorithms like PSRS parallel sort that a shuffle-based system can't express within a stage.
+It also unlocks pipelines whose intra-task state must be global-per-slice — e.g.
+`SELECT sum(v2) OVER (ORDER BY v2 RANGE 3 PRECEDING) FROM large`, which today collapses onto a single-partition
+sort+window and OOMs at h2o 10 GB scale; with the KLL-adaptive range-repartition rewrite that builds on this
+model, one slice-task per executor holds the sketch, buffered input, and per-partition halo state inside a
+single plan.
+
+## Adaptive Query Execution (AQE)
+
+The scheduling described above is _static_: the full set of query stages is computed once, at job
+submission time, from the plan-time cost estimates. Adaptive Query Execution (AQE) is the default
+alternative, in which the stage DAG is built _incrementally_, re-optimizing the remaining plan using the
+exact row counts and byte sizes observed as each shuffle stage completes. Set
+`ballista.planner.adaptive.enabled` to `false` to go back to the static planner.
+
+### Static vs adaptive execution graphs
+
+Job scheduling revolves around an `ExecutionGraph`, which translates a physical plan into a set of stages.
+There are two implementations, selected by configuration when a job is submitted:
+
+- **`StaticExecutionGraph`** — used when AQE is turned off. All stages are planned up front by the
+  `DistributedPlanner`, which returns a static list of stages.
+- **`AdaptiveExecutionGraph`** — the default. It is driven by the `AdaptivePlanner`, which runs
+  a set of pluggable physical optimizer rules after each stage completes and returns only the stages that are
+  currently runnable. Because decisions are deferred, stages come back already resolved, so the
+  `UnResolved` stage state used by the static path is not needed here.
+
+Keeping the two graphs side by side lets the adaptive implementation mature without destabilizing the static
+path.
+
+### How re-optimization works
+
+As each shuffle stage finishes, its exact output statistics are attached to the remaining plan and the
+optimizer rules are re-run. This is the key difference from DataFusion's normal single-shot physical
+optimization, where each rule runs once per plan. Running the full rule set repeatedly means the rules must be
+**idempotent** — otherwise they would keep inserting redundant exec nodes on each pass.
+
+The adaptive optimizations implemented today are:
+
+- **Join selection** — `SelectJoinRule` and `DelayJoinSelectionRule` resolve a `DynamicJoinSelectionExec`
+  into a concrete hash, broadcast, or sort-merge join from runtime row counts and byte sizes, so the
+  smaller side drives the join.
+- **Build-side staging** — when a join's build side has only an estimated size and the probe side is far
+  larger, AQE shuffles the build side alone first (`JoinSelectionAction::StageBuildSide`). Its measured size
+  then decides the join, so an over-estimated build side can still be broadcast instead of forcing a shuffle
+  of the probe side. On by default; see `ballista.optimizer.stage_build_side`.
+- **Empty stage elimination** — when a completed stage produces zero rows, its downstream exchange is
+  replaced with an empty execution node and emptiness is propagated up the plan so dependent stages are
+  skipped entirely.
+- **Shuffle-partition coalescing** — adjacent small partitions are merged so the next stage runs fewer,
+  larger tasks. Off by default; see `ballista.planner.coalesce.enabled`.
+- **Parallel windows** — bounded `RANGE`-frame windows are rewritten into a distributed range shuffle.
+  Off by default; see `ballista.planner.parallel_window.enabled`.
+
+### Code layout
+
+The adaptive scheduler code lives under [`ballista/scheduler/src/state/aqe`], with the
+`AdaptiveExecutionGraph` in `mod.rs`, the planner in `planner.rs`, the optimizer rules under
+`optimizer_rule/`, and the adaptive execution plan nodes under `execution_plan/`.
+
+### Current limitations
+
+The adaptive path currently covers the happy path only. Known gaps, each with a tracking issue:
+
+- Executor failure handling on the AQE path ([#1986])
+- Switching from hash join to sort-merge join based on runtime statistics ([#1988])
+- Switching from streaming aggregation to hash aggregation based on runtime statistics ([#1989])
+
+Design and progress are tracked in the AQE epic ([#1359]). See also the
+[AQE section of the tuning guide](../user-guide/tuning-guide.md) for the user-facing description.
+
+[`ballista/scheduler/src/state/aqe`]: https://github.com/apache/datafusion-ballista/tree/main/ballista/scheduler/src/state/aqe
+[#1359]: https://github.com/apache/datafusion-ballista/issues/1359
+[#1986]: https://github.com/apache/datafusion-ballista/issues/1986
+[#1988]: https://github.com/apache/datafusion-ballista/issues/1988
+[#1989]: https://github.com/apache/datafusion-ballista/issues/1989

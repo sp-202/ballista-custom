@@ -1,0 +1,1906 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Ballista Executor Process
+
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use arrow_flight::flight_service_server::FlightServiceServer;
+use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::serde::protobuf::ExecutorOperatingSystemSpecification;
+use datafusion::DATAFUSION_VERSION;
+use datafusion_proto::logical_plan::LogicalExtensionCodec;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use log::{error, info, warn};
+use sysinfo::{Disks, MemoryRefreshKind, System};
+use tempfile::TempDir;
+use tokio::fs::DirEntry;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::{fs, time};
+use tonic::transport::Channel;
+
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::prelude::SessionConfig;
+
+use ballista_core::config::{LogRotationPolicy, TaskSchedulingPolicy};
+use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::PipelinedRegistry;
+use ballista_core::extension::{EndpointOverrideFn, SessionConfigExt};
+use ballista_core::serde::protobuf::executor_resource::Resource;
+use ballista_core::serde::protobuf::{
+    ExecutorRegistration, ExecutorResource, ExecutorSpecification, ExecutorStoppedParams,
+    scheduler_grpc_client::SchedulerGrpcClient,
+};
+use ballista_core::serde::{
+    BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
+};
+use ballista_core::utils::{
+    GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
+    create_grpc_server_incoming, default_config_producer, drain_or_time_out,
+    get_time_before, shutdown_signal,
+};
+use ballista_core::{
+    BALLISTA_PROTOCOL_VERSION, BALLISTA_VERSION, ConfigProducer, JobId, RuntimeProducer,
+    ids::new_instance_id,
+};
+
+use crate::ArrowFlightServerProvider;
+use crate::client_pool::DefaultBallistaClientPool;
+use crate::execution_engine::{DefaultExecutionEngine, ExecutionEngine};
+use crate::executor::{Executor, TasksDrainedFuture};
+use crate::executor_server::{TERMINATING, heartbeat_params};
+use crate::flight_service::BallistaFlightService;
+use crate::metrics::LoggingMetricsCollector;
+use crate::metrics::{ExecutorMemoryMetrics, ExecutorMetricCollectionPolicy};
+use crate::runtime_cache::{
+    DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+};
+use crate::shutdown::Shutdown;
+use crate::shutdown::ShutdownNotifier;
+use crate::{execution_loop, executor_server};
+
+/// Default fraction of the detected memory limit handed to the pool when
+/// `--memory-pool-fraction` is not set. The `FairSpillPool` only bounds memory
+/// operators register with it, so the remaining budget absorbs untracked
+/// overhead (in-flight Arrow batches, shuffle writer buffers, fragmentation).
+pub(crate) const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.70;
+
+/// How the operator interpreted `--memory-pool-size`.
+#[derive(Debug, PartialEq)]
+enum MemoryBudget {
+    /// Flag unset: auto-size to `fraction` of detected host/cgroup memory.
+    Auto { fraction: f64 },
+    /// `--memory-pool-size 0`: run DataFusion's unbounded pool.
+    Unbounded,
+    /// `--memory-pool-size N`: bound the pool to exactly `N` bytes.
+    Bytes(u64),
+}
+
+/// Classify the raw CLI value into a [`MemoryBudget`]. `fraction` is only used
+/// for the auto path.
+fn memory_budget_from_cli(opt: Option<u64>, fraction: f64) -> MemoryBudget {
+    match opt {
+        None => MemoryBudget::Auto { fraction },
+        Some(0) => MemoryBudget::Unbounded,
+        Some(n) => MemoryBudget::Bytes(n),
+    }
+}
+
+/// Where an auto/explicit pool size came from (for logging).
+#[derive(Debug, PartialEq, Eq)]
+enum PoolSource {
+    /// Explicit `--memory-pool-size N`.
+    Configured,
+    /// Auto: fraction of the cgroup memory limit.
+    AutoCgroup,
+    /// Auto: fraction of host memory.
+    AutoHost,
+}
+
+/// Why the executor is running without a bounded pool (for logging).
+#[derive(Debug, PartialEq, Eq)]
+enum UnboundedReason {
+    /// User asked for it via `--memory-pool-size 0`.
+    Explicit,
+    /// Neither host nor cgroup memory could be detected.
+    Undetected,
+}
+
+/// The resolved pool decision: a concrete byte budget or unbounded.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedPool {
+    Bounded { bytes: u64, source: PoolSource },
+    Unbounded(UnboundedReason),
+}
+
+/// Pure resolver: turn the budget plus detected limits into a decision.
+/// `host_total` and `cgroup_limit` are only consulted for [`MemoryBudget::Auto`].
+fn resolve_pool(
+    budget: MemoryBudget,
+    host_total: Option<u64>,
+    cgroup_limit: Option<u64>,
+) -> ResolvedPool {
+    match budget {
+        MemoryBudget::Unbounded => ResolvedPool::Unbounded(UnboundedReason::Explicit),
+        MemoryBudget::Bytes(n) => ResolvedPool::Bounded {
+            bytes: n,
+            source: PoolSource::Configured,
+        },
+        MemoryBudget::Auto { fraction } => {
+            let (base, source) = match (host_total, cgroup_limit) {
+                (Some(h), Some(c)) if c <= h => (c, PoolSource::AutoCgroup),
+                (Some(h), Some(_)) => (h, PoolSource::AutoHost),
+                (Some(h), None) => (h, PoolSource::AutoHost),
+                (None, Some(c)) => (c, PoolSource::AutoCgroup),
+                (None, None) => {
+                    return ResolvedPool::Unbounded(UnboundedReason::Undetected);
+                }
+            };
+            let bytes = (base as f64 * fraction) as u64;
+            ResolvedPool::Bounded { bytes, source }
+        }
+    }
+}
+
+/// Read the cgroup memory limit in bytes, or `None` if unlimited/absent.
+/// Tries cgroup v2 (`<root>/memory.max`) then v1
+/// (`<root>/memory/memory.limit_in_bytes`). A v1 "unlimited" sentinel (a value
+/// near `u64::MAX`) is returned as-is; callers clamp it with `min(host, _)`.
+fn read_cgroup_memory_limit(cgroup_root: &Path) -> Option<u64> {
+    // cgroup v2
+    if let Ok(s) = std::fs::read_to_string(cgroup_root.join("memory.max")) {
+        let s = s.trim();
+        if s == "max" {
+            return None;
+        }
+        if let Ok(v) = s.parse::<u64>() {
+            return Some(v);
+        }
+    }
+    // cgroup v1
+    if let Ok(s) =
+        std::fs::read_to_string(cgroup_root.join("memory").join("memory.limit_in_bytes"))
+        && let Ok(v) = s.trim().parse::<u64>()
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// Total host memory in bytes via `sysinfo`, or `None` if unreadable.
+fn read_host_total_memory() -> Option<u64> {
+    let mut system = System::new_all();
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    let total = system.total_memory();
+    (total > 0).then_some(total)
+}
+
+/// Resolve the pool decision, reading host/cgroup limits only when auto-sizing.
+fn detect_pool(budget: MemoryBudget) -> ResolvedPool {
+    match budget {
+        MemoryBudget::Auto { fraction } => resolve_pool(
+            MemoryBudget::Auto { fraction },
+            read_host_total_memory(),
+            // Fixed cgroup root: assumes a cgroup-namespaced container (the
+            // default for modern k8s/Docker), where this path *is* the
+            // container's own limit. In a non-namespaced setup the real limit
+            // may live under a sub-slice instead, in which case this reads
+            // the host's root limit and we fall back to host memory below.
+            read_cgroup_memory_limit(Path::new("/sys/fs/cgroup")),
+        ),
+        other => resolve_pool(other, None, None),
+    }
+}
+
+/// How many of a task's largest memory consumers a `ResourcesExhausted` error
+/// lists. Matches DataFusion's default for `RuntimeEnvBuilder::with_memory_limit`.
+const TOP_MEMORY_CONSUMERS: NonZeroUsize = NonZeroUsize::new(5).unwrap();
+
+/// Builds a per-task memory-pool policy: each task's runtime is rebuilt from the
+/// shared base env with a fresh [`FairSpillPool`] of size
+/// `total_bytes / vcores`. The base env's disk manager, cache manager,
+/// and object-store registry are preserved via
+/// [`RuntimeEnvBuilder::from_runtime_env`].
+///
+/// The pool is wrapped in a [`TrackConsumersPool`], so when a reservation is
+/// refused the `ResourcesExhausted` error names the task's largest memory
+/// consumers, as DataFusion does for `RuntimeEnvBuilder::with_memory_limit`.
+///
+/// Returns an error if the per-task share would be zero (i.e. `total_bytes <
+/// vcores`).
+fn memory_pool_policy(
+    total_bytes: u64,
+    vcores: usize,
+) -> Result<MemoryPoolPolicy, BallistaError> {
+    let per_vcore = (total_bytes / vcores as u64) as usize;
+    if per_vcore == 0 {
+        return Err(BallistaError::Configuration(format!(
+            "memory_pool_size ({total_bytes} bytes) is smaller than vcores ({vcores})"
+        )));
+    }
+    Ok(Arc::new(
+        move |base: Arc<RuntimeEnv>, _config: &SessionConfig, vcores_consumed: u32| {
+            // Multi-partition tasks that claim N vcores get N × per-vcore
+            // share of the executor's memory pool. A collapse task with
+            // vcores_consumed=1 (see scheduler `bind_one`) gets the
+            // single-vcore share it uses; a 4-partition task gets 4×,
+            // matching the parallelism DataFusion will actually drive.
+            let size = per_vcore.saturating_mul(vcores_consumed.max(1) as usize);
+            let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(size),
+                TOP_MEMORY_CONSUMERS,
+            ));
+            RuntimeEnvBuilder::from_runtime_env(&base)
+                .with_memory_pool(pool)
+                .build_arc()
+        },
+    ))
+}
+
+/// Wraps `producer` so every runtime it builds writes spill files under
+/// `spill_dir`, keeping the runtime's memory pool, caches and object stores.
+/// The runtime gets a new disk manager with DataFusion's default settings, so
+/// any other disk settings the producer made are not carried over. The
+/// executor's default runtime already spills under its work dir; this lets a
+/// custom producer, such as the standalone binary's S3-enabled runtime, do the
+/// same.
+pub fn with_spill_dir(producer: RuntimeProducer, spill_dir: String) -> RuntimeProducer {
+    Arc::new(move |config: &SessionConfig| {
+        let runtime_env = producer(config)?;
+        RuntimeEnvBuilder::from_runtime_env(&runtime_env)
+            .with_temp_file_path(spill_dir.clone())
+            .build_arc()
+    })
+}
+
+/// Wraps `producer` so every runtime it builds limits spill files to
+/// `max_temp_directory_size` bytes of disk. Applied on top of the producer,
+/// rather than inside it, so a custom `override_runtime_producer` gets the
+/// same limit. Each base runtime has its own disk manager, so the limit is per
+/// session runtime (shared by that session's tasks).
+fn with_max_temp_directory_size(
+    producer: RuntimeProducer,
+    max_temp_directory_size: u64,
+) -> RuntimeProducer {
+    Arc::new(move |config: &SessionConfig| {
+        let runtime_env = producer(config)?;
+        runtime_env
+            .disk_manager
+            .set_max_temp_directory_size(max_temp_directory_size)?;
+        Ok(runtime_env)
+    })
+}
+
+/// A no-op policy: the task uses the shared base env unchanged (DataFusion's
+/// default unbounded pool). Used when `--memory-pool-size` is unset.
+fn identity_pool_policy() -> MemoryPoolPolicy {
+    Arc::new(|base, _config, _vcores| Ok(base))
+}
+
+fn observe_memory_pools(
+    policy: MemoryPoolPolicy,
+    metrics: ExecutorMemoryMetrics,
+) -> MemoryPoolPolicy {
+    Arc::new(move |base, config, vcores_consumed| {
+        let runtime = policy(base, config, vcores_consumed)?;
+        metrics.register(&runtime.memory_pool);
+        Ok(runtime)
+    })
+}
+
+/// Configuration for the executor process.
+///
+/// This struct contains all settings needed to run an executor, including
+/// network configuration, scheduler connection details, resource limits,
+/// and optional overrides for customizing executor behavior.
+pub struct ExecutorProcessConfig {
+    /// Identifier for this executor instance.
+    pub executor_id: String,
+    /// Local IP address for binding executor services.
+    pub bind_host: String,
+    /// External hostname/IP advertised to other components for connectivity.
+    pub external_host: Option<String>,
+    /// Port for the Arrow Flight service.
+    pub port: u16,
+    /// Port for the executor's gRPC service.
+    pub grpc_port: u16,
+    /// Hostname of the scheduler to connect to.
+    pub scheduler_host: String,
+    /// Port of the scheduler's gRPC service.
+    pub scheduler_port: u16,
+    /// Timeout in seconds for establishing scheduler connection.
+    pub scheduler_connect_timeout_seconds: u16,
+    /// Maximum time in seconds for scheduler notification, task and Flight draining,
+    /// and shuffle cleanup after shutdown is requested. `0` waits indefinitely.
+    pub graceful_shutdown_timeout_seconds: u64,
+    /// Virtual cores advertised by this executor to the scheduler.
+    pub vcores: usize,
+    /// Task scheduling policy (pull-staged or push-staged).
+    pub task_scheduling_policy: TaskSchedulingPolicy,
+    /// Directory for storing log files.
+    pub log_dir: Option<String>,
+    /// Directory for storing temporary shuffle data.
+    pub work_dir: Option<String>,
+    /// Log level configuration for specific modules.
+    pub special_mod_log_level: String,
+    /// Whether to include thread info in log output.
+    pub print_thread_info: bool,
+    /// Log file rotation policy.
+    pub log_rotation_policy: LogRotationPolicy,
+    /// Time-to-live in seconds for job data before cleanup.
+    pub job_data_ttl_seconds: u64,
+    /// Interval in seconds between cleanup runs.
+    pub job_data_clean_up_interval_seconds: u64,
+    /// The maximum size of a decoded message
+    pub grpc_max_decoding_message_size: u32,
+    /// The maximum size of an encoded message
+    pub grpc_max_encoding_message_size: u32,
+    /// gRPC server timeout configuration
+    pub grpc_server_config: GrpcServerConfig,
+    /// Interval in seconds between heartbeat messages.
+    pub executor_heartbeat_interval_seconds: u64,
+    /// Metric collection policy of this executor instance
+    pub metric_collection_policy: ExecutorMetricCollectionPolicy,
+    /// Optional total memory pool size in bytes. When set, every task's
+    /// runtime env receives a FairSpillPool of size
+    /// `memory_pool_size / vcores`. When `None`, no pool is
+    /// installed and DataFusion falls back to its unbounded default.
+    pub memory_pool_size: Option<u64>,
+    /// Fraction (0.0, 1.0] of the detected host/cgroup memory limit used for the
+    /// auto memory pool when `memory_pool_size` is `None`.
+    pub memory_pool_fraction: f64,
+    /// Maximum disk space spill files may use, applied to every runtime the
+    /// executor produces (including one from `override_runtime_producer`), so
+    /// per session runtime. When `None`, DataFusion's default limit applies.
+    pub max_temp_directory_size: Option<u64>,
+    /// Maximum number of sessions whose shared base runtime env is retained on
+    /// the executor (LRU). Sharing reuses object-store clients and the Parquet
+    /// footer cache across a session's tasks and queries. `0` disables caching
+    /// and builds a fresh runtime per task.
+    pub session_runtime_cache_capacity: usize,
+    /// Optional execution engine to use to execute physical plans, will default to
+    /// DataFusion if none is provided.
+    pub override_execution_engine: Option<Arc<dyn ExecutionEngine>>,
+    /// Overrides default function registry
+    pub override_function_registry: Option<Arc<BallistaFunctionRegistry>>,
+    /// [RuntimeProducer] override option
+    pub override_runtime_producer: Option<RuntimeProducer>,
+    /// [ConfigProducer] override option
+    pub override_config_producer: Option<ConfigProducer>,
+    /// [PhysicalExtensionCodec] override option
+    pub override_logical_codec: Option<Arc<dyn LogicalExtensionCodec>>,
+    /// [PhysicalExtensionCodec] override option
+    pub override_physical_codec: Option<Arc<dyn PhysicalExtensionCodec>>,
+    /// [ArrowFlightServerProvider] implementation override option
+    pub override_arrow_flight_service: Option<Arc<ArrowFlightServerProvider>>,
+    /// Override function for customizing gRPC client endpoints before they are used
+    pub override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
+    /// Number of seconds an established client connection is cached while idle.
+    /// `0` disables the pool, so every shuffle fetch opens and drops its own
+    /// connection and a shuffle-heavy query can exhaust the host's ephemeral
+    /// ports.
+    pub client_ttl: u64,
+    /// Shared readiness state that the heartbeat loops flip on every RPC
+    /// outcome. Embedders leave this as `Default::default()` and never
+    /// observe it; the standalone binary passes a handle here and also spawns
+    /// an HTTP server on it (see `bin/main.rs`).
+    pub health: crate::health::ExecutorHealth,
+}
+
+impl ExecutorProcessConfig {
+    /// Validates executor process configuration.
+    pub fn validate(&self) -> ballista_core::error::Result<()> {
+        if self.executor_id.trim().is_empty() {
+            return Err(BallistaError::Configuration(
+                "executor_id must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Generates a prefix for log file names based on executor host and port.
+    pub fn log_file_name_prefix(&self) -> String {
+        format!(
+            "executor_{}_{}",
+            self.external_host
+                .clone()
+                .unwrap_or_else(|| "localhost".to_string()),
+            self.port
+        )
+    }
+}
+
+impl Default for ExecutorProcessConfig {
+    fn default() -> Self {
+        Self {
+            executor_id: new_instance_id(),
+            bind_host: "127.0.0.1".into(),
+            external_host: None,
+            port: 50051,
+            grpc_port: 50052,
+            scheduler_host: "localhost".into(),
+            scheduler_port: 50050,
+            scheduler_connect_timeout_seconds: 0,
+            graceful_shutdown_timeout_seconds: 10,
+            vcores: std::thread::available_parallelism().unwrap().get(),
+            task_scheduling_policy: Default::default(),
+            log_dir: None,
+            work_dir: None,
+            special_mod_log_level: "INFO".into(),
+            print_thread_info: true,
+            log_rotation_policy: Default::default(),
+            job_data_ttl_seconds: 604800,
+            job_data_clean_up_interval_seconds: 0,
+            grpc_max_decoding_message_size: 16777216,
+            grpc_max_encoding_message_size: 16777216,
+            grpc_server_config: Default::default(),
+            executor_heartbeat_interval_seconds: 60,
+            metric_collection_policy: ExecutorMetricCollectionPolicy::default(),
+            memory_pool_size: None,
+            memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
+            max_temp_directory_size: None,
+            session_runtime_cache_capacity: 16,
+            override_execution_engine: None,
+            override_function_registry: None,
+            override_runtime_producer: None,
+            override_config_producer: None,
+            override_logical_codec: None,
+            override_physical_codec: None,
+            override_arrow_flight_service: None,
+            override_create_grpc_client_endpoint: None,
+            client_ttl: 30,
+            health: crate::health::ExecutorHealth::new(),
+        }
+    }
+}
+
+/// Starts the main executor process with the given configuration.
+///
+/// This function initializes all executor components including:
+/// - Arrow Flight service for shuffle data transfer
+/// - gRPC service for task management
+/// - Scheduler connection and registration
+/// - Heartbeat and cleanup background tasks
+///
+/// The function blocks until the executor receives a shutdown signal
+/// (SIGTERM, Ctrl+C, or stop request from scheduler).
+pub async fn start_executor_process(
+    opt: Arc<ExecutorProcessConfig>,
+) -> ballista_core::error::Result<()> {
+    start_executor_process_inner(opt, None).await
+}
+
+/// Starts an executor and exposes its resolved pool budget and live reservations.
+///
+/// Like [`start_executor_process`], this runs until shutdown. Metrics are observational:
+/// they do not wrap memory pools, change their limits, or retain completed task runtimes.
+pub async fn start_executor_process_with_memory_metrics(
+    opt: Arc<ExecutorProcessConfig>,
+    memory_metrics: ExecutorMemoryMetrics,
+) -> ballista_core::error::Result<()> {
+    start_executor_process_inner(opt, Some(memory_metrics)).await
+}
+
+async fn start_executor_process_inner(
+    opt: Arc<ExecutorProcessConfig>,
+    memory_metrics: Option<ExecutorMemoryMetrics>,
+) -> ballista_core::error::Result<()> {
+    opt.validate()?;
+
+    let addr = format!("{}:{}", opt.bind_host, opt.port);
+    let address = addr.parse().map_err(|e: std::net::AddrParseError| {
+        BallistaError::Configuration(e.to_string())
+    })?;
+
+    let scheduler_host = opt.scheduler_host.clone();
+    let scheduler_port = opt.scheduler_port;
+    let scheduler_url = format!("http://{scheduler_host}:{scheduler_port}");
+
+    let work_dir = if let Some(work_dir) = opt.work_dir.clone() {
+        work_dir
+    } else if let Some(temp_dir) = TempDir::new()?.path().to_str().map(ToOwned::to_owned)
+    {
+        temp_dir
+    } else {
+        return Err(BallistaError::Configuration(
+            "Unable to bind work dir".to_string(),
+        ));
+    };
+
+    let vcores = if opt.vcores == 0 {
+        // use all available cores if no concurrency level is specified
+        std::thread::available_parallelism().unwrap().get()
+    } else {
+        opt.vcores
+    };
+    let task_scheduling_policy = opt.task_scheduling_policy;
+    let executor_id = opt.executor_id.clone();
+    info!(
+        "Ballista Executor v{BALLISTA_VERSION} (DataFusion v{DATAFUSION_VERSION}) starting ..."
+    );
+    info!("Executor id: {executor_id}");
+    info!("Executor working directory: {work_dir}");
+    info!("Executor vcores (default: available CPU cores): {vcores}");
+    info!("Executor scheduling policy: {task_scheduling_policy:?}");
+
+    let executor_meta = structure_executor_metadata(&opt, vcores as u32);
+
+    // put them to session config
+    let metrics_collector = Arc::new(LoggingMetricsCollector::default());
+    let config_producer = opt
+        .override_config_producer
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_config_producer));
+
+    let wd = work_dir.clone();
+    let base_runtime_producer: RuntimeProducer =
+        opt.override_runtime_producer.clone().unwrap_or_else(|| {
+            Arc::new(move |_| {
+                let runtime_env = RuntimeEnvBuilder::new()
+                    .with_temp_file_path(wd.clone())
+                    .build()?;
+                Ok(Arc::new(runtime_env))
+            })
+        });
+    let base_runtime_producer = match opt.max_temp_directory_size {
+        Some(size) => {
+            info!("Executor spill disk limit: {}", bytesize::ByteSize::b(size));
+            with_max_temp_directory_size(base_runtime_producer, size)
+        }
+        None => base_runtime_producer,
+    };
+
+    let fraction = opt.memory_pool_fraction;
+    let pool_policy: MemoryPoolPolicy =
+        match detect_pool(memory_budget_from_cli(opt.memory_pool_size, fraction)) {
+            ResolvedPool::Bounded { bytes, source } => {
+                if let Some(metrics) = &memory_metrics {
+                    metrics.set_pool_size(Some(bytes));
+                }
+                let per_vcore = bytes / vcores as u64;
+                let source_desc = match source {
+                    PoolSource::Configured => {
+                        "configured via --memory-pool-size".to_string()
+                    }
+                    PoolSource::AutoCgroup => {
+                        format!("auto: {:.0}% of cgroup memory limit", fraction * 100.0)
+                    }
+                    PoolSource::AutoHost => {
+                        format!("auto: {:.0}% of host memory", fraction * 100.0)
+                    }
+                };
+                info!(
+                    "Executor memory pool: {} ({source_desc}), \
+                     split across {vcores} vcores ({}/vcore)",
+                    bytesize::ByteSize::b(bytes),
+                    bytesize::ByteSize::b(per_vcore),
+                );
+                memory_pool_policy(bytes, vcores)?
+            }
+            ResolvedPool::Unbounded(reason) => {
+                if let Some(metrics) = &memory_metrics {
+                    metrics.set_pool_size(None);
+                }
+                match reason {
+                    UnboundedReason::Explicit => {
+                        info!("Executor memory pool: unbounded (--memory-pool-size 0)")
+                    }
+                    UnboundedReason::Undetected => warn!(
+                        "Executor memory pool: unbounded (could not detect host or \
+                         cgroup memory limit; set --memory-pool-size to enable spilling)"
+                    ),
+                }
+                identity_pool_policy()
+            }
+        };
+
+    let pool_policy = if let Some(metrics) = memory_metrics.clone() {
+        observe_memory_pools(pool_policy, metrics)
+    } else {
+        pool_policy
+    };
+
+    // Combined producer preserving the current per-task behavior: build a fresh
+    // base env, then apply the pool policy. Used by `Executor::produce_runtime`
+    // and as the fallback when session caching is disabled.
+    // Session-level fallback (used only when no session cache is attached);
+    // per-task vcores aren't threaded here, so size the pool for the smallest
+    // task shape (1 vcore).
+    let runtime_producer: RuntimeProducer = {
+        let base = base_runtime_producer.clone();
+        let policy = pool_policy.clone();
+        Arc::new(move |config: &SessionConfig| policy(base(config)?, config, 1))
+    };
+
+    let logical = opt
+        .override_logical_codec
+        .clone()
+        .unwrap_or_else(|| Arc::new(BallistaLogicalExtensionCodec::default()));
+
+    let physical = opt
+        .override_physical_codec
+        .clone()
+        .unwrap_or_else(|| Arc::new(BallistaPhysicalExtensionCodec::default()));
+
+    let default_codec: BallistaCodec<
+        datafusion_proto::protobuf::LogicalPlanNode,
+        datafusion_proto::protobuf::PhysicalPlanNode,
+    > = BallistaCodec::new(logical, physical);
+
+    // Always attach the session cache: `pool_policy` wraps whatever base env
+    // the producer returns with a fresh per-task memory pool sized to the
+    // task's vcores, so an override producer (e.g. S3-aware) composes with
+    // the pool the same way the default one does.
+    let session_runtime_cache: Arc<dyn SessionRuntimeCache> =
+        Arc::new(DefaultSessionRuntimeCache::new(
+            base_runtime_producer.clone(),
+            pool_policy.clone(),
+            opt.session_runtime_cache_capacity,
+        ));
+
+    let executor = Arc::new(
+        Executor::new(
+            executor_meta.clone(),
+            &work_dir,
+            runtime_producer,
+            config_producer,
+            opt.override_function_registry.clone().unwrap_or_default(),
+            metrics_collector,
+            vcores,
+            opt.override_execution_engine.clone().unwrap_or_else(|| {
+                if opt.client_ttl > 0 {
+                    let client_pool =
+                        Arc::new(DefaultBallistaClientPool::with_eviction_thread(
+                            Duration::from_secs(opt.client_ttl),
+                        ));
+                    Arc::new(DefaultExecutionEngine::with_client_pool(client_pool))
+                } else {
+                    Arc::new(DefaultExecutionEngine::new())
+                }
+            }),
+        )
+        .with_session_runtime_cache(Some(session_runtime_cache))
+        .with_memory_metrics(memory_metrics),
+    );
+
+    let connect_timeout = opt.scheduler_connect_timeout_seconds as u64;
+    let session_config = (executor.config_producer)();
+    let ballista_config = session_config.ballista_config();
+    let grpc_config = GrpcClientConfig::from(&ballista_config);
+    let connection = if connect_timeout == 0 {
+        let mut endpoint = create_grpc_client_endpoint(scheduler_url, Some(&grpc_config))
+            .map_err(|_| {
+                BallistaError::GrpcConnectionError(
+                    "Could not create endpoint to scheduler".to_string(),
+                )
+            })?;
+
+        if let Some(ref override_fn) = opt.override_create_grpc_client_endpoint {
+            endpoint = override_fn(endpoint).map_err(|_| {
+                BallistaError::GrpcConnectionError(
+                    "Failed to apply endpoint override".to_string(),
+                )
+            })?;
+        }
+
+        endpoint.connect().await.map_err(|_| {
+            BallistaError::GrpcConnectionError(
+                "Could not connect to scheduler".to_string(),
+            )
+        })
+    } else {
+        // this feature was added to support docker-compose so that we can have the executor
+        // wait for the scheduler to start, or at least run for 10 seconds before failing so
+        // that docker-compose's restart policy will restart the container.
+        let start_time = Instant::now().elapsed().as_secs();
+        let mut x = None;
+        while x.is_none()
+            && Instant::now().elapsed().as_secs() - start_time < connect_timeout
+        {
+            match create_grpc_client_endpoint(scheduler_url.clone(), Some(&grpc_config)) {
+                Ok(mut endpoint) => {
+                    if let Some(ref override_fn) =
+                        opt.override_create_grpc_client_endpoint
+                    {
+                        match override_fn(endpoint) {
+                            Ok(overridden_endpoint) => endpoint = overridden_endpoint,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to apply endpoint override to scheduler at {scheduler_url} ({e}); retrying ..."
+                                );
+                                tokio::time::sleep(time::Duration::from_millis(500))
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
+
+                    match endpoint.connect().await {
+                        Ok(connection) => {
+                            info!("Connected to scheduler at {scheduler_url}");
+                            x = Some(connection);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to connect to scheduler at {scheduler_url} ({e}); retrying ..."
+                            );
+                            tokio::time::sleep(time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create endpoint to scheduler at {scheduler_url} ({e}); retrying ..."
+                    );
+                    tokio::time::sleep(time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        match x {
+            Some(conn) => Ok(conn),
+            _ => Err(BallistaError::General(format!(
+                "Timed out attempting to connect to scheduler at {scheduler_url}"
+            ))),
+        }
+    }?;
+
+    let mut scheduler = SchedulerGrpcClient::new(connection)
+        .max_encoding_message_size(opt.grpc_max_encoding_message_size as usize)
+        .max_decoding_message_size(opt.grpc_max_decoding_message_size as usize);
+
+    let scheduler_policy = opt.task_scheduling_policy;
+    let job_data_ttl_seconds = opt.job_data_ttl_seconds;
+
+    // Graceful shutdown notification
+    let shutdown_notification = ShutdownNotifier::new();
+    let flight_work_dir = work_dir.clone();
+    let clean_job_data_on_shutdown = opt.job_data_clean_up_interval_seconds > 0;
+
+    if clean_job_data_on_shutdown {
+        let mut interval_time =
+            time::interval(Duration::from_secs(opt.job_data_clean_up_interval_seconds));
+        let cleaner_work_dir = work_dir.clone();
+
+        let mut shuffle_cleaner_shutdown = shutdown_notification.subscribe_for_shutdown();
+        let shuffle_cleaner_complete = shutdown_notification.shutdown_complete_tx.clone();
+
+        tokio::spawn(async move {
+            // As long as the shutdown notification has not been received
+            while !shuffle_cleaner_shutdown.is_shutdown() {
+                tokio::select! {
+                    _ = interval_time.tick() => {
+                            if let Err(e) = clean_shuffle_data_loop(&cleaner_work_dir, job_data_ttl_seconds).await
+                        {
+                            error!("Ballista executor fail to clean_shuffle_data {e:?}")
+                        }
+                        },
+                    _ = shuffle_cleaner_shutdown.recv() => {
+                        drop(shuffle_cleaner_complete);
+                        return;
+                    }
+                };
+            }
+        });
+    }
+
+    let mut service_handlers: FuturesUnordered<JoinHandle<Result<(), BallistaError>>> =
+        FuturesUnordered::new();
+
+    // Channels used to receive stop requests from Executor grpc service.
+    let (stop_send, mut stop_recv) = mpsc::channel::<bool>(10);
+
+    // Shared readiness state, flipped by the heartbeat/poll_work loop. When
+    // the caller is the standalone binary, an HTTP probe server observes
+    // this same handle (see `bin/main.rs`); library embedders leave it
+    // unobserved.
+    let health = opt.health.clone();
+
+    // Starting main executor process based on the TaskSchedulingPolicy
+    //
+    // PushStaged => starting new executor_server that waits for tasks from the schedule
+    // PullStaged => executor is polling the scheduler when it is idle
+    match scheduler_policy {
+        TaskSchedulingPolicy::PushStaged => {
+            service_handlers.push(
+                // If there is executor registration error during startup, return the error and stop early.
+                executor_server::startup(
+                    scheduler.clone(),
+                    opt.clone(),
+                    executor.clone(),
+                    default_codec,
+                    stop_send,
+                    &shutdown_notification,
+                    health,
+                )
+                .await?,
+            );
+        }
+        _ => {
+            start_pull_heartbeater(
+                scheduler.clone(),
+                executor.clone(),
+                opt.metric_collection_policy,
+                opt.executor_heartbeat_interval_seconds,
+                &shutdown_notification,
+            );
+            let poll_loop = execution_loop::poll_loop(
+                scheduler.clone(),
+                executor.clone(),
+                default_codec,
+                None, // poll_now_notify
+                None, // free_vcores: use internal semaphore
+                health,
+            );
+            let mut poll_shutdown = shutdown_notification.subscribe_for_shutdown();
+            service_handlers.push(tokio::spawn(async move {
+                tokio::select! {
+                    result = poll_loop => result,
+                    _ = poll_shutdown.recv() => Ok(()),
+                }
+            }));
+        }
+    };
+    let shutdown = shutdown_notification.subscribe_for_shutdown();
+    let override_flight = opt.override_arrow_flight_service.clone();
+
+    service_handlers.push(match override_flight {
+        None => {
+            info!("Starting built-in arrow flight service");
+            flight_server_task(
+                flight_work_dir,
+                executor.pipelined_registry().clone(),
+                address,
+                shutdown,
+                opt.grpc_max_encoding_message_size as usize,
+                opt.grpc_max_decoding_message_size as usize,
+                opt.grpc_server_config.clone(),
+            )
+            .await
+        }
+        Some(flight_provider) => {
+            info!("Starting custom, user provided, arrow flight service");
+            (flight_provider)(
+                flight_work_dir,
+                address,
+                shutdown,
+                opt.grpc_server_config.clone(),
+            )
+        }
+    });
+
+    let tasks_drained = TasksDrainedFuture(executor.clone());
+
+    // Concurrently run the service checking and listen for the `shutdown` signal and wait for the stop request coming.
+    // The check_services runs until an error is encountered, so under normal circumstances, this `select!` statement runs
+    // until the `shutdown` signal is received or a stop request is coming.
+    let (notify_scheduler, stop_reason) = tokio::select! {
+        service_val = check_services(&mut service_handlers) => {
+            let msg = format!("executor services stopped with reason {service_val:?}");
+            info!("{msg:?}");
+            (true, msg)
+        },
+        signal = shutdown_signal() => {
+            (true, format!("executor received {signal}."))
+        },
+        _ = stop_recv.recv() => {
+            (false, "".to_string())
+        },
+    };
+
+    // Set status to fenced
+    info!("setting executor to TERMINATING status");
+    TERMINATING.store(true, Ordering::Release);
+
+    let ShutdownNotifier {
+        mut shutdown_complete_rx,
+        shutdown_complete_tx,
+        notify_shutdown,
+    } = shutdown_notification;
+
+    let graceful_shutdown = async {
+        if notify_scheduler {
+            // Send a heartbeat to update status of executor to `Fenced`. This should signal to the
+            // scheduler to no longer schedule tasks on this executor. It carries the latest
+            // metrics, which the scheduler keeps once the executor stops heartbeating.
+            if let Err(error) = scheduler
+                .heart_beat_from_executor(heartbeat_params(
+                    &executor,
+                    opt.metric_collection_policy,
+                ))
+                .await
+            {
+                error!("error sending heartbeat with fenced status: {error:?}");
+            }
+
+            // TODO we probably don't need a separate rpc call for this....
+            if let Err(error) = scheduler
+                .executor_stopped(ExecutorStoppedParams {
+                    executor_id,
+                    reason: stop_reason,
+                })
+                .await
+            {
+                error!("ExecutorStopped grpc failed: {error:?}");
+            }
+
+            // Wait for tasks to drain
+            tasks_drained.await;
+        }
+
+        // Signal all subscribed components to shut down.
+        let _ = notify_shutdown.send(());
+        // Drop final `Sender` so the `Receiver` below can complete
+        drop(shutdown_complete_tx);
+
+        // Wait for all related components to finish the shutdown processing.
+        let _ = shutdown_complete_rx.recv().await;
+        // Drain the servers, including Flight, before removing their shuffle data.
+        while !service_handlers.is_empty() {
+            if let Err(error) = check_services(&mut service_handlers).await {
+                error!("Executor service failed during shutdown: {error:?}");
+            }
+        }
+        if clean_job_data_on_shutdown {
+            if let Err(e) = clean_all_shuffle_data(&work_dir).await {
+                error!("Ballista executor fail to clean_shuffle_data {e:?}")
+            } else {
+                info!("Shuffle data cleaned.");
+            }
+        }
+    };
+
+    let shutdown_timeout = Duration::from_secs(opt.graceful_shutdown_timeout_seconds);
+    if let Err(timed_out) = drain_or_time_out(graceful_shutdown, shutdown_timeout).await {
+        warn!("aborting remaining services");
+        // A scheduler RPC or task drain may have timed out before broadcasting shutdown.
+        let _ = notify_shutdown.send(());
+        for service in &service_handlers {
+            service.abort();
+        }
+        return Err(timed_out.into());
+    }
+    info!("Executor stopped.");
+    Ok(())
+}
+
+// Arrow flight service
+async fn flight_server_task(
+    work_dir: String,
+    pipelined_registry: Arc<PipelinedRegistry>,
+    address: SocketAddr,
+    mut grpc_shutdown: Shutdown,
+    max_encoding_message_size: usize,
+    max_decoding_message_size: usize,
+    grpc_server_config: GrpcServerConfig,
+) -> JoinHandle<Result<(), BallistaError>> {
+    tokio::spawn(async move {
+        // Bound here rather than by `serve`, so the accept queue gets
+        // `listen_backlog` instead of the standard library's 128. Every
+        // reader task of a job on every executor connects to this port when
+        // the job starts.
+        let incoming = create_grpc_server_incoming(address, &grpc_server_config)
+            .inspect_err(|_| error!("Could not bind built-in arrow flight server."))?;
+        info!(
+            "Built-in arrow flight server listening on: {address:?} max_encoding_size: {max_encoding_message_size} max_decoding_size: {max_decoding_message_size}"
+        );
+
+        let server_future = create_grpc_server(&grpc_server_config)
+            .add_service(
+                FlightServiceServer::new(
+                    BallistaFlightService::new(work_dir)
+                        .with_pipelined_registry(pipelined_registry),
+                )
+                .max_decoding_message_size(max_decoding_message_size)
+                .max_encoding_message_size(max_encoding_message_size),
+            )
+            .serve_with_incoming_shutdown(incoming, grpc_shutdown.recv());
+
+        server_future.await.map_err(|e| {
+            error!("Could not start built-in arrow flight server.");
+            BallistaError::TonicError(e)
+        })
+    })
+}
+
+// Check the status of long running services
+async fn check_services(
+    service_handlers: &mut FuturesUnordered<JoinHandle<Result<(), BallistaError>>>,
+) -> Result<(), BallistaError> {
+    loop {
+        match service_handlers.next().await {
+            Some(result) => match result {
+                // React to "inner_result", i.e. propagate as BallistaError
+                Ok(inner_result) => match inner_result {
+                    Ok(()) => (),
+                    Err(e) => return Err(e),
+                },
+                // React to JoinError
+                Err(e) => return Err(BallistaError::TokioError(e)),
+            },
+            None => {
+                info!("service handlers are all done with their work!");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Sends periodic heartbeats from a pull-based executor so the scheduler sees
+/// its metrics and status, as it does for a push-based one.
+///
+/// The poll loop already keeps the executor alive, as it polls far more often
+/// than this. A failed heartbeat is logged and retried on the next interval;
+/// the executor's health, and shutting down when the scheduler is unreachable,
+/// stay with the poll loop.
+fn start_pull_heartbeater(
+    mut scheduler: SchedulerGrpcClient<Channel>,
+    executor: Arc<Executor>,
+    metric_collection_policy: ExecutorMetricCollectionPolicy,
+    interval_seconds: u64,
+    shutdown_notification: &ShutdownNotifier,
+) {
+    let mut shutdown = shutdown_notification.subscribe_for_shutdown();
+    let complete = shutdown_notification.shutdown_complete_tx.clone();
+    tokio::spawn(async move {
+        info!("Starting heartbeater to send metrics to the scheduler periodically");
+        while !shutdown.is_shutdown() {
+            let params = heartbeat_params(&executor, metric_collection_policy);
+            if let Err(e) = scheduler.heart_beat_from_executor(params).await {
+                warn!("Fail to send heartbeat to the scheduler due to {e:?}");
+            }
+            tokio::select! {
+                _ = time::sleep(Duration::from_secs(interval_seconds)) => {},
+                _ = shutdown.recv() => break,
+            };
+        }
+        info!("Stop heartbeater");
+        drop(complete);
+    });
+}
+
+/// This function will be scheduled periodically for cleanup the job shuffle data left on the executor.
+/// Only directories will be checked cleaned.
+async fn clean_shuffle_data_loop(
+    work_dir: &str,
+    seconds: u64,
+) -> ballista_core::error::Result<()> {
+    let mut dir = fs::read_dir(work_dir).await?;
+    let mut to_deleted = Vec::new();
+    while let Some(child) = dir.next_entry().await? {
+        if let Ok(metadata) = child.metadata().await {
+            let child_path = child.path().into_os_string();
+            // only delete the job dir
+            if metadata.is_dir() {
+                match satisfy_dir_ttl(child, seconds).await {
+                    Err(e) => {
+                        error!(
+                            "Fail to check ttl for the directory {child_path:?} due to {e:?}"
+                        )
+                    }
+                    Ok(false) => to_deleted.push(child_path),
+                    Ok(_) => {}
+                }
+            } else {
+                warn!(
+                    "{child_path:?} under the working directory is a not a directory and will be ignored when doing cleanup"
+                )
+            }
+        } else {
+            error!("Fail to get metadata for file {:?}", child.path())
+        }
+    }
+    info!(
+        "The directories {to_deleted:?} that have not been modified for {seconds:?} seconds so that they will be deleted"
+    );
+    for del in to_deleted {
+        if let Err(e) = fs::remove_dir_all(&del).await {
+            error!("Fail to remove the directory {del:?} due to {e}");
+        }
+    }
+    Ok(())
+}
+
+/// This function will clean up all shuffle data on this executor
+async fn clean_all_shuffle_data(work_dir: &str) -> ballista_core::error::Result<()> {
+    let mut dir = fs::read_dir(work_dir).await?;
+    let mut to_deleted = Vec::new();
+    while let Some(child) = dir.next_entry().await? {
+        if let Ok(metadata) = child.metadata().await {
+            // only delete the job dir
+            if metadata.is_dir() {
+                to_deleted.push(child.path().into_os_string())
+            }
+        } else {
+            error!("Can not get metadata from file: {child:?}")
+        }
+    }
+
+    info!("The work_dir {:?} will be deleted", to_deleted);
+    for del in to_deleted {
+        if let Err(e) = fs::remove_dir_all(&del).await {
+            error!("Fail to remove the directory {del:?} due to {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Remove job data under work_dir.
+/// Used by both push-based (gRPC handler) and pull-based (poll loop) cleanup.
+///
+/// `remove_stage_ids` empty ⇒ remove the whole `work_dir/{job_id}` dir (legacy
+/// behavior). Non-empty ⇒ remove only the listed `work_dir/{job_id}/{stage_id}`
+/// subdirs, retaining the rest of the job dir (e.g. the final-stage output).
+pub(crate) async fn remove_job_data(
+    work_dir: &str,
+    job_id: &JobId,
+    remove_stage_ids: &[u32],
+) -> ballista_core::error::Result<()> {
+    let work_path = PathBuf::from(&work_dir);
+    let job_path = work_path.join(job_id.as_str());
+
+    // Match legacy behavior: If the job path does not exist, return OK
+    if !tokio::fs::try_exists(&job_path).await.unwrap_or(false) {
+        return Ok(());
+    }
+
+    if !job_path.is_dir() {
+        return Err(BallistaError::General(format!(
+            "Path {job_path:?} is not a directory"
+        )));
+    } else if !is_subdirectory(job_path.as_path(), work_path.as_path()) {
+        return Err(BallistaError::General(format!(
+            "Path {job_path:?} is not a subdirectory of {work_path:?}"
+        )));
+    }
+
+    // Empty stage list ⇒ remove the whole job dir (legacy behavior).
+    if remove_stage_ids.is_empty() {
+        info!("Remove data for job {:?}", job_id);
+        return tokio::fs::remove_dir_all(&job_path).await.map_err(|e| {
+            BallistaError::General(format!("Failed to remove {job_path:?} due to {e}"))
+        });
+    }
+
+    // Otherwise remove only the given (intermediate) stage subdirs.
+    for stage_id in remove_stage_ids {
+        let stage_path = job_path.join(stage_id.to_string());
+        if !tokio::fs::try_exists(&stage_path).await.unwrap_or(false) {
+            continue;
+        }
+        if !is_subdirectory(stage_path.as_path(), job_path.as_path()) {
+            return Err(BallistaError::General(format!(
+                "Path {stage_path:?} is not a subdirectory of {job_path:?}"
+            )));
+        }
+        info!("Remove intermediate data for job {job_id:?} stage {stage_id}");
+        tokio::fs::remove_dir_all(&stage_path).await.map_err(|e| {
+            BallistaError::General(format!("Failed to remove {stage_path:?} due to {e}"))
+        })?;
+    }
+
+    Ok(())
+}
+
+// Check whether the path is the subdirectory of the base directory
+pub(crate) fn is_subdirectory(path: &Path, base_path: &Path) -> bool {
+    let path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let base = match base_path.canonicalize() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    path.parent().is_some_and(|p| p.starts_with(&base))
+}
+
+/// Checks if a directory should be retained based on its TTL.
+///
+/// Returns `Ok(true)` if the directory or any of its contents have been
+/// modified within the TTL period, meaning it should be kept.
+/// Returns `Ok(false)` if the directory is older than the TTL and can be deleted.
+pub async fn satisfy_dir_ttl(
+    dir: DirEntry,
+    ttl_seconds: u64,
+) -> ballista_core::error::Result<bool> {
+    let cutoff = get_time_before(ttl_seconds);
+
+    let mut to_check = vec![dir];
+    while let Some(dir) = to_check.pop() {
+        // Check the ttl for the current directory first
+        if dir
+            .metadata()
+            .await?
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs()
+            > cutoff
+        {
+            return Ok(true);
+        }
+        // Check its children
+        let mut children = fs::read_dir(dir.path()).await?;
+        while let Some(child) = children.next_entry().await? {
+            let metadata = child.metadata().await?;
+            if metadata.is_dir() {
+                to_check.push(child);
+            } else if metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs()
+                > cutoff
+            {
+                return Ok(true);
+            };
+        }
+    }
+
+    Ok(false)
+}
+
+/// Structuring executor's metadata to start the main process
+pub fn structure_executor_metadata(
+    options: &Arc<ExecutorProcessConfig>,
+    vcores: u32,
+) -> ExecutorRegistration {
+    let system_name =
+        System::name().unwrap_or_else(|| String::from("Unknown system name"));
+    let os_ver =
+        System::os_version().unwrap_or_else(|| String::from("Unknown OS version"));
+    let os_ver_long = System::long_os_version()
+        .unwrap_or_else(|| String::from("Unknown long OS version"));
+    let kernel_ver = System::kernel_long_version();
+
+    let physical_cores = System::physical_core_count().unwrap_or(0) as u32;
+    let open_files_limit = System::open_files_limit().unwrap_or(0) as u64;
+
+    let disks = Disks::new_with_refreshed_list();
+    let num_disks = disks.list().len() as u32;
+    let mut total_disk_space: u64 = 0;
+    let mut total_available_disk_space: u64 = 0;
+    for disk in &disks {
+        total_disk_space += disk.total_space();
+        total_available_disk_space += disk.available_space();
+    }
+
+    ExecutorRegistration {
+        id: options.executor_id.clone(),
+        host: options.external_host.clone(),
+        port: options.port as u32,
+        grpc_port: options.grpc_port as u32,
+        specification: Some(ExecutorSpecification {
+            resources: vec![ExecutorResource {
+                resource: Some(Resource::Vcores(vcores)),
+            }],
+        }),
+        os_info: Some(ExecutorOperatingSystemSpecification {
+            system_name,
+            kernel_ver,
+            os_ver,
+            os_ver_long,
+            physical_cores,
+            num_disks,
+            total_disk_space,
+            total_available_disk_space,
+            open_files_limit,
+        }),
+        ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::executor_process::is_subdirectory;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use super::ExecutorProcessConfig;
+    use super::clean_shuffle_data_loop;
+    use super::remove_job_data;
+    use super::structure_executor_metadata;
+    use ballista_core::BALLISTA_PROTOCOL_VERSION;
+    use ballista_core::JobId;
+    use ballista_core::ids::new_instance_id;
+    use ballista_core::serde::protobuf::executor_resource::Resource;
+    use std::fs;
+    use std::fs::File;
+    use std::io::Write;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[test]
+    fn executor_metadata_reflects_process_configuration() {
+        let executor_id = new_instance_id();
+        let config = Arc::new(ExecutorProcessConfig {
+            executor_id: executor_id.clone(),
+            external_host: Some("executor.example.com".to_string()),
+            port: 10051,
+            grpc_port: 10052,
+            ..ExecutorProcessConfig::default()
+        });
+
+        let metadata = structure_executor_metadata(&config, 4);
+
+        assert_eq!(metadata.id, executor_id);
+        uuid::Uuid::parse_str(&metadata.id).unwrap();
+        assert_eq!(metadata.host.as_deref(), Some("executor.example.com"));
+        assert_eq!(metadata.port, 10051);
+        assert_eq!(metadata.grpc_port, 10052);
+        assert_eq!(
+            metadata
+                .specification
+                .as_ref()
+                .and_then(|spec| spec.resources.first())
+                .and_then(|resource| resource.resource.as_ref()),
+            Some(&Resource::Vcores(4))
+        );
+        assert!(metadata.os_info.is_some());
+        assert_eq!(
+            metadata.ballista_protocol_version,
+            BALLISTA_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn default_executor_id_is_uuid() {
+        let config = ExecutorProcessConfig::default();
+
+        uuid::Uuid::parse_str(&config.executor_id).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_empty_executor_id() {
+        let config = ExecutorProcessConfig {
+            executor_id: " ".to_string(),
+            ..ExecutorProcessConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("executor_id"));
+    }
+
+    #[tokio::test]
+    async fn test_executor_clean_up() {
+        let work_dir = TempDir::new().unwrap();
+        let work_dir_clone = work_dir.path().to_owned();
+        let job_dir = work_dir_clone.join("job_id");
+        let file_path = job_dir.as_path().join("tmp.csv");
+        let data = "Jorge,2018-12-13T12:12:10.011Z\n\
+                    Andrew,2018-11-13T17:11:10.011Z";
+        fs::create_dir(job_dir).unwrap();
+        File::create(&file_path)
+            .expect("creating temp file")
+            .write_all(data.as_bytes())
+            .expect("writing data");
+
+        let work_dir_cloned = work_dir_clone.clone();
+
+        let count1 = fs::read_dir(&work_dir_clone).unwrap().count();
+        assert_eq!(count1, 1);
+        let mut handles = vec![];
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            clean_shuffle_data_loop(work_dir_cloned.to_str().unwrap(), 1)
+                .await
+                .unwrap();
+        }));
+        futures::future::join_all(handles).await;
+        let count2 = fs::read_dir(work_dir_clone).unwrap().count();
+        assert_eq!(count2, 0);
+    }
+
+    #[tokio::test]
+    async fn test_arrow_flight_provider_ergonomics() {
+        let config = crate::executor_process::ExecutorProcessConfig {
+            override_arrow_flight_service: Some(std::sync::Arc::new(
+                move |work_dir, address, mut grpc_shutdown, ballista_config| {
+                    tokio::spawn(async move {
+                        log::info!(
+                            "custom arrow flight server listening on: {address:?}"
+                        );
+
+                        let server_future = ballista_core::utils::create_grpc_server(
+                            &ballista_config,
+                        )
+                        .add_service(
+                            arrow_flight::flight_service_server::FlightServiceServer::new(
+                                crate::flight_service::BallistaFlightService::new(
+                                    work_dir,
+                                ),
+                            ),
+                        )
+                        .serve_with_shutdown(address, grpc_shutdown.recv());
+
+                        server_future.await.map_err(|e| {
+                            log::error!("Could not start built-in arrow flight server.");
+                            ballista_core::error::BallistaError::TonicError(e)
+                        })
+                    })
+                },
+            )),
+            ..Default::default()
+        };
+
+        assert!(config.override_arrow_flight_service.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_is_subdirectory() {
+        let base_dir = TempDir::new().unwrap();
+        let base_dir = base_dir.path();
+
+        // Normal correct one
+        {
+            let job_path = prepare_testing_job_directory(base_dir, &"job_a".into());
+            assert!(is_subdirectory(&job_path, base_dir));
+        }
+
+        // Empty job id
+        {
+            let job_path = prepare_testing_job_directory(base_dir, &"".into());
+            assert!(!is_subdirectory(&job_path, base_dir));
+
+            let job_path = prepare_testing_job_directory(base_dir, &".".into());
+            assert!(!is_subdirectory(&job_path, base_dir));
+        }
+
+        // Malicious job id
+        {
+            let job_path = prepare_testing_job_directory(base_dir, &"..".into());
+            assert!(!is_subdirectory(&job_path, base_dir));
+        }
+    }
+    #[tokio::test]
+    async fn test_remove_intermediate_stage_data() {
+        let work_dir = TempDir::new().unwrap();
+        let work = work_dir.path();
+        let job_id: JobId = "job".into();
+
+        // Create job/1, job/2, job/3, each with a data file.
+        for stage in [1u32, 2, 3] {
+            let stage_dir = work.join("job").join(stage.to_string());
+            fs::create_dir_all(&stage_dir).unwrap();
+            File::create(stage_dir.join("data.arrow"))
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+        }
+
+        // Remove intermediate stages 1 and 2; stage 3 (final) is retained.
+        remove_job_data(work.to_str().unwrap(), &job_id, &[1, 2])
+            .await
+            .unwrap();
+        assert!(!work.join("job").join("1").exists());
+        assert!(!work.join("job").join("2").exists());
+        assert!(work.join("job").join("3").exists());
+
+        // Removing a missing stage id is a no-op (idempotent).
+        remove_job_data(work.to_str().unwrap(), &job_id, &[99])
+            .await
+            .unwrap();
+        assert!(work.join("job").join("3").exists());
+
+        // Empty list removes the whole job dir.
+        remove_job_data(work.to_str().unwrap(), &job_id, &[])
+            .await
+            .unwrap();
+        assert!(!work.join("job").exists());
+    }
+
+    fn prepare_testing_job_directory(base_dir: &Path, job_id: &JobId) -> PathBuf {
+        let mut path = base_dir.to_path_buf();
+        path.push(job_id.as_str());
+        if !path.exists() {
+            fs::create_dir(&path).unwrap();
+        }
+        path
+    }
+}
+
+#[cfg(test)]
+mod memory_pool_tests {
+    use super::*;
+    use datafusion::execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryLimit,
+    };
+    use datafusion::execution::object_store::DefaultObjectStoreRegistry;
+    use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+    use std::sync::Arc;
+
+    #[test]
+    fn observes_per_task_pools_without_changing_their_limits() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(Some(8192));
+        let policy =
+            observe_memory_pools(memory_pool_policy(8192, 8).unwrap(), metrics.clone());
+        let base = Arc::new(RuntimeEnv::default());
+        let first = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
+        let second = policy(base, &SessionConfig::new(), 4).unwrap();
+        assert!(first.memory_pool.is::<TrackConsumersPool<FairSpillPool>>());
+        assert!(matches!(
+            first.memory_pool.memory_limit(),
+            MemoryLimit::Finite(1024)
+        ));
+        assert!(matches!(
+            second.memory_pool.memory_limit(),
+            MemoryLimit::Finite(4096)
+        ));
+        let first_reservation = MemoryConsumer::new("first").register(&first.memory_pool);
+        let second_reservation =
+            MemoryConsumer::new("second").register(&second.memory_pool);
+        first_reservation.try_grow(128).unwrap();
+        second_reservation.try_grow(256).unwrap();
+        let usage = metrics.snapshot().unwrap();
+        assert_eq!(usage.pool_size, Some(8192));
+        assert_eq!(usage.reserved, 384);
+        assert_eq!(usage.pool_count, 2);
+        drop(first_reservation);
+        drop(second_reservation);
+        drop(first);
+        drop(second);
+        assert_eq!(metrics.snapshot().unwrap().pool_count, 0);
+    }
+
+    #[test]
+    fn observes_custom_shared_pool_without_wrapping_or_double_counting() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(None);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let base = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .build_arc()
+            .unwrap();
+        let policy = observe_memory_pools(identity_pool_policy(), metrics.clone());
+        let first = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
+        let second = policy(base.clone(), &SessionConfig::new(), 4).unwrap();
+        assert!(Arc::ptr_eq(&first, &base));
+        assert!(Arc::ptr_eq(&second, &base));
+        assert!(first.memory_pool.is::<GreedyMemoryPool>());
+        let reservation = MemoryConsumer::new("custom").register(&pool);
+        reservation.try_grow(128).unwrap();
+        assert_eq!(metrics.snapshot().unwrap().reserved, 128);
+        assert_eq!(metrics.snapshot().unwrap().pool_count, 1);
+        assert_eq!(metrics.snapshot().unwrap().pool_size, None);
+    }
+
+    #[test]
+    fn observes_cached_session_task_pools_without_retaining_them() {
+        let metrics = ExecutorMemoryMetrics::default();
+        metrics.set_pool_size(Some(8192));
+        let policy =
+            observe_memory_pools(memory_pool_policy(8192, 8).unwrap(), metrics.clone());
+        let cache = DefaultSessionRuntimeCache::new(
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default()))),
+            policy,
+            2,
+        );
+        let config = SessionConfig::new();
+        let first = cache.produce_runtime("session", &config, 1).unwrap();
+        let second = cache.produce_runtime("session", &config, 4).unwrap();
+        assert_eq!(metrics.snapshot().unwrap().pool_count, 2);
+        let reservation = MemoryConsumer::new("cached").register(&second.memory_pool);
+        reservation.try_grow(256).unwrap();
+        assert_eq!(metrics.snapshot().unwrap().reserved, 256);
+        drop(reservation);
+        drop(first);
+        drop(second);
+        assert_eq!(metrics.snapshot().unwrap().pool_count, 0);
+    }
+
+    #[test]
+    fn returns_error_when_total_smaller_than_vcores() {
+        let result = memory_pool_policy(4, 8);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("memory_pool_size"));
+        assert!(msg.contains("vcores"));
+    }
+
+    #[test]
+    fn produces_runtime_with_fair_spill_pool_scaled_by_vcores() {
+        let total = 8u64 * 1024 * 1024 * 1024;
+        let vcores = 8usize;
+        let per_vcore = (total / vcores as u64) as usize;
+
+        let policy = memory_pool_policy(total, vcores).unwrap();
+        let base = Arc::new(RuntimeEnv::default());
+
+        // A 1-vcore task gets the per-vcore share; a 4-vcore task gets 4×.
+        let env_1 = policy(base.clone(), &SessionConfig::new(), 1).unwrap();
+        let env_4 = policy(base, &SessionConfig::new(), 4).unwrap();
+
+        match env_1.memory_pool.memory_limit() {
+            MemoryLimit::Finite(n) => assert_eq!(n, per_vcore),
+            MemoryLimit::Infinite => panic!("expected Finite, got Infinite"),
+            MemoryLimit::Unknown => panic!("expected Finite, got Unknown"),
+        }
+        match env_4.memory_pool.memory_limit() {
+            MemoryLimit::Finite(n) => assert_eq!(n, per_vcore * 4),
+            MemoryLimit::Infinite => panic!("expected Finite, got Infinite"),
+            MemoryLimit::Unknown => panic!("expected Finite, got Unknown"),
+        }
+    }
+
+    #[test]
+    fn exhausted_memory_error_names_the_largest_consumers() {
+        let policy = memory_pool_policy(1024, 1).unwrap();
+        let env =
+            policy(Arc::new(RuntimeEnv::default()), &SessionConfig::new(), 1).unwrap();
+
+        let build = MemoryConsumer::new("HashJoinInput").register(&env.memory_pool);
+        build.try_grow(1000).unwrap();
+        // 1000 + 100 bytes doesn't fit the 1024-byte pool, so the sorter is refused.
+        let sort = MemoryConsumer::new("ExternalSorter").register(&env.memory_pool);
+        let err = sort.try_grow(100).unwrap_err().to_string();
+
+        // FairSpillPool's own error only names the consumer that was refused.
+        assert!(err.contains("HashJoinInput"), "{err}");
+    }
+
+    #[test]
+    fn preserves_base_object_store_registry() {
+        let registry: Arc<dyn datafusion::execution::object_store::ObjectStoreRegistry> =
+            Arc::new(DefaultObjectStoreRegistry::new());
+        let base = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_object_store_registry(registry.clone())
+                .build()
+                .unwrap(),
+        );
+
+        let policy = memory_pool_policy(1024, 1).unwrap();
+        let env = policy(base, &SessionConfig::new(), 1).unwrap();
+
+        assert!(Arc::ptr_eq(&env.object_store_registry, &registry));
+    }
+
+    #[test]
+    fn identity_policy_returns_base_unchanged() {
+        let base = Arc::new(RuntimeEnv::default());
+        let env = identity_pool_policy()(base.clone(), &SessionConfig::new(), 1).unwrap();
+        assert!(Arc::ptr_eq(&env, &base));
+    }
+
+    #[test]
+    fn budget_from_cli_classifies_none_zero_and_positive() {
+        assert_eq!(
+            memory_budget_from_cli(None, 0.7),
+            MemoryBudget::Auto { fraction: 0.7 }
+        );
+        assert_eq!(
+            memory_budget_from_cli(Some(0), 0.7),
+            MemoryBudget::Unbounded
+        );
+        assert_eq!(
+            memory_budget_from_cli(Some(1024), 0.7),
+            MemoryBudget::Bytes(1024)
+        );
+    }
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn resolve_explicit_bytes_ignores_detection() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Bytes(4 * GB), Some(32 * GB), Some(8 * GB)),
+            ResolvedPool::Bounded {
+                bytes: 4 * GB,
+                source: PoolSource::Configured
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_unbounded_is_explicit() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Unbounded, Some(32 * GB), None),
+            ResolvedPool::Unbounded(UnboundedReason::Explicit)
+        );
+    }
+
+    #[test]
+    fn resolve_auto_prefers_cgroup_when_smaller() {
+        let expected = ((8 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.70 },
+                Some(32 * GB),
+                Some(8 * GB)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_honors_custom_fraction() {
+        let expected = ((8 * GB) as f64 * 0.50) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.50 },
+                Some(32 * GB),
+                Some(8 * GB)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_falls_back_to_host_when_cgroup_unlimited_sentinel() {
+        // cgroup v1 "unlimited" reports a value larger than host; min() picks host.
+        let expected = ((32 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(
+                MemoryBudget::Auto { fraction: 0.70 },
+                Some(32 * GB),
+                Some(u64::MAX)
+            ),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoHost
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_host_only() {
+        let expected = ((32 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, Some(32 * GB), None),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoHost
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_cgroup_only() {
+        let expected = ((8 * GB) as f64 * 0.70) as u64;
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, None, Some(8 * GB)),
+            ResolvedPool::Bounded {
+                bytes: expected,
+                source: PoolSource::AutoCgroup
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_auto_undetected_is_unbounded() {
+        assert_eq!(
+            resolve_pool(MemoryBudget::Auto { fraction: 0.70 }, None, None),
+            ResolvedPool::Unbounded(UnboundedReason::Undetected)
+        );
+    }
+
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cgroup_v2_reads_numeric_limit() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("memory.max"), "8589934592").unwrap();
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(8 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_max_means_unlimited() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("memory.max"), "max\n").unwrap();
+        assert_eq!(read_cgroup_memory_limit(dir.path()), None);
+    }
+
+    #[test]
+    fn cgroup_v1_reads_numeric_limit() {
+        let dir = tempdir().unwrap();
+        let v1 = dir.path().join("memory");
+        fs::create_dir_all(&v1).unwrap();
+        fs::write(v1.join("memory.limit_in_bytes"), "8589934592\n").unwrap();
+        assert_eq!(
+            read_cgroup_memory_limit(dir.path()),
+            Some(8 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cgroup_absent_returns_none() {
+        let dir = tempdir().unwrap();
+        assert_eq!(read_cgroup_memory_limit(dir.path()), None);
+    }
+}
+
+#[cfg(test)]
+mod spill_limit_tests {
+    use super::*;
+    use datafusion::execution::disk_manager::DEFAULT_MAX_TEMP_DIRECTORY_SIZE;
+
+    #[test]
+    fn applies_spill_limit_to_custom_runtime_producer() {
+        let work_dir = TempDir::new().unwrap();
+        let path = work_dir.path().to_path_buf();
+        let producer: RuntimeProducer = Arc::new(move |_: &SessionConfig| {
+            RuntimeEnvBuilder::new()
+                .with_temp_file_path(path.clone())
+                .build_arc()
+        });
+        let unlimited = producer(&SessionConfig::new()).unwrap();
+        assert_eq!(
+            unlimited.disk_manager.max_temp_directory_size(),
+            DEFAULT_MAX_TEMP_DIRECTORY_SIZE
+        );
+
+        let producer = with_max_temp_directory_size(producer, 1024);
+        let runtime = producer(&SessionConfig::new()).unwrap();
+        assert_eq!(runtime.disk_manager.max_temp_directory_size(), 1024);
+    }
+
+    #[test]
+    fn spill_dir_relocates_spills_and_keeps_runtime_state() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1 << 20));
+        let base = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()
+            .unwrap();
+        let producer: RuntimeProducer = {
+            let base = base.clone();
+            Arc::new(move |_: &SessionConfig| Ok(base.clone()))
+        };
+        // The base runtime spills to the OS temp dir.
+        assert!(base.disk_manager.temp_dir_paths().is_empty());
+
+        let work_dir = TempDir::new().unwrap();
+        let spill_dir = work_dir.path().to_str().unwrap().to_string();
+        let producer =
+            with_max_temp_directory_size(with_spill_dir(producer, spill_dir), 2048);
+        let runtime = producer(&SessionConfig::new()).unwrap();
+
+        let paths = runtime.disk_manager.temp_dir_paths();
+        assert!(!paths.is_empty());
+        assert!(
+            paths.iter().all(|p| p.starts_with(work_dir.path())),
+            "{paths:?}"
+        );
+        assert_eq!(runtime.disk_manager.max_temp_directory_size(), 2048);
+        assert!(Arc::ptr_eq(&runtime.memory_pool, &base.memory_pool));
+        assert!(Arc::ptr_eq(
+            &runtime.object_store_registry,
+            &base.object_store_registry
+        ));
+    }
+}

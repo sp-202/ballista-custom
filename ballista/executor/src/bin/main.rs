@@ -1,0 +1,154 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Ballista Rust executor binary.
+
+use ballista_core::RuntimeProducer;
+use ballista_core::config::LogRotationPolicy;
+use ballista_core::error::BallistaError;
+use ballista_core::object_store::{
+    runtime_env_with_s3_support, session_config_with_s3_support,
+};
+use ballista_executor::alloc_accounting::{AccountingAllocator, current_balance};
+use ballista_executor::config::Config;
+use ballista_executor::executor_process::{
+    ExecutorProcessConfig, start_executor_process_with_memory_metrics, with_spill_dir,
+};
+use ballista_executor::health::spawn_health_server;
+use ballista_executor::metrics::ExecutorMemoryMetrics;
+use clap::Parser;
+use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
+use tracing_subscriber::EnvFilter;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: AccountingAllocator<mimalloc::MiMalloc> =
+    AccountingAllocator::new(mimalloc::MiMalloc);
+
+#[cfg(not(feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL: AccountingAllocator<std::alloc::System> =
+    AccountingAllocator::new(std::alloc::System);
+
+#[tokio::main]
+async fn main() -> ballista_core::error::Result<()> {
+    // parse command-line arguments
+    let opt = Config::parse();
+    let bind_host = opt.bind_host.clone();
+    let bind_health_port = opt.bind_health_port;
+
+    let mut config: ExecutorProcessConfig = opt.try_into()?;
+    config.override_config_producer = Some(Arc::new(session_config_with_s3_support));
+    let s3_runtime: RuntimeProducer = Arc::new(runtime_env_with_s3_support);
+    // Spill under --work-dir, as the executor's default runtime does, rather
+    // than in the OS temp dir the S3 runtime would otherwise use.
+    config.override_runtime_producer = Some(match config.work_dir.clone() {
+        Some(work_dir) => with_spill_dir(s3_runtime, work_dir),
+        None => s3_runtime,
+    });
+
+    let rust_log = env::var(EnvFilter::DEFAULT_ENV);
+    let log_filter =
+        EnvFilter::new(rust_log.unwrap_or(config.special_mod_log_level.clone()));
+
+    let tracing = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_thread_names(config.print_thread_info)
+        .with_thread_ids(config.print_thread_info)
+        .with_env_filter(log_filter);
+
+    // File layer
+    if let Some(log_dir) = &config.log_dir {
+        let log_file = match config.log_rotation_policy {
+            LogRotationPolicy::Minutely => tracing_appender::rolling::minutely(
+                log_dir,
+                config.log_file_name_prefix(),
+            ),
+            LogRotationPolicy::Hourly => {
+                tracing_appender::rolling::hourly(log_dir, config.log_file_name_prefix())
+            }
+            LogRotationPolicy::Daily => {
+                tracing_appender::rolling::daily(log_dir, config.log_file_name_prefix())
+            }
+            LogRotationPolicy::Never => {
+                tracing_appender::rolling::never(log_dir, config.log_file_name_prefix())
+            }
+        };
+
+        tracing.with_writer(log_file).init();
+    } else {
+        tracing.init();
+    }
+
+    let memory_metrics = ExecutorMemoryMetrics::default();
+    // This binary installs `AccountingAllocator` as its global allocator, so
+    // its balance can be reported alongside the pool usage.
+    memory_metrics.set_allocated_bytes_source(current_balance);
+    let logging_metrics = memory_metrics.clone();
+    let memory_logging = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Some(usage) = logging_metrics.snapshot() {
+                let pool_size = usage.pool_size.map_or_else(
+                    || "unbounded".to_string(),
+                    |bytes| format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)),
+                );
+                log::info!(
+                    "Ballista executor memory usage: allocated {:.1} MiB, \
+                     reserved {:.1} MiB, pool size {pool_size} ({} live pools)",
+                    logging_metrics.allocated_bytes().unwrap_or_default() as f64
+                        / (1024.0 * 1024.0),
+                    usage.reserved as f64 / (1024.0 * 1024.0),
+                    usage.pool_count,
+                );
+            }
+        }
+    });
+
+    // Kubernetes-style health probes are a concern of the standalone binary,
+    // not of the library, so wire them here on top of the config's shared
+    // ExecutorHealth handle. `/healthz` is process-liveness, `/readyz`
+    // reflects heartbeat state (see `ballista_executor::health`).
+    let health = config.health.clone();
+    let health_addr: SocketAddr = format!("{bind_host}:{bind_health_port}")
+        .parse()
+        .map_err(|e| {
+            BallistaError::General(format!("invalid --bind-health-port address: {e}"))
+        })?;
+    let (health_shutdown_tx, health_shutdown_rx) = tokio::sync::oneshot::channel();
+    let health_handle = spawn_health_server(health_addr, health, health_shutdown_rx);
+
+    let result =
+        start_executor_process_with_memory_metrics(Arc::new(config), memory_metrics)
+            .await;
+
+    memory_logging.abort();
+    let _ = memory_logging.await;
+
+    // Ask the health server to shut down so the process can exit cleanly.
+    let _ = health_shutdown_tx.send(());
+    if let Err(e) = health_handle.await {
+        log::warn!("health server task join error: {e}");
+    }
+    result
+}

@@ -1,0 +1,3265 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! This crate contains code generated from the Ballista Protocol Buffer Definition as well
+//! as convenience code for interacting with the generated code.
+
+use crate::extension::BallistaCacheNode;
+use crate::{error::BallistaError, serde::scheduler::Action as BallistaAction};
+
+use arrow_flight::sql::ProstMessageExt;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::{DataFusionError, Result};
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Extension;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion_proto::logical_plan::file_formats::{
+    ArrowLogicalExtensionCodec, AvroLogicalExtensionCodec, CsvLogicalExtensionCodec,
+    JsonLogicalExtensionCodec, ParquetLogicalExtensionCodec,
+};
+use datafusion_proto::physical_plan::from_proto::parse_physical_sort_exprs;
+use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
+use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
+use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
+use datafusion_proto::physical_plan::to_proto::serialize_physical_sort_exprs;
+use datafusion_proto::physical_plan::{
+    DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
+    PhysicalPlanDecodeContext, PhysicalProtoConverterExtension,
+};
+use datafusion_proto::protobuf::proto_error;
+use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+use datafusion_proto::{
+    convert_required,
+    logical_plan::{AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec},
+    physical_plan::{AsExecutionPlan, PhysicalExtensionCodec},
+};
+
+use prost::Message;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::{convert::TryInto, io::Cursor};
+
+use crate::execution_plans::sort_shuffle::SortShuffleConfig;
+use crate::execution_plans::{
+    BufferExec, BufferMode, ChaosExec, CoalescePlan, FinalizedPartitionState, InputOrder,
+    OrderedRangeRepartitionExec, PartitionGroup, PartitionedBoundedWindowAggExec,
+    PerPartitionFilterExec, PipelinedShuffleReaderExec, PipelinedShuffleWriterExec,
+    PrefixMergeExec, RangeFilterExec, RangeShuffleReaderExec, RangeShuffleWriterExec,
+    RuntimeStatsExec, ScalarOp, ShuffleReaderExec, ShuffleWriterExec,
+    SortShuffleWriterExec, UnorderedRangeRepartitionExec, UnresolvedShuffleExec,
+    WindowApply,
+};
+use crate::serde::protobuf::{
+    ballista_logical_plan_node::LogicalPlanType,
+    ballista_physical_plan_node::PhysicalPlanType,
+};
+use crate::serde::scheduler::PartitionLocation;
+use datafusion::arrow::compute::SortOptions;
+use datafusion::execution::FunctionRegistry;
+pub use generated::ballista as protobuf;
+
+/// Generated protobuf code from Ballista protocol definitions.
+pub mod generated;
+/// Scheduler-specific serialization types and conversions.
+pub mod scheduler;
+
+// ============================ CoalescePlan codec ============================
+//
+// Native ↔ proto conversions for `CoalescePlan` and `PartitionGroup`. Borrow-
+// based on the encode side because the call site only has a borrow
+// (`exec.coalesce.as_ref()`); the `Vec<u32>` clone is intentional and cheap
+// for typical K (small post-coalesce partition counts).
+
+impl From<&protobuf::PartitionGroup> for PartitionGroup {
+    fn from(p: &protobuf::PartitionGroup) -> Self {
+        Self {
+            upstream_indices: p.upstream_indices.clone(),
+        }
+    }
+}
+
+impl From<&PartitionGroup> for protobuf::PartitionGroup {
+    fn from(p: &PartitionGroup) -> Self {
+        Self {
+            upstream_indices: p.upstream_indices.clone(),
+        }
+    }
+}
+
+impl From<&protobuf::CoalescePlan> for CoalescePlan {
+    fn from(p: &protobuf::CoalescePlan) -> Self {
+        Self {
+            upstream_partition_count: p.upstream_partition_count,
+            groups: p.groups.iter().map(PartitionGroup::from).collect(),
+        }
+    }
+}
+
+impl From<&CoalescePlan> for protobuf::CoalescePlan {
+    fn from(p: &CoalescePlan) -> Self {
+        Self {
+            upstream_partition_count: p.upstream_partition_count,
+            groups: p.groups.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl ProstMessageExt for protobuf::Action {
+    fn type_url() -> &'static str {
+        "type.googleapis.com/arrow.flight.protocol.sql.Action"
+    }
+
+    fn as_any(&self) -> arrow_flight::sql::Any {
+        arrow_flight::sql::Any {
+            type_url: protobuf::Action::type_url().to_string(),
+            value: self.encode_to_vec().into(),
+        }
+    }
+}
+
+/// Encodes the `Hash` partitioning a shuffle writer applies to its output.
+fn serialize_hash_partitioning(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    partition_count: usize,
+    codec: &dyn PhysicalExtensionCodec,
+) -> Result<datafusion_proto::protobuf::PhysicalHashRepartition, DataFusionError> {
+    Ok(datafusion_proto::protobuf::PhysicalHashRepartition {
+        hash_expr: exprs
+            .iter()
+            .map(|expr| {
+                datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                    expr, codec,
+                )
+            })
+            .collect::<Result<Vec<_>, DataFusionError>>()?,
+        partition_count: partition_count as u64,
+    })
+}
+
+/// Encodes a Ballista action as protobuf bytes, the inverse of
+/// [`decode_protobuf`].
+pub fn encode_protobuf(action: BallistaAction) -> Result<Vec<u8>, BallistaError> {
+    let action: protobuf::Action = action.try_into()?;
+    Ok(action.encode_to_vec())
+}
+
+/// Decodes a Ballista action from protobuf bytes.
+pub fn decode_protobuf(bytes: &[u8]) -> Result<BallistaAction, BallistaError> {
+    let mut buf = Cursor::new(bytes);
+
+    protobuf::Action::decode(&mut buf)
+        .map_err(|e| BallistaError::Internal(format!("{e:?}")))
+        .and_then(|node| node.try_into())
+}
+
+/// Codec for serializing and deserializing Ballista logical and physical plans.
+#[derive(Clone, Debug)]
+pub struct BallistaCodec<
+    T: 'static + AsLogicalPlan = LogicalPlanNode,
+    U: 'static + AsExecutionPlan = PhysicalPlanNode,
+> {
+    logical_extension_codec: Arc<dyn LogicalExtensionCodec>,
+    physical_extension_codec: Arc<dyn PhysicalExtensionCodec>,
+    logical_plan_repr: PhantomData<T>,
+    physical_plan_repr: PhantomData<U>,
+}
+
+impl Default for BallistaCodec {
+    fn default() -> Self {
+        Self {
+            logical_extension_codec: Arc::new(BallistaLogicalExtensionCodec::default()),
+            physical_extension_codec: Arc::new(BallistaPhysicalExtensionCodec::default()),
+            logical_plan_repr: PhantomData,
+            physical_plan_repr: PhantomData,
+        }
+    }
+}
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> BallistaCodec<T, U> {
+    /// Creates a new Ballista codec with custom extension codecs.
+    pub fn new(
+        logical_extension_codec: Arc<dyn LogicalExtensionCodec>,
+        physical_extension_codec: Arc<dyn PhysicalExtensionCodec>,
+    ) -> Self {
+        Self {
+            logical_extension_codec,
+            physical_extension_codec,
+            logical_plan_repr: PhantomData,
+            physical_plan_repr: PhantomData,
+        }
+    }
+
+    /// Returns the logical extension codec.
+    pub fn logical_extension_codec(&self) -> &dyn LogicalExtensionCodec {
+        self.logical_extension_codec.as_ref()
+    }
+
+    /// Returns the physical extension codec.
+    pub fn physical_extension_codec(&self) -> &dyn PhysicalExtensionCodec {
+        self.physical_extension_codec.as_ref()
+    }
+}
+
+/// Logical extension codec for Ballista-specific plan nodes.
+#[derive(Debug)]
+pub struct BallistaLogicalExtensionCodec {
+    default_codec: Arc<dyn LogicalExtensionCodec>,
+    file_format_codecs: Vec<Arc<dyn LogicalExtensionCodec>>,
+}
+
+impl BallistaLogicalExtensionCodec {
+    /// looks for a codec which can operate on this node
+    /// returns a position of codec in the list and result.
+    ///
+    /// position is important with encoding process
+    /// as position of used codecs is needed
+    /// so the same codec can be used for decoding
+    fn try_any<R>(
+        &self,
+        mut f: impl FnMut(&dyn LogicalExtensionCodec) -> Result<R>,
+    ) -> Result<(u32, R)> {
+        let mut last_err = None;
+        for (position, codec) in self.file_format_codecs.iter().enumerate() {
+            match f(codec.as_ref()) {
+                Ok(result) => return Ok((position as u32, result)),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            DataFusionError::Internal(
+                "List of provided extended logical codecs is empty".to_owned(),
+            )
+        }))
+    }
+}
+
+impl Default for BallistaLogicalExtensionCodec {
+    fn default() -> Self {
+        Self {
+            default_codec: Arc::new(DefaultLogicalExtensionCodec {}),
+            // Position in this list is important as it will be used for decoding.
+            // If new codec is added it should go to last position.
+            file_format_codecs: vec![
+                Arc::new(ParquetLogicalExtensionCodec {}),
+                Arc::new(CsvLogicalExtensionCodec {}),
+                Arc::new(JsonLogicalExtensionCodec {}),
+                Arc::new(ArrowLogicalExtensionCodec {}),
+                Arc::new(AvroLogicalExtensionCodec {}),
+            ],
+        }
+    }
+}
+
+impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[datafusion::logical_expr::LogicalPlan],
+        ctx: &TaskContext,
+    ) -> Result<datafusion::logical_expr::Extension> {
+        let plan = protobuf::BallistaLogicalPlanNode::decode(buf)
+            .ok()
+            .and_then(|node| node.logical_plan_type);
+
+        let Some(plan) = plan else {
+            return self.default_codec.try_decode(buf, inputs, ctx);
+        };
+
+        match plan {
+            LogicalPlanType::CacheNode(plan_cache) => Ok(Extension {
+                node: Arc::new(BallistaCacheNode::new(
+                    plan_cache.cache_id,
+                    plan_cache.session_id,
+                    inputs
+                        .first()
+                        .ok_or(DataFusionError::Plan(
+                            "expected input size of 1".to_string(),
+                        ))?
+                        .clone(),
+                )),
+            }),
+        }
+    }
+
+    fn try_encode(
+        &self,
+        node: &datafusion::logical_expr::Extension,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        if let Some(node) = node.node.as_any().downcast_ref::<BallistaCacheNode>() {
+            let proto = protobuf::BallistaLogicalPlanNode {
+                logical_plan_type: Some(LogicalPlanType::CacheNode(
+                    protobuf::LogicalPlanCacheNode {
+                        cache_id: node.cache_id().to_owned(),
+                        session_id: node.session_id().to_owned(),
+                    },
+                )),
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode cache node logical plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else {
+            self.default_codec.try_encode(node, buf)
+        }
+    }
+
+    fn try_decode_table_provider(
+        &self,
+        buf: &[u8],
+        table_ref: &datafusion::common::TableReference,
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        ctx: &TaskContext,
+    ) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        self.default_codec
+            .try_decode_table_provider(buf, table_ref, schema, ctx)
+    }
+
+    fn try_encode_table_provider(
+        &self,
+        table_ref: &datafusion::common::TableReference,
+        node: Arc<dyn datafusion::catalog::TableProvider>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.default_codec
+            .try_encode_table_provider(table_ref, node, buf)
+    }
+
+    fn try_decode_file_format(
+        &self,
+        buf: &[u8],
+        ctx: &TaskContext,
+    ) -> Result<Arc<dyn datafusion::datasource::file_format::FileFormatFactory>> {
+        let proto = FileFormatProto::decode(buf)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+
+        let codec = self
+            .file_format_codecs
+            .get(proto.encoder_position as usize)
+            .ok_or(DataFusionError::Internal(
+                "Can't find required codec in file codec list".to_owned(),
+            ))?;
+
+        codec.try_decode_file_format(&proto.blob, ctx)
+    }
+
+    fn try_encode_file_format(
+        &self,
+        buf: &mut Vec<u8>,
+        node: Arc<dyn datafusion::datasource::file_format::FileFormatFactory>,
+    ) -> Result<()> {
+        let mut blob = vec![];
+        let (encoder_position, _) =
+            self.try_any(|codec| codec.try_encode_file_format(&mut blob, node.clone()))?;
+
+        let proto = FileFormatProto {
+            encoder_position,
+            blob,
+        };
+        proto
+            .encode(buf)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))
+    }
+}
+
+/// Physical extension codec for Ballista-specific execution plan nodes.
+#[derive(Debug)]
+pub struct BallistaPhysicalExtensionCodec {
+    default_codec: Arc<dyn PhysicalExtensionCodec>,
+}
+
+impl Default for BallistaPhysicalExtensionCodec {
+    fn default() -> Self {
+        Self {
+            default_codec: Arc::new(DefaultPhysicalExtensionCodec {}),
+        }
+    }
+}
+
+/// Encode a `ScalarValue` list for the wire, naming what failed.
+fn encode_scalars(
+    values: &[datafusion::scalar::ScalarValue],
+    what: &str,
+) -> Result<Vec<datafusion_proto_common::ScalarValue>, DataFusionError> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(
+            datafusion_proto_common::ScalarValue::try_from(value).map_err(|e| {
+                DataFusionError::Internal(format!("failed to encode {what}: {e:?}"))
+            })?,
+        );
+    }
+    Ok(out)
+}
+
+/// Reverse of [`encode_scalars`].
+fn decode_scalars(
+    proto: &[datafusion_proto_common::ScalarValue],
+    what: &str,
+) -> Result<Vec<datafusion::scalar::ScalarValue>, DataFusionError> {
+    let mut out = Vec::with_capacity(proto.len());
+    for value in proto {
+        out.push(
+            datafusion::scalar::ScalarValue::try_from(value).map_err(|e| {
+                DataFusionError::Internal(format!("failed to decode {what}: {e:?}"))
+            })?,
+        );
+    }
+    Ok(out)
+}
+
+/// Encode `PrefixMergeExec`'s per-partition prefix state.
+///
+/// An absent slot stays absent: a window expression that published no state
+/// is not the same as one that published an empty state.
+fn encode_prefix_state(
+    state: &[FinalizedPartitionState],
+) -> Result<Vec<protobuf::FinalizedPartitionStateNode>, DataFusionError> {
+    let mut partitions = Vec::with_capacity(state.len());
+    for partition in state {
+        let mut slots = Vec::with_capacity(partition.len());
+        for slot in partition.slots() {
+            let state = match slot {
+                Some(values) => Some(protobuf::AggregateStateNode {
+                    values: encode_scalars(values, "prefix state")?,
+                }),
+                None => None,
+            };
+            slots.push(protobuf::AggregateStateSlotNode { state });
+        }
+        partitions.push(protobuf::FinalizedPartitionStateNode { slots });
+    }
+    Ok(partitions)
+}
+
+/// Reverse of [`encode_prefix_state`].
+fn decode_prefix_state(
+    proto: &[protobuf::FinalizedPartitionStateNode],
+) -> Result<Vec<FinalizedPartitionState>, DataFusionError> {
+    let mut partitions = Vec::with_capacity(proto.len());
+    for partition in proto {
+        let mut slots = Vec::with_capacity(partition.slots.len());
+        for slot in &partition.slots {
+            let state = match &slot.state {
+                Some(state) => Some(decode_scalars(&state.values, "prefix state")?),
+                None => None,
+            };
+            slots.push(state);
+        }
+        partitions.push(FinalizedPartitionState::new(slots));
+    }
+    Ok(partitions)
+}
+
+/// Encode `PrefixMergeExec`'s per-column apply descriptors.
+///
+/// The aggregate arm carries its UDAF by name, resolved from the executor's
+/// function registry on decode — the same way DataFusion moves UDFs
+/// generally.
+fn encode_window_applies(
+    applies: &[WindowApply],
+    codec: &dyn PhysicalExtensionCodec,
+) -> Result<Vec<protobuf::WindowApplyNode>, DataFusionError> {
+    let mut out = Vec::with_capacity(applies.len());
+    for apply in applies {
+        let apply = match apply {
+            WindowApply::Scalar {
+                op,
+                offset,
+                output_column,
+            } => protobuf::window_apply_node::Apply::Scalar(
+                protobuf::ScalarWindowApplyNode {
+                    op: encode_scalar_op(*op) as i32,
+                    offset: encode_scalars(offset, "scalar apply offset")?,
+                    output_column: *output_column as u32,
+                },
+            ),
+            WindowApply::Aggregate {
+                udf,
+                args,
+                output_column,
+                window_expr_index,
+            } => {
+                let mut encoded_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    encoded_args.push(
+                        datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                            arg, codec,
+                        )?,
+                    );
+                }
+                protobuf::window_apply_node::Apply::Aggregate(
+                    protobuf::AggregateWindowApplyNode {
+                        udf_name: udf.name().to_string(),
+                        args: encoded_args,
+                        output_column: *output_column as u32,
+                        window_expr_index: *window_expr_index as u32,
+                    },
+                )
+            }
+        };
+        out.push(protobuf::WindowApplyNode { apply: Some(apply) });
+    }
+    Ok(out)
+}
+
+/// Reverse of [`encode_window_applies`]. `schema` is the operator's input
+/// schema, which the aggregate arm's argument expressions resolve against.
+fn decode_window_applies(
+    proto: &[protobuf::WindowApplyNode],
+    ctx: &TaskContext,
+    schema: &datafusion::arrow::datatypes::Schema,
+    codec: &dyn PhysicalExtensionCodec,
+) -> Result<Vec<WindowApply>, DataFusionError> {
+    let mut out = Vec::with_capacity(proto.len());
+    for node in proto {
+        let apply = node.apply.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("WindowApplyNode missing apply".into())
+        })?;
+        out.push(match apply {
+            protobuf::window_apply_node::Apply::Scalar(scalar) => WindowApply::Scalar {
+                op: decode_scalar_op(scalar.op()),
+                offset: decode_scalars(&scalar.offset, "scalar apply offset")?,
+                output_column: scalar.output_column as usize,
+            },
+            protobuf::window_apply_node::Apply::Aggregate(aggregate) => {
+                let mut args = Vec::with_capacity(aggregate.args.len());
+                for arg in &aggregate.args {
+                    args.push(
+                        datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+                            arg, ctx, schema, codec,
+                        )?,
+                    );
+                }
+                WindowApply::Aggregate {
+                    udf: ctx.udaf(&aggregate.udf_name)?,
+                    args,
+                    output_column: aggregate.output_column as usize,
+                    window_expr_index: aggregate.window_expr_index as usize,
+                }
+            }
+        });
+    }
+    Ok(out)
+}
+
+fn encode_scalar_op(op: ScalarOp) -> protobuf::ScalarOpNode {
+    match op {
+        ScalarOp::Add => protobuf::ScalarOpNode::Add,
+        ScalarOp::Min => protobuf::ScalarOpNode::Min,
+        ScalarOp::Max => protobuf::ScalarOpNode::Max,
+        ScalarOp::Overwrite => protobuf::ScalarOpNode::Overwrite,
+    }
+}
+
+fn decode_scalar_op(op: protobuf::ScalarOpNode) -> ScalarOp {
+    match op {
+        protobuf::ScalarOpNode::Add => ScalarOp::Add,
+        protobuf::ScalarOpNode::Min => ScalarOp::Min,
+        protobuf::ScalarOpNode::Max => ScalarOp::Max,
+        protobuf::ScalarOpNode::Overwrite => ScalarOp::Overwrite,
+    }
+}
+
+/// Decode a `ScalarValue` carried on a Ballista physical plan node.
+fn scalar_from_proto(
+    proto: &datafusion_proto_common::ScalarValue,
+) -> Result<datafusion::scalar::ScalarValue, DataFusionError> {
+    datafusion::scalar::ScalarValue::try_from(proto).map_err(|e| {
+        DataFusionError::Internal(format!("failed to decode ScalarValue: {e:?}"))
+    })
+}
+
+/// Encode a `ScalarValue` for a Ballista physical plan node.
+fn scalar_to_proto(
+    value: &datafusion::scalar::ScalarValue,
+) -> Result<datafusion_proto_common::ScalarValue, DataFusionError> {
+    datafusion_proto_common::ScalarValue::try_from(value).map_err(|e| {
+        DataFusionError::Internal(format!("failed to encode ScalarValue: {e:?}"))
+    })
+}
+
+impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[Arc<dyn ExecutionPlan>],
+        ctx: &TaskContext,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let ballista_plan: protobuf::BallistaPhysicalPlanNode =
+            protobuf::BallistaPhysicalPlanNode::decode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "Could not deserialize BallistaPhysicalPlanNode: {e}"
+                ))
+            })?;
+
+        let ballista_plan =
+            ballista_plan.physical_plan_type.as_ref().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Could not deserialize BallistaPhysicalPlanNode because it's physical_plan_type is none".to_string()
+                )
+            })?;
+        let converter = DefaultPhysicalProtoConverter {};
+        let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
+        match ballista_plan {
+            PhysicalPlanType::ShuffleWriter(shuffle_writer) => {
+                let input = inputs[0].clone();
+
+                // ShuffleWriterExec never repartitions. A plan that still
+                // carries an output partitioning is a legacy hash-shuffle
+                // plan, which this writer no longer implements.
+                if shuffle_writer.output_partitioning.is_some() {
+                    return Err(DataFusionError::Internal(
+                        "hash-partitioned ShuffleWriterExec is no longer supported; \
+                         hash-repartition stages use SortShuffleWriterExec"
+                            .to_string(),
+                    ));
+                }
+
+                Ok(Arc::new(ShuffleWriterExec::try_new(
+                    shuffle_writer.job_id.clone().into(),
+                    shuffle_writer.stage_id as usize,
+                    input,
+                    "".to_string(), // this is intentional but hacky - the executor will fill this in
+                )?))
+            }
+            PhysicalPlanType::RangeShuffleWriter(range_shuffle_writer) => {
+                let input = inputs[0].clone();
+
+                Ok(Arc::new(RangeShuffleWriterExec::try_new(
+                    range_shuffle_writer.job_id.clone().into(),
+                    range_shuffle_writer.stage_id as usize,
+                    input,
+                    "".to_string(), // the executor fills the work dir in
+                )?))
+            }
+            PhysicalPlanType::SortShuffleWriter(sort_shuffle_writer) => {
+                let input = inputs[0].clone();
+
+                let shuffle_output_partitioning = parse_protobuf_hash_partitioning(
+                    sort_shuffle_writer.output_partitioning.as_ref(),
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
+
+                let partitioning = shuffle_output_partitioning.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "SortShuffleWriterExec requires hash partitioning".to_string(),
+                    )
+                })?;
+
+                let batch_size = if sort_shuffle_writer.batch_size > 0 {
+                    sort_shuffle_writer.batch_size as usize
+                } else {
+                    8192
+                };
+                let mut config = SortShuffleConfig::new(true, batch_size);
+                // Absent (legacy plan) keeps the built-in default; a present
+                // value — including 0, which disables the per-task budget —
+                // is applied verbatim so the session override reaches the
+                // executor where the writer actually runs.
+                if let Some(bytes) = sort_shuffle_writer.memory_limit_per_task_bytes {
+                    config = config.with_memory_limit_per_task_bytes(bytes as usize);
+                }
+
+                Ok(Arc::new(SortShuffleWriterExec::try_new(
+                    sort_shuffle_writer.job_id.clone().into(),
+                    sort_shuffle_writer.stage_id as usize,
+                    input,
+                    "".to_string(), // executor will fill this in
+                    partitioning,
+                    config,
+                )?))
+            }
+            PhysicalPlanType::PipelinedShuffleWriter(writer) => {
+                let input = inputs[0].clone();
+                let partitioning = parse_protobuf_hash_partitioning(
+                    writer.output_partitioning.as_ref(),
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
+                Ok(Arc::new(PipelinedShuffleWriterExec::try_new(
+                    writer.job_id.clone().into(),
+                    writer.stage_id as usize,
+                    input,
+                    partitioning,
+                    writer.broadcast,
+                )?))
+            }
+            PhysicalPlanType::PipelinedShuffleReader(reader) => {
+                let stage_id = reader.stage_id as usize;
+                let schema: SchemaRef = Arc::new(convert_required!(reader.schema)?);
+                let partition = reader
+                    .partition
+                    .iter()
+                    .map(|p| {
+                        p.location
+                            .iter()
+                            .map(|l| {
+                                l.clone().try_into().map_err(|e| {
+                                    DataFusionError::Internal(format!(
+                                        "Fail to get pipelined partition location due to {e:?}"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                let exec = if reader.broadcast {
+                    let locations = partition.into_iter().next().ok_or_else(|| {
+                        proto_error(
+                            "broadcast PipelinedShuffleReaderExec: expected exactly one partition",
+                        )
+                    })?;
+                    PipelinedShuffleReaderExec::new_broadcast(stage_id, locations, schema)
+                } else {
+                    let partitioning = parse_protobuf_partitioning(
+                        reader.partitioning.as_ref(),
+                        &decode_ctx,
+                        schema.as_ref(),
+                        &converter,
+                    )?
+                    .ok_or_else(|| proto_error("missing required partitioning field"))?;
+                    PipelinedShuffleReaderExec::try_new(
+                        stage_id,
+                        partition,
+                        schema,
+                        partitioning,
+                    )?
+                };
+                Ok(Arc::new(exec))
+            }
+            PhysicalPlanType::ShuffleReader(shuffle_reader) => {
+                let stage_id = shuffle_reader.stage_id as usize;
+                let schema: SchemaRef =
+                    Arc::new(convert_required!(shuffle_reader.schema)?);
+                let partition_location: Vec<Vec<PartitionLocation>> = shuffle_reader
+                    .partition
+                    .iter()
+                    .map(|p| {
+                        p.location
+                            .iter()
+                            .map(|l| {
+                                l.clone().try_into().map_err(|e| {
+                                    DataFusionError::Internal(format!(
+                                        "Fail to get partition location due to {e:?}"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                let partitioning = parse_protobuf_partitioning(
+                    shuffle_reader.partitioning.as_ref(),
+                    &decode_ctx,
+                    schema.as_ref(),
+                    &converter,
+                )?;
+                let partitioning = partitioning
+                    .ok_or_else(|| proto_error("missing required partitioning field"))?;
+                let exec = if let Some(c) = shuffle_reader.coalesce.as_ref() {
+                    ShuffleReaderExec::try_new_coalesced(
+                        stage_id,
+                        partition_location,
+                        CoalescePlan::from(c),
+                        schema,
+                        partitioning,
+                    )?
+                } else if shuffle_reader.broadcast {
+                    let all_locations = partition_location
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| proto_error(
+                            "broadcast ShuffleReaderExec: expected exactly one partition in proto"
+                        ))?;
+                    ShuffleReaderExec::try_new_broadcast(
+                        stage_id,
+                        all_locations,
+                        schema,
+                        shuffle_reader.upstream_partition_count as usize,
+                    )?
+                } else {
+                    ShuffleReaderExec::try_new(
+                        stage_id,
+                        partition_location,
+                        schema,
+                        partitioning,
+                    )?
+                };
+                Ok(Arc::new(exec))
+            }
+            PhysicalPlanType::RangeShuffleReader(range_reader) => {
+                let stage_id = range_reader.stage_id as usize;
+                let schema: SchemaRef = Arc::new(convert_required!(range_reader.schema)?);
+                let partition_location: Vec<Vec<PartitionLocation>> = range_reader
+                    .partition
+                    .iter()
+                    .map(|p| {
+                        p.location
+                            .iter()
+                            .map(|l| {
+                                l.clone().try_into().map_err(|e| {
+                                    DataFusionError::Internal(format!(
+                                        "Fail to get partition location due to {e:?}"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                let merge_ordering_exprs = parse_physical_sort_exprs(
+                    &range_reader.merge_ordering,
+                    &decode_ctx,
+                    schema.as_ref(),
+                    &converter,
+                )?;
+                let merge_ordering = datafusion::physical_expr::LexOrdering::new(
+                    merge_ordering_exprs,
+                )
+                .ok_or_else(|| {
+                    proto_error(
+                        "RangeShuffleReaderExec: merge_ordering must be non-empty",
+                    )
+                })?;
+                let reader = RangeShuffleReaderExec::try_new(
+                    stage_id,
+                    partition_location,
+                    schema,
+                    merge_ordering,
+                )?
+                .with_fetch_limit(range_reader.fetch.map(|f| f as usize));
+
+                // Empty means the scheduler had no cuts to give, which is a
+                // reader that reads its sources whole — not a reader whose
+                // every partition covers nothing.
+                let reader = if range_reader.bounds.is_empty() {
+                    reader
+                } else {
+                    let bounds = range_reader
+                        .bounds
+                        .iter()
+                        .map(|bound| {
+                            let lo =
+                                bound.lo.as_ref().map(scalar_from_proto).transpose()?;
+                            let hi =
+                                bound.hi.as_ref().map(scalar_from_proto).transpose()?;
+                            Ok::<_, DataFusionError>((lo, hi))
+                        })
+                        .collect::<Result<Vec<_>, DataFusionError>>()?;
+                    reader.with_bounds(bounds)?
+                };
+                Ok(Arc::new(reader))
+            }
+            PhysicalPlanType::UnresolvedShuffle(unresolved_shuffle) => {
+                let schema: SchemaRef =
+                    Arc::new(convert_required!(unresolved_shuffle.schema)?);
+                let partitioning = parse_protobuf_partitioning(
+                    unresolved_shuffle.partitioning.as_ref(),
+                    &decode_ctx,
+                    schema.as_ref(),
+                    &converter,
+                )?;
+                let partitioning = partitioning
+                    .ok_or_else(|| proto_error("missing required partitioning field"))?;
+                let exec = if let Some(c) = unresolved_shuffle.coalesce.as_ref() {
+                    UnresolvedShuffleExec::new_coalesced(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        partitioning,
+                        CoalescePlan::from(c),
+                    )
+                } else if unresolved_shuffle.broadcast {
+                    UnresolvedShuffleExec::new_broadcast(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        unresolved_shuffle.upstream_partition_count as usize,
+                    )
+                } else {
+                    UnresolvedShuffleExec::new(
+                        unresolved_shuffle.stage_id as usize,
+                        schema,
+                        partitioning,
+                    )
+                };
+                Ok(Arc::new(exec))
+            }
+            PhysicalPlanType::ChaosExec(chaos_exec) => {
+                let input = match inputs {
+                    [input] => input.clone(),
+                    _ => {
+                        return Err(DataFusionError::Internal(format!(
+                            "ChaosExec expects exactly 1 input, got {}",
+                            inputs.len()
+                        )));
+                    }
+                };
+                Ok(Arc::new(ChaosExec::new(
+                    input,
+                    chaos_exec.failure_probability,
+                    &chaos_exec.fault_type,
+                    Some(chaos_exec.seed),
+                )?))
+            }
+            PhysicalPlanType::RuntimeStats(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "RuntimeStatsExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                // Empty proto vec means row-count-only mode; a non-empty
+                // vec is the ORDER BY that drives the quantile sketch.
+                let order_by = if node.order_by.is_empty() {
+                    None
+                } else {
+                    Some(parse_physical_sort_exprs(
+                        &node.order_by,
+                        &decode_ctx,
+                        input.schema().as_ref(),
+                        &converter,
+                    )?)
+                };
+                Ok(Arc::new(RuntimeStatsExec::try_new(
+                    input.clone(),
+                    order_by,
+                )?))
+            }
+            PhysicalPlanType::Buffer(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "BufferExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let mode = match protobuf::BufferMode::try_from(node.mode) {
+                    Ok(protobuf::BufferMode::Dam) => BufferMode::Dam,
+                    Err(_) => {
+                        return Err(DataFusionError::Internal(format!(
+                            "BufferExec: unknown mode enum discriminant {}",
+                            node.mode
+                        )));
+                    }
+                };
+                Ok(Arc::new(BufferExec::try_new(input.clone(), mode)?))
+            }
+            PhysicalPlanType::UnorderedRangeRepartition(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "UnorderedRangeRepartitionExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let order_by = parse_physical_sort_exprs(
+                    &node.order_by,
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
+                Ok(Arc::new(UnorderedRangeRepartitionExec::try_new(
+                    input.clone(),
+                    order_by,
+                    node.output_partitions as usize,
+                )?))
+            }
+            PhysicalPlanType::OrderedRangeRepartition(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "OrderedRangeRepartitionExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let order_by = parse_physical_sort_exprs(
+                    &node.order_by,
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
+                Ok(Arc::new(OrderedRangeRepartitionExec::try_new(
+                    input.clone(),
+                    order_by,
+                    node.output_partitions as usize,
+                )?))
+            }
+            PhysicalPlanType::PerPartitionFilter(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "PerPartitionFilterExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let schema = input.schema();
+                let predicates = node
+                    .predicates
+                    .iter()
+                    .map(|p| {
+                        datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+                            p,
+                            ctx,
+                            schema.as_ref(),
+                            self,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                Ok(Arc::new(PerPartitionFilterExec::try_new(
+                    input.clone(),
+                    predicates,
+                )?))
+            }
+            PhysicalPlanType::PrefixMerge(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "PrefixMergeExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let schema = input.schema();
+                Ok(Arc::new(PrefixMergeExec::try_new_resolved(
+                    input.clone(),
+                    decode_window_applies(&node.applies, ctx, schema.as_ref(), self)?,
+                    decode_prefix_state(&node.per_partition_state)?,
+                )?))
+            }
+            PhysicalPlanType::RangeFilter(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "RangeFilterExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let schema = input.schema();
+                let filter_expr_proto = node.filter_expr.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "RangeFilterExecNode missing filter_expr".into(),
+                    )
+                })?;
+                let filter_expr =
+                    datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+                        filter_expr_proto,
+                        ctx,
+                        schema.as_ref(),
+                        self,
+                    )?;
+                let input_order = node.input_order.as_ref().map(|order| match order {
+                    protobuf::range_filter_exec_node::InputOrder::UnorderedNullsFirst(
+                        nulls_first,
+                    ) => InputOrder::Unordered {
+                        nulls_first: *nulls_first,
+                    },
+                    protobuf::range_filter_exec_node::InputOrder::Ordered(options) => {
+                        InputOrder::Ordered(SortOptions {
+                            descending: options.descending,
+                            nulls_first: options.nulls_first,
+                        })
+                    }
+                });
+                let halo_lo_proto = node.halo_lo.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "RangeFilterExecNode missing halo_lo".into(),
+                    )
+                })?;
+                let halo_lo = scalar_from_proto(halo_lo_proto)?;
+                let halo_hi_proto = node.halo_hi.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "RangeFilterExecNode missing halo_hi".into(),
+                    )
+                })?;
+                let halo_hi = scalar_from_proto(halo_hi_proto)?;
+                let raw_bounds = node
+                    .raw_bounds
+                    .iter()
+                    .map(|b| {
+                        let lo = b.lo.as_ref().map(scalar_from_proto).transpose()?;
+                        let hi = b.hi.as_ref().map(scalar_from_proto).transpose()?;
+                        Ok::<_, DataFusionError>((lo, hi))
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()?;
+                Ok(Arc::new(RangeFilterExec::try_new_resolved(
+                    input.clone(),
+                    filter_expr,
+                    halo_lo,
+                    halo_hi,
+                    input_order,
+                    raw_bounds,
+                )?))
+            }
+            PhysicalPlanType::PartitionedBoundedWindowAgg(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "PartitionedBoundedWindowAggExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let input_schema = input.schema();
+                let window_expr = node
+                    .window_expr
+                    .iter()
+                    .map(|we| {
+                        datafusion_proto::physical_plan::from_proto::parse_physical_window_expr(
+                            we,
+                            &decode_ctx,
+                            input_schema.as_ref(),
+                            &converter,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Arc::new(PartitionedBoundedWindowAggExec::try_new(
+                    window_expr,
+                    input.clone(),
+                )?))
+            }
+            // DistributedQuery is only serialized and deserialized in ballista python.
+            // It is not supposed to be serialized by native ballista codec.
+            PhysicalPlanType::DistributedQuery(_) => Err(DataFusionError::Internal(
+                "DistributedQueryExec is only supported by PyBallistaPhysicalExtensionCodec"
+                    .to_string(),
+            )),
+            PhysicalPlanType::DistributedExplainAnalyze(_) => {
+                Err(DataFusionError::Internal(
+                    "DistributedExplainAnalyzeExec is only supported by PyBallistaPhysicalExtensionCodec"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<(), DataFusionError> {
+        if let Some(exec) = node.downcast_ref::<ShuffleWriterExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::ShuffleWriter(
+                    protobuf::ShuffleWriterExecNode {
+                        job_id: exec.job_id().to_string(),
+                        stage_id: exec.stage_id() as u32,
+                        input: None,
+                        // This writer preserves its input partitioning, so
+                        // there is never a shuffle partitioning to encode.
+                        output_partitioning: None,
+                    },
+                )),
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode shuffle writer execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<RangeShuffleWriterExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::RangeShuffleWriter(
+                    protobuf::RangeShuffleWriterExecNode {
+                        job_id: exec.job_id().to_string(),
+                        stage_id: exec.stage_id() as u32,
+                        input: None,
+                    },
+                )),
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode range shuffle writer execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<SortShuffleWriterExec>() {
+            let output_partitioning = match exec.shuffle_output_partitioning() {
+                Partitioning::Hash(exprs, partition_count) => {
+                    Some(serialize_hash_partitioning(
+                        exprs,
+                        *partition_count,
+                        self.default_codec.as_ref(),
+                    )?)
+                }
+                other => {
+                    return Err(DataFusionError::Internal(format!(
+                        "SortShuffleWriterExec requires Hash partitioning, got: {other:?}"
+                    )));
+                }
+            };
+
+            let config = exec.config();
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::SortShuffleWriter(
+                    protobuf::SortShuffleWriterExecNode {
+                        job_id: exec.job_id().to_string(),
+                        stage_id: exec.stage_id() as u32,
+                        input: None,
+                        output_partitioning,
+                        batch_size: config.batch_size as u64,
+                        memory_limit_per_task_bytes: Some(
+                            config.memory_limit_per_task_bytes as u64,
+                        ),
+                    },
+                )),
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode sort shuffle writer execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PipelinedShuffleWriterExec>() {
+            let output_partitioning = match exec.shuffle_output_partitioning() {
+                Some(Partitioning::Hash(exprs, partition_count)) => {
+                    Some(serialize_hash_partitioning(
+                        exprs,
+                        *partition_count,
+                        self.default_codec.as_ref(),
+                    )?)
+                }
+                Some(other) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "PipelinedShuffleWriterExec requires Hash partitioning, got: {other:?}"
+                    )));
+                }
+                None => None,
+            };
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PipelinedShuffleWriter(
+                    protobuf::PipelinedShuffleWriterExecNode {
+                        job_id: exec.job_id().to_string(),
+                        stage_id: exec.stage_id() as u32,
+                        output_partitioning,
+                        broadcast: exec.broadcast(),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode pipelined shuffle writer execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PipelinedShuffleReaderExec>() {
+            let partition = exec
+                .partition
+                .iter()
+                .map(|locations| protobuf::PipelinedReaderPartition {
+                    location: locations.iter().cloned().map(Into::into).collect(),
+                })
+                .collect();
+            let converter = DefaultPhysicalProtoConverter {};
+            let partitioning = serialize_partitioning(
+                &exec.properties().partitioning,
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PipelinedShuffleReader(
+                    protobuf::PipelinedShuffleReaderExecNode {
+                        partition,
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        stage_id: exec.stage_id as u32,
+                        partitioning: Some(partitioning),
+                        broadcast: exec.broadcast,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode pipelined shuffle reader execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<ShuffleReaderExec>() {
+            let stage_id = exec.stage_id as u32;
+            let mut partition = vec![];
+            for location in &exec.partition {
+                partition.push(protobuf::ShuffleReaderPartition {
+                    location: location
+                        .iter()
+                        .map(|l| {
+                            l.clone().try_into().map_err(|e| {
+                                DataFusionError::Internal(format!(
+                                    "Fail to get partition location due to {e:?}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                });
+            }
+            let converter = DefaultPhysicalProtoConverter {};
+            let partitioning = serialize_partitioning(
+                &exec.properties().partitioning,
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::ShuffleReader(
+                    protobuf::ShuffleReaderExecNode {
+                        stage_id,
+                        partition,
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        partitioning: Some(partitioning),
+                        broadcast: exec.broadcast,
+                        upstream_partition_count: exec.upstream_partition_count as u32,
+                        coalesce: exec.coalesce.as_ref().map(|c| c.into()),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode shuffle reader execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<RangeShuffleReaderExec>() {
+            let stage_id = exec.stage_id as u32;
+            let mut partition = vec![];
+            for location in &exec.partition {
+                partition.push(protobuf::ShuffleReaderPartition {
+                    location: location
+                        .iter()
+                        .map(|l| {
+                            l.clone().try_into().map_err(|e| {
+                                DataFusionError::Internal(format!(
+                                    "Fail to get partition location due to {e:?}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                });
+            }
+            let converter = DefaultPhysicalProtoConverter {};
+            let merge_ordering = serialize_physical_sort_exprs(
+                exec.merge_ordering().iter().cloned(),
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::RangeShuffleReader(
+                    protobuf::RangeShuffleReaderExecNode {
+                        stage_id,
+                        partition,
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        merge_ordering,
+                        fetch: exec.fetch().map(|f| f as u64),
+                        bounds: exec
+                            .bounds()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|(lo, hi)| {
+                                let lo = lo.as_ref().map(scalar_to_proto).transpose()?;
+                                let hi = hi.as_ref().map(scalar_to_proto).transpose()?;
+                                Ok::<_, DataFusionError>(protobuf::RangeBound { lo, hi })
+                            })
+                            .collect::<Result<Vec<_>, DataFusionError>>()?,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode range shuffle reader execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<UnresolvedShuffleExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            let partitioning = serialize_partitioning(
+                &exec.properties().partitioning,
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::UnresolvedShuffle(
+                    protobuf::UnresolvedShuffleExecNode {
+                        stage_id: exec.stage_id as u32,
+                        schema: Some(exec.schema().as_ref().try_into()?),
+                        partitioning: Some(partitioning),
+                        broadcast: exec.broadcast,
+                        upstream_partition_count: exec.upstream_partition_count as u32,
+                        coalesce: exec.coalesce.as_ref().map(|c| c.into()),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode unresolved shuffle execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<ChaosExec>() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::ChaosExec(
+                    protobuf::ChaosExecNode {
+                        failure_probability: exec.failure_probability(),
+                        fault_type: exec.fault_type().to_string(),
+                        seed: exec.seed(),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode chaos monkey execution plan: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<RuntimeStatsExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            // Empty vec on the wire when the operator is in
+            // row-count-only mode; otherwise serialise the full ORDER BY.
+            let order_by = match exec.order_by() {
+                Some(exprs) => serialize_physical_sort_exprs(
+                    exprs.iter().cloned(),
+                    self.default_codec.as_ref(),
+                    &converter,
+                )?,
+                None => Vec::new(),
+            };
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::RuntimeStats(
+                    protobuf::RuntimeStatsExecNode { order_by },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode RuntimeStatsExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<BufferExec>() {
+            let mode = match *exec.mode() {
+                BufferMode::Dam => protobuf::BufferMode::Dam,
+            };
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::Buffer(
+                    protobuf::BufferExecNode { mode: mode.into() },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!("failed to encode BufferExec: {e:?}"))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<UnorderedRangeRepartitionExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            let order_by = serialize_physical_sort_exprs(
+                exec.order_by().iter().cloned(),
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::UnorderedRangeRepartition(
+                    protobuf::UnorderedRangeRepartitionExecNode {
+                        order_by,
+                        output_partitions: exec.output_partitions() as u32,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode UnorderedRangeRepartitionExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<OrderedRangeRepartitionExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            let order_by = serialize_physical_sort_exprs(
+                exec.order_by().iter().cloned(),
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::OrderedRangeRepartition(
+                    protobuf::OrderedRangeRepartitionExecNode {
+                        order_by,
+                        output_partitions: exec.output_partitions() as u32,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode OrderedRangeRepartitionExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PerPartitionFilterExec>() {
+            let predicates = exec
+                .predicates()
+                .iter()
+                .map(|p| {
+                    datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                        p,
+                        self.default_codec.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PerPartitionFilter(
+                    protobuf::PerPartitionFilterExecNode { predicates },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode PerPartitionFilterExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PrefixMergeExec>() {
+            // An executor has no route to prefix state, so a plan reaching
+            // the wire unresolved could only emit partition-local aggregates.
+            // Refuse, the way RangeFilterExec refuses unresolved bounds.
+            let state = exec.per_partition_state().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "PrefixMergeExec: cannot serialize before resolve_state()".into(),
+                )
+            })?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PrefixMerge(
+                    protobuf::PrefixMergeExecNode {
+                        applies: encode_window_applies(
+                            exec.applies(),
+                            self.default_codec.as_ref(),
+                        )?,
+                        per_partition_state: encode_prefix_state(&state)?,
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode PrefixMergeExecNode: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<RangeFilterExec>() {
+            let raw_bounds = exec.raw_bounds().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "RangeFilterExec: cannot serialize before resolve_bounds()".into(),
+                )
+            })?;
+            let filter_expr =
+                datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                    exec.filter_expr(),
+                    self.default_codec.as_ref(),
+                )?;
+            let halo_lo = scalar_to_proto(exec.halo_lo())?;
+            let halo_hi = scalar_to_proto(exec.halo_hi())?;
+            let raw_bounds_proto = raw_bounds
+                .iter()
+                .map(|(lo, hi)| {
+                    let lo = lo.as_ref().map(scalar_to_proto).transpose()?;
+                    let hi = hi.as_ref().map(scalar_to_proto).transpose()?;
+                    Ok::<_, DataFusionError>(protobuf::RangeBound { lo, hi })
+                })
+                .collect::<Result<Vec<_>, DataFusionError>>()?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::RangeFilter(
+                    protobuf::RangeFilterExecNode {
+                        filter_expr: Some(filter_expr),
+                        halo_lo: Some(halo_lo),
+                        halo_hi: Some(halo_hi),
+                        raw_bounds: raw_bounds_proto,
+                        input_order: exec.input_order().map(|order| match order {
+                            InputOrder::Unordered { nulls_first } => {
+                                protobuf::range_filter_exec_node::InputOrder::UnorderedNullsFirst(nulls_first)
+                            }
+                            InputOrder::Ordered(options) => {
+                                protobuf::range_filter_exec_node::InputOrder::Ordered(
+                                    protobuf::SortOptions {
+                                        descending: options.descending,
+                                        nulls_first: options.nulls_first,
+                                    },
+                                )
+                            }
+                        }),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode RangeFilterExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<PartitionedBoundedWindowAggExec>()
+        {
+            let converter = DefaultPhysicalProtoConverter {};
+            let window_expr = exec
+                .window_expr()
+                .iter()
+                .map(|we| {
+                    datafusion_proto::physical_plan::to_proto::serialize_physical_window_expr(
+                        we,
+                        self.default_codec.as_ref(),
+                        &converter,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::PartitionedBoundedWindowAgg(
+                    protobuf::PartitionedBoundedWindowAggExecNode { window_expr },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode PartitionedBoundedWindowAggExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else {
+            Err(DataFusionError::Internal(format!(
+                "Unsupported plan node, name: [{}] ",
+                node.name()
+            )))
+        }
+    }
+}
+
+/// FileFormatProto captures data encoded by file format codecs
+///
+/// it captures position of codec used to encode FileFormat
+/// and actual encoded value.
+///
+/// capturing codec position is required, as same codec can decode
+/// blobs encoded by different encoders (probability is low but  it
+/// happened in the past)
+///
+#[derive(Clone, PartialEq, prost::Message)]
+struct FileFormatProto {
+    /// encoder id used to encode blob
+    /// (to be used for decoding)
+    #[prost(uint32, tag = 1)]
+    pub encoder_position: u32,
+    #[prost(bytes, tag = 2)]
+    pub blob: Vec<u8>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::execution_plans::PartitionGroup;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::expressions::col;
+    use datafusion::{
+        common::DFSchema,
+        datasource::file_format::{DefaultFileType, parquet::ParquetFormatFactory},
+        logical_expr::{EmptyRelation, LogicalPlan, dml::CopyTo},
+        prelude::SessionContext,
+    };
+    use datafusion_proto::{logical_plan::AsLogicalPlan, protobuf::LogicalPlanNode};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn file_format_serialization_roundtrip() {
+        let ctx = SessionContext::new().task_ctx();
+        let empty = EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::empty()),
+        };
+        let file_type =
+            Arc::new(DefaultFileType::new(Arc::new(ParquetFormatFactory::new())));
+        let original_plan = LogicalPlan::Copy(CopyTo {
+            input: Arc::new(LogicalPlan::EmptyRelation(empty)),
+            output_url: "/tmp/file".to_string(),
+            partition_by: vec![],
+            file_type,
+            options: Default::default(),
+            output_schema: Arc::new(DFSchema::empty()),
+        });
+
+        let codec = crate::serde::BallistaLogicalExtensionCodec::default();
+        let plan_message =
+            LogicalPlanNode::try_from_logical_plan(&original_plan, &codec).unwrap();
+
+        let mut buf: Vec<u8> = vec![];
+        plan_message.try_encode(&mut buf).unwrap();
+        println!("{}", original_plan.display_indent());
+
+        let decoded_message = LogicalPlanNode::try_decode(&buf).unwrap();
+        let decoded_plan = decoded_message.try_into_logical_plan(&ctx, &codec).unwrap();
+
+        println!("{}", decoded_plan.display_indent());
+        let o = original_plan.display_indent();
+        let d = decoded_plan.display_indent();
+
+        assert_eq!(o.to_string(), d.to_string())
+        //logical_plan.
+    }
+
+    fn create_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+    }
+
+    // Regression coverage for #1838 and the removed `make_filter_projection_serde_safe`
+    // workaround: a `FilterExec` that projects to zero columns must survive physical
+    // plan serialization with its empty projection intact. datafusion-proto 53.1.0
+    // could not distinguish `Some(vec![])` (empty projection) from `None` (full
+    // projection) and decoded the former back as `None`, shifting column indices.
+    // DataFusion 54 preserves the distinction, so no Ballista-side rewrite is needed.
+    #[tokio::test]
+    async fn filter_exec_empty_projection_survives_physical_serde() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::expressions::lit;
+        use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
+        use datafusion_proto::physical_plan::{
+            AsExecutionPlan, DefaultPhysicalExtensionCodec,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let filter = FilterExecBuilder::new(lit(true), input)
+            .apply_projection(Some(vec![]))
+            .unwrap()
+            .build()
+            .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(filter);
+        assert_eq!(
+            plan.schema().fields().len(),
+            0,
+            "precondition: filter projects to zero columns"
+        );
+
+        let codec = DefaultPhysicalExtensionCodec {};
+        let proto = PhysicalPlanNode::try_from_physical_plan(plan, &codec).unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = proto.try_into_physical_plan(&ctx, &codec).unwrap();
+
+        assert_eq!(
+            decoded.schema().fields().len(),
+            0,
+            "decoded FilterExec must still project zero columns"
+        );
+        let filter = decoded
+            .downcast_ref::<FilterExec>()
+            .expect("decoded plan must be a FilterExec");
+        assert_eq!(
+            filter.projection().as_ref().map(|p| p.is_empty()),
+            Some(true),
+            "empty projection must round-trip as Some(vec![]), not None"
+        );
+    }
+
+    // apache/datafusion#23642 is fixed upstream: `datafusion-proto` now preserves the
+    // partition count when round-tripping `EmptyExec`. This test locks in that
+    // behaviour so we notice if it ever regresses.
+    #[tokio::test]
+    async fn empty_exec_partition_count_survives_datafusion_proto() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion_proto::physical_plan::{
+            AsExecutionPlan, DefaultPhysicalExtensionCodec,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(schema).with_partitions(4));
+        assert_eq!(
+            plan.output_partitioning().partition_count(),
+            4,
+            "precondition: EmptyExec reports 4 partitions"
+        );
+
+        let codec = DefaultPhysicalExtensionCodec {};
+        let proto = PhysicalPlanNode::try_from_physical_plan(plan, &codec).unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = proto.try_into_physical_plan(&ctx, &codec).unwrap();
+
+        assert_eq!(
+            decoded.output_partitioning().partition_count(),
+            4,
+            "EmptyExec partition count must survive round-trip through datafusion-proto"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unresolved_shuffle_exec_roundtrip() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 4);
+
+        let original_exec = UnresolvedShuffleExec::new(
+            1, // stage_id
+            schema.clone(),
+            partitioning.clone(),
+        );
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded_exec = decoded_plan
+            .downcast_ref::<UnresolvedShuffleExec>()
+            .expect("Expected UnresolvedShuffleExec");
+
+        assert_eq!(decoded_exec.stage_id, 1);
+        assert_eq!(decoded_exec.schema().as_ref(), schema.as_ref());
+        assert_eq!(&decoded_exec.properties().partitioning, &partitioning);
+        assert!(
+            decoded_exec.coalesce.is_none(),
+            "absent coalesce field must decode to None (codec inertness)"
+        );
+    }
+
+    fn pipelined_location(
+        task_id: usize,
+        partition: usize,
+    ) -> crate::serde::scheduler::PipelinedPartitionLocation {
+        use crate::serde::scheduler::{
+            ExecutorMetadata, ExecutorOperatingSystemSpecification,
+            ExecutorSpecification, PartitionId, PipelinedPartitionLocation,
+        };
+        PipelinedPartitionLocation {
+            partition_id: PartitionId::new(&"job".into(), 2, partition),
+            task_id,
+            executor_meta: ExecutorMetadata {
+                id: format!("executor-{task_id}"),
+                host: "host".to_owned(),
+                port: 50051,
+                grpc_port: 50052,
+                specification: ExecutorSpecification::default(),
+                os_info: ExecutorOperatingSystemSpecification::default(),
+            },
+        }
+    }
+
+    fn roundtrip_plan(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(plan.clone(), &mut buf, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let ctx = SessionContext::new().task_ctx();
+        let inputs: Vec<Arc<dyn ExecutionPlan>> =
+            plan.children().into_iter().cloned().collect();
+        codec
+            .try_decode(&buf, &inputs, &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_shuffle_writer_exec_roundtrip() {
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(schema.clone()),
+        );
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 4);
+
+        for (partitioning, broadcast) in [(Some(partitioning), false), (None, true)] {
+            let writer = PipelinedShuffleWriterExec::try_new(
+                "job".into(),
+                3,
+                input.clone(),
+                partitioning.clone(),
+                broadcast,
+            )
+            .unwrap();
+            let decoded = roundtrip_plan(Arc::new(writer));
+            let decoded = decoded
+                .downcast_ref::<PipelinedShuffleWriterExec>()
+                .expect("Expected PipelinedShuffleWriterExec");
+            assert_eq!(decoded.job_id().as_str(), "job");
+            assert_eq!(decoded.stage_id(), 3);
+            assert_eq!(decoded.shuffle_output_partitioning(), partitioning.as_ref());
+            assert_eq!(decoded.broadcast(), broadcast);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_shuffle_reader_exec_roundtrip() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 2);
+        let partition = vec![
+            vec![pipelined_location(0, 0), pipelined_location(1, 0)],
+            vec![pipelined_location(0, 1), pipelined_location(1, 1)],
+        ];
+
+        let reader = PipelinedShuffleReaderExec::try_new(
+            2,
+            partition.clone(),
+            schema.clone(),
+            partitioning.clone(),
+        )
+        .unwrap();
+        let decoded = roundtrip_plan(Arc::new(reader));
+        let decoded = decoded
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .expect("Expected PipelinedShuffleReaderExec");
+        assert_eq!(decoded.stage_id, 2);
+        assert_eq!(decoded.partition, partition);
+        assert!(!decoded.broadcast);
+        assert_eq!(&decoded.properties().partitioning, &partitioning);
+        assert_eq!(decoded.schema().as_ref(), schema.as_ref());
+
+        let broadcast = PipelinedShuffleReaderExec::new_broadcast(
+            2,
+            partition.concat(),
+            schema.clone(),
+        );
+        let decoded = roundtrip_plan(Arc::new(broadcast));
+        let decoded = decoded
+            .downcast_ref::<PipelinedShuffleReaderExec>()
+            .expect("Expected PipelinedShuffleReaderExec");
+        assert!(decoded.broadcast);
+        assert_eq!(decoded.partition, vec![partition.concat()]);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_reader_exec_roundtrip() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 4);
+
+        let original_exec = ShuffleReaderExec::try_new(
+            1, // stage_id
+            Vec::new(),
+            schema.clone(),
+            partitioning.clone(),
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded_exec = decoded_plan
+            .downcast_ref::<ShuffleReaderExec>()
+            .expect("Expected ShuffleReaderExec");
+
+        assert_eq!(decoded_exec.stage_id, 1);
+        assert_eq!(decoded_exec.schema().as_ref(), schema.as_ref());
+        assert_eq!(&decoded_exec.properties().partitioning, &partitioning);
+        assert!(
+            decoded_exec.coalesce.is_none(),
+            "absent coalesce field must decode to None (codec inertness)"
+        );
+    }
+
+    /// `RangeShuffleReaderExec` carries its merge ordering across the wire —
+    /// the reader's k-way merge machinery is inert without it, and the
+    /// scheduler side plants the reader with the child's declared ordering.
+    /// Both `WindowApply` shapes and the prefix state must survive the wire.
+    /// The aggregate arm is the interesting one: its UDAF crosses by name and
+    /// is resolved from the executor's registry, and its state is an opaque
+    /// `Vec<ScalarValue>` rather than a number.
+    #[tokio::test]
+    async fn test_prefix_merge_exec_roundtrip() {
+        use datafusion::functions_aggregate::sum::sum_udaf;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::scalar::ScalarValue;
+
+        let schema = create_test_schema();
+        let input = Arc::new(EmptyExec::new(schema.clone()));
+        let applies = vec![
+            WindowApply::Scalar {
+                op: ScalarOp::Overwrite,
+                offset: vec![ScalarValue::Float64(Some(1.5))],
+                output_column: 0,
+            },
+            WindowApply::Aggregate {
+                udf: sum_udaf(),
+                args: vec![col("id", schema.as_ref()).unwrap()],
+                output_column: 1,
+                window_expr_index: 3,
+            },
+        ];
+        // One partition; slot 0 carries state, slot 1 is a window function
+        // that published none. `None` and `Some(vec![])` must stay distinct.
+        let state = vec![FinalizedPartitionState::new(vec![
+            Some(vec![ScalarValue::Float64(Some(42.0))]),
+            None,
+        ])];
+        let original =
+            PrefixMergeExec::try_new_resolved(input, applies, state.clone()).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(
+                &buf,
+                &[Arc::new(EmptyExec::new(schema.clone()))],
+                &ctx,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<PrefixMergeExec>()
+            .expect("Expected PrefixMergeExec");
+
+        assert_eq!(decoded.per_partition_state(), Some(state));
+        match &decoded.applies()[0] {
+            WindowApply::Scalar {
+                op,
+                offset,
+                output_column,
+            } => {
+                assert!(matches!(op, ScalarOp::Overwrite));
+                assert_eq!(offset, &[ScalarValue::Float64(Some(1.5))]);
+                assert_eq!(*output_column, 0);
+            }
+            other => panic!("expected Scalar apply, got {other:?}"),
+        }
+        match &decoded.applies()[1] {
+            WindowApply::Aggregate {
+                udf,
+                args,
+                output_column,
+                window_expr_index,
+            } => {
+                assert_eq!(udf.name(), "sum");
+                assert_eq!(args.len(), 1);
+                assert_eq!(*output_column, 1);
+                assert_eq!(*window_expr_index, 3);
+            }
+            other => panic!("expected Aggregate apply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_range_shuffle_reader_exec_roundtrip() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
+        let schema = create_test_schema();
+        let sort_expr = PhysicalSortExpr {
+            expr: col("id", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let merge_ordering = LexOrdering::new(vec![sort_expr.clone()]).unwrap();
+
+        let original = RangeShuffleReaderExec::try_new(
+            7,
+            vec![vec![]; 4],
+            schema.clone(),
+            merge_ordering.clone(),
+        )
+        .unwrap()
+        .with_fetch_limit(Some(20));
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<RangeShuffleReaderExec>()
+            .expect("Expected RangeShuffleReaderExec");
+
+        assert_eq!(decoded.stage_id, 7);
+        assert_eq!(decoded.schema().as_ref(), schema.as_ref());
+        assert_eq!(decoded.partition.len(), 4, "partition shape must survive");
+        assert_eq!(
+            decoded.merge_ordering().len(),
+            1,
+            "merge_ordering must round-trip"
+        );
+        assert_eq!(
+            decoded.merge_ordering().first().expr.to_string(),
+            sort_expr.expr.to_string(),
+        );
+        // Dropped on the wire, the limit would silently stop applying: the
+        // reader only ever executes after being decoded on an executor.
+        assert_eq!(
+            ExecutionPlan::fetch(decoded),
+            Some(20),
+            "fetch must round-trip"
+        );
+        // The ordering must land on `PlanProperties.eq_properties` — downstream
+        // consumers (BWAG, SMJ build side) read it there.
+        let advertised = decoded
+            .properties()
+            .eq_properties
+            .oeq_class()
+            .iter()
+            .next()
+            .cloned()
+            .expect("advertised ordering");
+        assert_eq!(advertised, merge_ordering);
+    }
+
+    /// The sort shuffle writer's per-task memory budget must survive the
+    /// protobuf round trip so a session override reaches the executor where the
+    /// writer actually runs (issue #2089). A non-default value and the special
+    /// `0` (per-task budget disabled) are both checked.
+    #[tokio::test]
+    async fn test_sort_shuffle_writer_exec_roundtrip_preserves_memory_limit() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        for memory_limit in [7 * 1024 * 1024_usize, 0] {
+            let schema = create_test_schema();
+            let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+            let partitioning =
+                Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 4);
+
+            let original_exec = SortShuffleWriterExec::try_new(
+                "job1".into(),
+                1,
+                input.clone(),
+                String::new(),
+                partitioning.clone(),
+                SortShuffleConfig::new(true, 4096)
+                    .with_memory_limit_per_task_bytes(memory_limit),
+            )
+            .unwrap();
+
+            let codec = BallistaPhysicalExtensionCodec::default();
+            let mut buf: Vec<u8> = vec![];
+            codec
+                .try_encode(
+                    Arc::new(original_exec),
+                    &mut buf,
+                    &DefaultPhysicalProtoConverter {},
+                )
+                .unwrap();
+
+            let ctx = SessionContext::new().task_ctx();
+            let decoded_plan = codec
+                .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+                .unwrap();
+            let decoded_exec = decoded_plan
+                .downcast_ref::<SortShuffleWriterExec>()
+                .expect("Expected SortShuffleWriterExec");
+
+            assert_eq!(
+                decoded_exec.config().memory_limit_per_task_bytes,
+                memory_limit,
+                "memory_limit_per_task_bytes must survive the wire, including 0"
+            );
+            assert_eq!(decoded_exec.config().batch_size, 4096);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_reader_exec_coalesced_roundtrip_single_group() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 1);
+        let coalesce = CoalescePlan {
+            upstream_partition_count: 4,
+            groups: vec![PartitionGroup {
+                upstream_indices: vec![0, 1, 2, 3],
+            }],
+        };
+
+        let original_exec = ShuffleReaderExec::try_new_coalesced(
+            7,
+            vec![vec![]; 1], // K-shape: 1 output partition
+            coalesce.clone(),
+            schema.clone(),
+            partitioning.clone(),
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded_exec = decoded_plan
+            .downcast_ref::<ShuffleReaderExec>()
+            .expect("Expected ShuffleReaderExec");
+
+        assert_eq!(decoded_exec.stage_id, 7);
+        assert_eq!(&decoded_exec.properties().partitioning, &partitioning);
+        let stored = decoded_exec
+            .coalesce
+            .as_ref()
+            .expect("coalesce must round-trip");
+        assert_eq!(stored, &coalesce);
+        assert_eq!(stored.upstream_partition_count, 4);
+        assert_eq!(stored.groups.len(), 1);
+        assert_eq!(stored.groups[0].upstream_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn sort_shuffle_writer_memory_limit_survives_roundtrip() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = create_test_schema();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 4);
+
+        let config = SortShuffleConfig::new(true, 4096)
+            .with_memory_limit_per_task_bytes(1024 * 1024 * 1024);
+        let original = SortShuffleWriterExec::try_new(
+            "job-1".to_string().into(),
+            3,
+            input.clone(),
+            String::new(),
+            partitioning,
+            config,
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded
+            .downcast_ref::<SortShuffleWriterExec>()
+            .expect("Expected SortShuffleWriterExec");
+
+        assert_eq!(
+            decoded.config().memory_limit_per_task_bytes,
+            1024 * 1024 * 1024,
+            "memory limit override must survive serialization to the executor"
+        );
+        assert_eq!(decoded.config().batch_size, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_reader_exec_coalesced_roundtrip_multi_group_mixed_sizes() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 3);
+        let coalesce = CoalescePlan {
+            upstream_partition_count: 8,
+            groups: vec![
+                PartitionGroup {
+                    upstream_indices: vec![0, 1, 2],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![3, 4],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![5, 6, 7],
+                },
+            ],
+        };
+
+        let original_exec = ShuffleReaderExec::try_new_coalesced(
+            1,
+            vec![vec![]; 3], // K-shape: 3 output partitions
+            coalesce.clone(),
+            schema.clone(),
+            partitioning.clone(),
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded_exec = decoded_plan
+            .downcast_ref::<ShuffleReaderExec>()
+            .expect("Expected ShuffleReaderExec");
+
+        let stored = decoded_exec
+            .coalesce
+            .as_ref()
+            .expect("coalesce must round-trip");
+        assert_eq!(stored, &coalesce);
+        assert_eq!(stored.upstream_partition_count, 8);
+        assert_eq!(stored.groups.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_unresolved_shuffle_exec_coalesced_roundtrip_multi_index() {
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 2);
+        let coalesce = CoalescePlan {
+            upstream_partition_count: 5,
+            groups: vec![
+                PartitionGroup {
+                    upstream_indices: vec![0, 1, 2, 3],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![4],
+                },
+            ],
+        };
+
+        let original_exec = UnresolvedShuffleExec::new_coalesced(
+            9,
+            schema.clone(),
+            partitioning.clone(),
+            coalesce.clone(),
+        );
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded_exec = decoded_plan
+            .downcast_ref::<UnresolvedShuffleExec>()
+            .expect("Expected UnresolvedShuffleExec");
+
+        assert_eq!(decoded_exec.stage_id, 9);
+        let stored = decoded_exec
+            .coalesce
+            .as_ref()
+            .expect("coalesce must round-trip");
+        assert_eq!(stored, &coalesce);
+        assert_eq!(stored.upstream_partition_count, 5);
+        assert_eq!(stored.groups[0].upstream_indices.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_reader_exec_coalesced_roundtrip_non_contiguous_indices() {
+        // Proto allows arbitrary upstream_indices sets even though the default
+        // algorithm only emits contiguous ranges.
+        let schema = create_test_schema();
+        let partitioning =
+            Partitioning::Hash(vec![col("id", schema.as_ref()).unwrap()], 2);
+        let coalesce = CoalescePlan {
+            upstream_partition_count: 6,
+            groups: vec![
+                PartitionGroup {
+                    upstream_indices: vec![0, 2, 4],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![1, 3, 5],
+                },
+            ],
+        };
+
+        let original_exec = ShuffleReaderExec::try_new_coalesced(
+            3,
+            vec![vec![]; 2],
+            coalesce.clone(),
+            schema.clone(),
+            partitioning.clone(),
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded_exec = decoded_plan
+            .downcast_ref::<ShuffleReaderExec>()
+            .expect("Expected ShuffleReaderExec");
+
+        let stored = decoded_exec
+            .coalesce
+            .as_ref()
+            .expect("coalesce must round-trip");
+        assert_eq!(stored, &coalesce);
+        // Non-contiguous indices preserved bit-for-bit:
+        assert_eq!(stored.groups[0].upstream_indices, vec![0, 2, 4]);
+        assert_eq!(stored.groups[1].upstream_indices, vec![1, 3, 5]);
+    }
+
+    // ---- CoalescePlan native ↔ proto direct conversion round-trips ----
+
+    #[test]
+    fn coalesce_plan_native_to_proto_roundtrip_empty() {
+        let native = CoalescePlan {
+            upstream_partition_count: 0,
+            groups: vec![],
+        };
+        let proto: protobuf::CoalescePlan = (&native).into();
+        let back: CoalescePlan = (&proto).into();
+        assert_eq!(native, back);
+    }
+
+    #[test]
+    fn coalesce_plan_native_to_proto_roundtrip_single_group() {
+        let native = CoalescePlan {
+            upstream_partition_count: 4,
+            groups: vec![PartitionGroup {
+                upstream_indices: vec![0, 1, 2, 3],
+            }],
+        };
+        let proto: protobuf::CoalescePlan = (&native).into();
+        let back: CoalescePlan = (&proto).into();
+        assert_eq!(native, back);
+    }
+
+    #[test]
+    fn coalesce_plan_native_to_proto_roundtrip_multi_group_mixed_sizes() {
+        let native = CoalescePlan {
+            upstream_partition_count: 8,
+            groups: vec![
+                PartitionGroup {
+                    upstream_indices: vec![0, 1, 2],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![3, 4],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![5, 6, 7],
+                },
+            ],
+        };
+        let proto: protobuf::CoalescePlan = (&native).into();
+        let back: CoalescePlan = (&proto).into();
+        assert_eq!(native, back);
+        assert_eq!(back.groups.len(), 3);
+        assert_eq!(back.upstream_partition_count, 8);
+    }
+
+    #[test]
+    fn coalesce_plan_native_to_proto_roundtrip_non_contiguous_indices() {
+        // Proto allows arbitrary index sets even though the default algorithm
+        // only produces contiguous ranges.
+        let native = CoalescePlan {
+            upstream_partition_count: 6,
+            groups: vec![
+                PartitionGroup {
+                    upstream_indices: vec![0, 2, 4],
+                },
+                PartitionGroup {
+                    upstream_indices: vec![1, 3, 5],
+                },
+            ],
+        };
+        let proto: protobuf::CoalescePlan = (&native).into();
+        let back: CoalescePlan = (&proto).into();
+        assert_eq!(native, back);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_unresolved_shuffle_exec_roundtrip() {
+        let schema = create_test_schema();
+        let original_exec = UnresolvedShuffleExec::new_broadcast(7, schema.clone(), 4);
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded_exec = decoded_plan
+            .downcast_ref::<UnresolvedShuffleExec>()
+            .expect("Expected UnresolvedShuffleExec");
+
+        assert_eq!(decoded_exec.stage_id, 7);
+        assert!(decoded_exec.broadcast);
+        assert_eq!(decoded_exec.upstream_partition_count, 4);
+        assert_eq!(decoded_exec.output_partition_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_shuffle_reader_exec_roundtrip() {
+        let schema = create_test_schema();
+        let original_exec =
+            ShuffleReaderExec::try_new_broadcast(7, Vec::new(), schema.clone(), 4)
+                .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original_exec.clone()),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded_exec = decoded_plan
+            .downcast_ref::<ShuffleReaderExec>()
+            .expect("Expected ShuffleReaderExec");
+
+        assert_eq!(decoded_exec.stage_id, 7);
+        assert!(decoded_exec.broadcast);
+        assert_eq!(decoded_exec.upstream_partition_count, 4);
+        assert_eq!(decoded_exec.partition.len(), 1);
+    }
+
+    /// `INTERSECT` / `EXCEPT` lower to semi/anti joins with
+    /// `NullEquality::NullEqualsNull` so that NULL matches NULL. Ballista ships
+    /// the client's *logical* plan to the scheduler as protobuf, so that flag
+    /// has to survive the roundtrip: if it decodes back as `NullEqualsNothing`
+    /// the scheduler silently plans a different query than the client asked for
+    /// (NULL stops matching itself, so INTERSECT drops rows and EXCEPT keeps
+    /// them). See https://github.com/apache/datafusion-ballista/issues/2046
+    ///
+    /// `null_equality` is not part of the rendered plan, so this inspects the
+    /// decoded `Join` directly rather than asserting on a plan string.
+    #[tokio::test]
+    async fn logical_join_roundtrip_preserves_null_equality() {
+        use datafusion::common::NullEquality;
+        use datafusion::logical_expr::LogicalPlan;
+
+        fn join_null_equality(plan: &LogicalPlan) -> Option<NullEquality> {
+            if let LogicalPlan::Join(join) = plan {
+                return Some(join.null_equality);
+            }
+            plan.inputs().into_iter().find_map(join_null_equality)
+        }
+
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "t",
+            "../../examples/testdata/alltypes_plain.parquet",
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let plan = ctx
+            .state()
+            .create_logical_plan(
+                "select string_col from t intersect select string_col from t",
+            )
+            .await
+            .unwrap();
+        let plan = ctx.state().optimize(&plan).unwrap();
+        assert_eq!(
+            join_null_equality(&plan),
+            Some(NullEquality::NullEqualsNull),
+            "precondition: INTERSECT should plan a NullEqualsNull join"
+        );
+
+        let codec = BallistaLogicalExtensionCodec::default();
+        let node = LogicalPlanNode::try_from_logical_plan(&plan, &codec).unwrap();
+        let roundtripped = node.try_into_logical_plan(&ctx.task_ctx(), &codec).unwrap();
+
+        assert_eq!(
+            join_null_equality(&roundtripped),
+            Some(NullEquality::NullEqualsNull),
+            "null_equality must survive the logical plan protobuf roundtrip"
+        );
+    }
+
+    /// `RuntimeStatsExec` in sketching mode round-trips its ORDER BY
+    /// and keeps the sketch accessor available. Row-count accessor is
+    /// always available (and empty on a fresh operator).
+    #[tokio::test]
+    async fn test_runtime_stats_exec_roundtrip_with_sketch() {
+        use crate::execution_plans::RuntimeStatsExec;
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("v2", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let original =
+            RuntimeStatsExec::try_new(input.clone(), Some(vec![sort_expr.clone()]))
+                .unwrap();
+        // Fresh operator: row-count zero, sketch present but empty.
+        // EmptyExec exposes one partition, so partition-0 is the only slot.
+        assert_eq!(original.row_count(0).unwrap(), 0);
+        assert_eq!(original.total_row_count(), 0);
+        assert_eq!(original.sort_key_sketch(0).unwrap().unwrap().count(), 0);
+        assert_eq!(
+            original.merged_sort_key_sketch().unwrap().unwrap().count(),
+            0
+        );
+        // Out-of-range partition surfaces as an internal error, not a panic.
+        assert!(original.row_count(1).is_err());
+        assert!(original.sort_key_sketch(1).is_err());
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<RuntimeStatsExec>()
+            .expect("Expected RuntimeStatsExec");
+        let order_by = decoded
+            .order_by()
+            .expect("sketching mode preserves order_by");
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
+        assert!(!order_by[0].options.descending);
+        assert_eq!(decoded.row_count(0).unwrap(), 0);
+        assert_eq!(decoded.sort_key_sketch(0).unwrap().unwrap().count(), 0);
+        assert_eq!(
+            decoded.merged_sort_key_sketch().unwrap().unwrap().count(),
+            0
+        );
+    }
+
+    /// `RuntimeStatsExec` in row-count-only mode — `order_by = None`.
+    /// Sketch accessors return `None`; row-count accessors work.
+    #[tokio::test]
+    async fn test_runtime_stats_exec_roundtrip_row_count_only() {
+        use crate::execution_plans::RuntimeStatsExec;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v2",
+            DataType::Float64,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = RuntimeStatsExec::try_new(input.clone(), None).unwrap();
+        assert!(original.order_by().is_none());
+        assert_eq!(original.row_count(0).unwrap(), 0);
+        assert!(
+            original.sort_key_sketch(0).unwrap().is_none(),
+            "no sketch was requested at construction"
+        );
+        assert!(original.merged_sort_key_sketch().unwrap().is_none());
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<RuntimeStatsExec>()
+            .expect("Expected RuntimeStatsExec");
+        assert!(decoded.order_by().is_none());
+        assert!(decoded.sort_key_sketch(0).unwrap().is_none());
+        assert!(decoded.merged_sort_key_sketch().unwrap().is_none());
+    }
+
+    /// `try_new` refuses an empty ORDER BY — no routing key means the
+    /// downstream sketcher has nothing to sample.
+    #[test]
+    fn test_runtime_stats_exec_rejects_empty_order_by() {
+        use crate::execution_plans::RuntimeStatsExec;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v2",
+            DataType::Float64,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let err = RuntimeStatsExec::try_new(input, Some(vec![]))
+            .expect_err("empty order_by must be rejected");
+        assert!(
+            err.to_string().contains("order_by is Some but empty"),
+            "got: {err}"
+        );
+    }
+
+    /// `try_new` refuses a routing expression whose evaluated type is
+    /// not encodable — the sketch needs a fixed-width key, so failing
+    /// An `Int64` key and a nullable key are both sketchable now: the codec
+    /// covers every fixed-width type and NULLs are counted beside the values
+    /// rather than having nowhere to go.
+    #[test]
+    fn test_runtime_stats_exec_accepts_widened_routing_exprs() {
+        use crate::execution_plans::RuntimeStatsExec;
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::expressions::col;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("nullable_float", DataType::Float64, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new("when", DataType::Utf8, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_on = |name: &str| PhysicalSortExpr {
+            expr: col(name, schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+
+        for name in ["nullable_float", "id"] {
+            RuntimeStatsExec::try_new(input.clone(), Some(vec![sort_on(name)]))
+                .unwrap_or_else(|e| panic!("{name} must be sketchable: {e}"));
+        }
+
+        // What the codec does not cover is still refused, and says so.
+        let err = RuntimeStatsExec::try_new(input, Some(vec![sort_on("when")]))
+            .expect_err("a variable-width key has no fixed-width encoding");
+        assert!(
+            err.to_string().contains("no sort-key encoding"),
+            "got: {err}"
+        );
+    }
+
+    /// `PerPartitionFilterExec` round-trips through the codec: three input
+    /// partitions with three distinct range predicates re-materialize
+    /// on the other side with the same predicate strings in the same
+    /// order.
+    #[tokio::test]
+    async fn test_per_partition_filter_exec_roundtrip() {
+        use crate::execution_plans::PerPartitionFilterExec;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::scalar::ScalarValue;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(schema.clone()),
+        );
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(3)).unwrap(),
+        );
+        let range = |lo: i64, hi: i64| -> Arc<dyn PhysicalExpr> {
+            let c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("v", 0));
+            let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                c.clone(),
+                Operator::GtEq,
+                Arc::new(Literal::new(ScalarValue::Int64(Some(lo)))),
+            ));
+            let lt: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                c,
+                Operator::Lt,
+                Arc::new(Literal::new(ScalarValue::Int64(Some(hi)))),
+            ));
+            Arc::new(BinaryExpr::new(ge, Operator::And, lt))
+        };
+        let predicates = vec![range(0, 10), range(10, 20), range(20, 30)];
+        let original =
+            PerPartitionFilterExec::try_new(input.clone(), predicates.clone()).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<PerPartitionFilterExec>()
+            .expect("Expected PerPartitionFilterExec");
+        assert_eq!(decoded.predicates().len(), 3);
+        for (k, expected) in predicates.iter().enumerate() {
+            assert_eq!(
+                decoded.predicates()[k].to_string(),
+                expected.to_string(),
+                "predicate {k} mismatched after roundtrip",
+            );
+        }
+    }
+
+    /// `RangeFilterExec` round-trips through the codec: routing expr, raw
+    /// bounds, and halo widths reappear identical on the other side.
+    #[tokio::test]
+    async fn test_range_filter_exec_roundtrip() {
+        use crate::execution_plans::RangeFilterExec;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(schema.clone()),
+        );
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(3)).unwrap(),
+        );
+        use datafusion::scalar::ScalarValue;
+        let filter_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("v", 0));
+        // K=3 raw bounds: (-∞, 10), [10, 20), [20, +∞)
+        let raw_bounds: Vec<(Option<ScalarValue>, Option<ScalarValue>)> = vec![
+            (None, Some(ScalarValue::Float64(Some(10.0)))),
+            (
+                Some(ScalarValue::Float64(Some(10.0))),
+                Some(ScalarValue::Float64(Some(20.0))),
+            ),
+            (Some(ScalarValue::Float64(Some(20.0))), None),
+        ];
+        // Round-tripped alongside the bounds: the placement of the NULL run is
+        // not recoverable from the child on the far side.
+        let original_input_order = Some(InputOrder::Ordered(SortOptions {
+            descending: false,
+            nulls_first: true,
+        }));
+        let original = RangeFilterExec::try_new_resolved(
+            input.clone(),
+            filter_expr.clone(),
+            ScalarValue::Float64(Some(3.0)),
+            ScalarValue::Float64(Some(0.0)),
+            original_input_order,
+            raw_bounds.clone(),
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<RangeFilterExec>()
+            .expect("Expected RangeFilterExec");
+        assert_eq!(decoded.raw_bounds().unwrap(), raw_bounds);
+        assert_eq!(decoded.halo_lo(), &ScalarValue::Float64(Some(3.0)));
+        assert_eq!(decoded.halo_hi(), &ScalarValue::Float64(Some(0.0)));
+        assert_eq!(decoded.filter_expr().to_string(), filter_expr.to_string());
+        assert_eq!(decoded.input_order(), original_input_order);
+    }
+
+    /// A pending RangeFilterExec (unresolved bounds) refuses to serialize —
+    /// wire plans must always carry resolved bounds.
+    #[tokio::test]
+    async fn test_range_filter_exec_pending_refuses_serialization() {
+        use crate::execution_plans::RangeFilterExec;
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let source: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(schema.clone()),
+        );
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(2)).unwrap(),
+        );
+        use datafusion::scalar::ScalarValue;
+        let filter_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("v", 0));
+        let pending = RangeFilterExec::try_new_pending(
+            input,
+            filter_expr,
+            ScalarValue::Float64(Some(0.0)),
+            ScalarValue::Float64(Some(0.0)),
+            None,
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        let err = codec
+            .try_encode(
+                Arc::new(pending),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("before resolve_bounds"));
+    }
+
+    /// `BufferExec` in `Dam` mode round-trips through the codec.
+    /// The child is decoded from `inputs[0]` by the framework, so the
+    /// wire only carries the mode discriminant — a wrong discriminant
+    /// (added but not handled) would surface as a decode error.
+    #[tokio::test]
+    async fn test_buffer_exec_dam_roundtrip() {
+        use crate::execution_plans::{BufferExec, BufferMode};
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = BufferExec::try_new(input.clone(), BufferMode::Dam).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<BufferExec>()
+            .expect("Expected BufferExec");
+        assert!(matches!(decoded.mode(), BufferMode::Dam));
+    }
+
+    /// The wrapper carries its ORDER BY across the network so the executor's
+    /// sampler knows which column to route on. Round-trip a single-key
+    /// ordering to guard the codec's happy path.
+    #[tokio::test]
+    async fn test_unordered_range_repartition_exec_roundtrip_single_key() {
+        use crate::execution_plans::UnorderedRangeRepartitionExec;
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("v2", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let original = UnorderedRangeRepartitionExec::try_new(
+            input.clone(),
+            vec![sort_expr.clone()],
+            8,
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<UnorderedRangeRepartitionExec>()
+            .expect("Expected UnorderedRangeRepartitionExec");
+        let order_by = decoded.order_by();
+        assert_eq!(order_by.len(), 1, "single-key ORDER BY should round-trip");
+        assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
+        assert!(!order_by[0].options.descending);
+        assert!(order_by[0].options.nulls_first);
+        assert_eq!(decoded.output_partitions(), 8, "K must round-trip");
+    }
+
+    /// The API accepts multi-key lexicographic ordering (RANGE-frame windows
+    /// only route on the first key, but the wire format must not drop the
+    /// rest — that's the ROWS-frame follow-up's substrate).
+    #[tokio::test]
+    async fn test_unordered_range_repartition_exec_roundtrip_multi_key() {
+        use crate::execution_plans::UnorderedRangeRepartitionExec;
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let order_by = vec![
+            PhysicalSortExpr {
+                expr: col("v2", schema.as_ref()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+            PhysicalSortExpr {
+                expr: col("id", schema.as_ref()).unwrap(),
+                options: SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            },
+        ];
+        let original =
+            UnorderedRangeRepartitionExec::try_new(input.clone(), order_by.clone(), 16)
+                .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<UnorderedRangeRepartitionExec>()
+            .expect("Expected UnorderedRangeRepartitionExec");
+        let decoded_order_by = decoded.order_by();
+        assert_eq!(decoded_order_by.len(), 2, "multi-key ORDER BY must survive");
+        assert!(
+            decoded_order_by[1].options.descending,
+            "sort options must survive per-key"
+        );
+        assert!(!decoded_order_by[1].options.nulls_first);
+    }
+
+    /// `OrderedRangeRepartitionExec` requires input to declare a matching
+    /// sort ordering; wrap `EmptyExec` in a `SortExec` so the ordering
+    /// claim is present at construction time.
+    #[tokio::test]
+    async fn test_ordered_range_repartition_exec_roundtrip() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("v2", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let sort_lex = LexOrdering::new(vec![sort_expr.clone()]).unwrap();
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(sort_lex, leaf).with_preserve_partitioning(true));
+        let original = OrderedRangeRepartitionExec::try_new(
+            input.clone(),
+            vec![sort_expr.clone()],
+            8,
+        )
+        .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec
+            .try_encode(
+                Arc::new(original),
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
+            .unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec
+            .try_decode(&buf, &[input], &ctx, &DefaultPhysicalProtoConverter {})
+            .unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<OrderedRangeRepartitionExec>()
+            .expect("Expected OrderedRangeRepartitionExec");
+        let order_by = decoded.order_by();
+        assert_eq!(order_by.len(), 1, "ORDER BY must round-trip");
+        assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
+        assert_eq!(decoded.output_partitions(), 8, "K must round-trip");
+    }
+
+    /// Cross-version wire compatibility for `CopyTo` file formats.
+    ///
+    /// Ballista <= 54 encodes a file format as `FileFormatProto { encoder_position, blob }`,
+    /// where `encoder_position` indexes `[Parquet, Csv, Json, Arrow, Avro]`. Released clients
+    /// on the 54 crates talk to schedulers built from this branch, so the decoder has to keep
+    /// understanding those bytes.
+    ///
+    /// This is deliberately independent of the production `FileFormatProto`: it re-declares the
+    /// legacy layout locally, so a future change to how Ballista encodes file formats fails here
+    /// instead of silently mis-decoding. `file_format_serialization_roundtrip` cannot catch that,
+    /// because it encodes and decodes with the same codec and so passes for any self-consistent
+    /// encoding. See #2376, where delegating to DataFusion's codec made position 0 (Parquet)
+    /// decode as `FILE_FORMAT_KIND_UNSPECIFIED` and position 3 (Arrow) decode as Parquet.
+    #[tokio::test]
+    async fn decodes_file_format_bytes_from_a_54_client() {
+        /// The pre-#2348 on-the-wire layout, declared here so the test does not depend on the
+        /// production type.
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct LegacyFileFormatProto {
+            #[prost(uint32, tag = 1)]
+            pub encoder_position: u32,
+            #[prost(bytes, tag = 2)]
+            pub blob: Vec<u8>,
+        }
+
+        let codec = BallistaLogicalExtensionCodec::default();
+        let ctx = SessionContext::new().task_ctx();
+
+        // Position -> the extension the decoded factory must report. Avro (position 4) is
+        // omitted: DataFusion's `AvroLogicalExtensionCodec::try_decode_file_format` returns an
+        // `ArrowFormatFactory` in both 54 and 55, which is an upstream bug unrelated to this.
+        for (encoder_position, expected_ext) in
+            [(0u32, "parquet"), (1, "csv"), (2, "json"), (3, "arrow")]
+        {
+            let mut buf = Vec::new();
+            LegacyFileFormatProto {
+                encoder_position,
+                blob: Vec::new(),
+            }
+            .encode(&mut buf)
+            .unwrap();
+
+            let factory = codec
+                .try_decode_file_format(&buf, &ctx)
+                .unwrap_or_else(|e| {
+                    panic!("position {encoder_position} must still decode, got {e}")
+                });
+
+            assert_eq!(
+                factory.get_ext(),
+                expected_ext,
+                "position {encoder_position} must decode as {expected_ext}"
+            );
+        }
+    }
+}

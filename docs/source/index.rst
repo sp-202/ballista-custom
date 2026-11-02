@@ -1,0 +1,107 @@
+.. Licensed to the Apache Software Foundation (ASF) under one
+.. or more contributor license agreements.  See the NOTICE file
+.. distributed with this work for additional information
+.. regarding copyright ownership.  The ASF licenses this file
+.. to you under the Apache License, Version 2.0 (the
+.. "License"); you may not use this file except in compliance
+.. with the License.  You may obtain a copy of the License at
+
+..   http://www.apache.org/licenses/LICENSE-2.0
+
+.. Unless required by applicable law or agreed to in writing,
+.. software distributed under the License is distributed on an
+.. "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+.. KIND, either express or implied.  See the License for the
+.. specific language governing permissions and limitations
+.. under the License.
+
+=====================
+Apache DataFusion Ballista
+=====================
+
+Table of content
+================
+
+
+.. _toc.guide:
+
+.. toctree::
+   :maxdepth: 1
+   :caption: User Guide
+
+   Introduction <user-guide/introduction>
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Cluster Deployment
+
+   Deployment <user-guide/deployment/index>
+   Scheduler <user-guide/scheduler>
+   History Server <user-guide/history-server>
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Clients
+
+   Python <user-guide/python/index>
+   Rust <user-guide/rust>
+   SQL CLI <user-guide/cli>
+   Arrow Flight SQL <user-guide/flightsql>
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Reference
+
+   user-guide/configs
+   user-guide/tuning-guide
+   user-guide/metrics
+   user-guide/faq
+   user-guide/extending-components
+   user-guide/extensions-example
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Changelog
+
+   changelog/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Upgrade Guides
+
+   upgrading/index
+
+.. _toc.contributors:
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Contributors Guide
+
+   contributors-guide/architecture
+   contributors-guide/shuffle
+   contributors-guide/dataframe-cache
+   contributors-guide/code-organization
+   contributors-guide/user-personas
+   contributors-guide/development
+   contributors-guide/benchmarking/index
+   Source code <https://github.com/apache/datafusion-ballista/>
+
+.. _toc.about:
+
+.. toctree::
+   :maxdepth: 1
+   :caption: About
+
+   Comparison with DataFusion Distributed <about/datafusion-distributed-comparison>
+
+.. _toc.community:
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Community
+
+   community/communication
+   community/adopters
+
+   Issue tracker <https://github.com/apache/datafusion-ballista/issues>
+   Code of conduct <https://github.com/apache/datafusion-ballista/blob/main/CODE_OF_CONDUCT.md>

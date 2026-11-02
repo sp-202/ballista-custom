@@ -1,0 +1,1284 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::config::{
+    BALLISTA_ADAPTIVE_PLANNER_ENABLED, BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES,
+    BALLISTA_BROADCAST_JOIN_THRESHOLD_ROWS, BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE,
+    BALLISTA_CLIENT_USE_TLS, BALLISTA_COALESCE_ENABLED,
+    BALLISTA_COALESCE_MERGED_PARTITION_FACTOR, BALLISTA_COALESCE_SMALL_PARTITION_FACTOR,
+    BALLISTA_COALESCE_TARGET_PARTITION_BYTES,
+    BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES, BALLISTA_JOB_NAME,
+    BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
+    BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
+    BallistaConfig,
+};
+use crate::planner::BallistaQueryPlanner;
+use crate::serde::protobuf::KeyValuePair;
+use crate::serde::{BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec};
+use crate::utils::redact_config_value;
+use datafusion::common::DFSchemaRef;
+use datafusion::execution::context::{QueryPlanner, SessionConfig, SessionState};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::{CacheFactory, SessionStateBuilder};
+use datafusion::functions::all_default_functions;
+use datafusion::functions_aggregate::all_default_aggregate_functions;
+use datafusion::functions_nested::all_default_nested_functions;
+use datafusion::functions_window::all_default_window_functions;
+use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
+use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::prelude::Expr;
+use datafusion_proto::logical_plan::LogicalExtensionCodec;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::protobuf::LogicalPlanNode;
+use std::collections::HashMap;
+use std::error::Error;
+use std::sync::Arc;
+use tonic::codegen::http::HeaderName;
+use tonic::metadata::MetadataMap;
+use tonic::service::Interceptor;
+use tonic::transport::Endpoint;
+use tonic::{Request, Status};
+use uuid::Uuid;
+
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>> + Send + Sync>;
+
+/// Returns scalar functions for Ballista (DataFusion defaults)
+pub fn ballista_scalar_functions() -> Vec<Arc<ScalarUDF>> {
+    let mut functions = all_default_functions();
+    functions.append(&mut all_default_nested_functions());
+    functions
+}
+
+/// Returns aggregate functions for Ballista (DataFusion defaults)
+pub fn ballista_aggregate_functions() -> Vec<Arc<AggregateUDF>> {
+    all_default_aggregate_functions()
+}
+
+/// Returns window functions for Ballista (DataFusion defaults)
+pub fn ballista_window_functions() -> Vec<Arc<WindowUDF>> {
+    all_default_window_functions()
+}
+
+/// Provides methods which adapt [SessionState]
+/// for Ballista usage
+pub trait SessionStateExt {
+    /// Setups new [SessionState] for ballista usage
+    ///
+    /// State will be created with appropriate [SessionConfig] configured
+    fn new_ballista_state(
+        scheduler_url: String,
+    ) -> datafusion::error::Result<SessionState>;
+    /// Upgrades [SessionState] for ballista usage
+    ///
+    /// State will be upgraded to appropriate [SessionConfig]
+    fn upgrade_for_ballista(
+        self,
+        scheduler_url: String,
+    ) -> datafusion::error::Result<SessionState>;
+}
+
+/// [SessionConfig] extension with methods needed
+/// for Ballista configuration
+pub trait SessionConfigExt {
+    /// Creates session config which has
+    /// ballista configuration initialized
+    fn new_with_ballista() -> SessionConfig;
+
+    /// update [SessionConfig] with Ballista specific settings
+    fn upgrade_for_ballista(self) -> SessionConfig;
+
+    /// return ballista specific configuration or
+    /// creates one if does not exist
+    fn ballista_config(&self) -> BallistaConfig;
+
+    /// Overrides ballista's [LogicalExtensionCodec]
+    fn with_ballista_logical_extension_codec(
+        self,
+        codec: Arc<dyn LogicalExtensionCodec>,
+    ) -> SessionConfig;
+
+    /// Overrides ballista's [PhysicalExtensionCodec]
+    fn with_ballista_physical_extension_codec(
+        self,
+        codec: Arc<dyn PhysicalExtensionCodec>,
+    ) -> SessionConfig;
+
+    /// returns [LogicalExtensionCodec] if set
+    /// or default ballista codec if not
+    fn ballista_logical_extension_codec(&self) -> Arc<dyn LogicalExtensionCodec>;
+
+    /// returns [PhysicalExtensionCodec] if set
+    /// or default ballista codec if not
+    fn ballista_physical_extension_codec(&self) -> Arc<dyn PhysicalExtensionCodec>;
+
+    /// Overrides ballista's [QueryPlanner]
+    fn with_ballista_query_planner(
+        self,
+        planner: Arc<dyn QueryPlanner + Send + Sync + 'static>,
+    ) -> SessionConfig;
+
+    /// Returns ballista's [QueryPlanner] if overridden
+    fn ballista_query_planner(
+        &self,
+    ) -> Option<Arc<dyn QueryPlanner + Send + Sync + 'static>>;
+
+    /// Returns parallelism of standalone cluster
+    fn ballista_standalone_parallelism(&self) -> usize;
+
+    /// Forces the shuffle reader to always read partitions via the Arrow Flight client,
+    /// even when partitions are local to the node.
+    fn ballista_shuffle_reader_force_remote_read(&self) -> bool;
+    /// Forces the shuffle reader to always read partitions via the Arrow Flight client,
+    /// even when partitions are local to the node.
+    ///
+    /// Enabling forced remote read may significantly reduce performance,
+    /// as all partition reads will go through the Arrow Flight client even for local data.
+    /// Use only when necessary, like in tests
+    fn with_ballista_shuffle_reader_force_remote_read(
+        self,
+        force_remote_read: bool,
+    ) -> Self;
+
+    /// Sets parallelism of standalone cluster
+    ///
+    /// This option to be used to configure standalone session context
+    fn with_ballista_standalone_parallelism(self, parallelism: usize) -> Self;
+
+    /// Returns the byte-size threshold below which a hash join's smaller side
+    /// is promoted to `CollectLeft` and lowered via the broadcast pattern in
+    /// the distributed planner. `0` disables promotion.
+    fn ballista_broadcast_join_threshold_bytes(&self) -> usize;
+
+    /// Sets the byte-size threshold below which a hash join's smaller side
+    /// is promoted to `CollectLeft` and lowered via the broadcast pattern in
+    /// the distributed planner. Setting `0` disables promotion.
+    fn with_ballista_broadcast_join_threshold_bytes(self, threshold_bytes: usize)
+    -> Self;
+
+    /// retrieves the row-count threshold below which a hash join's smaller side
+    /// is promoted to `CollectLeft` and lowered via the broadcast pattern, used
+    /// as a fallback when byte-size statistics are unavailable. `0` disables
+    /// promotion via the row-count path.
+    fn ballista_broadcast_join_threshold_rows(&self) -> usize;
+
+    /// Sets the row-count threshold below which a hash join's smaller side is
+    /// promoted to `CollectLeft` and lowered via the broadcast pattern, used as
+    /// a fallback when byte-size statistics are unavailable. Setting `0`
+    /// disables promotion via the row-count path.
+    fn with_ballista_broadcast_join_threshold_rows(self, threshold_rows: usize) -> Self;
+
+    /// Returns the maximum per-partition hash-join build-side bytes before
+    /// falling back to SortMergeJoin under AQE. `0` disables the check.
+    fn ballista_hash_join_max_build_partition_bytes(&self) -> usize;
+
+    /// Sets the maximum per-partition hash-join build-side bytes before falling
+    /// back to SortMergeJoin under AQE. Setting `0` disables the check, which
+    /// leaves AQE on a hash join whatever the build size.
+    fn with_ballista_hash_join_max_build_partition_bytes(self, max_bytes: usize) -> Self;
+
+    /// retrieves grpc client max message size
+    fn ballista_grpc_client_max_message_size(&self) -> usize;
+
+    /// sets grpc client max message size
+    fn with_ballista_grpc_client_max_message_size(self, max_size: usize) -> Self;
+
+    /// Sets ballista job name
+    fn with_ballista_job_name(self, job_name: &str) -> Self;
+
+    /// get maximum in flight requests for shuffle reader
+    fn ballista_shuffle_reader_maximum_concurrent_requests(&self) -> usize;
+
+    /// Sets maximum in flight requests for shuffle reader
+    fn with_ballista_shuffle_reader_maximum_concurrent_requests(
+        self,
+        max_requests: usize,
+    ) -> Self;
+
+    /// Returns whether to prefer Flight protocol for remote shuffle reads.
+    fn ballista_shuffle_reader_remote_prefer_flight(&self) -> bool;
+
+    /// Sets whether to prefer Flight protocol for remote shuffle reads.
+    fn with_ballista_shuffle_reader_remote_prefer_flight(
+        self,
+        prefer_flight: bool,
+    ) -> Self;
+
+    /// Is adaptive query planner enabled
+    fn ballista_adaptive_query_planner_enabled(&self) -> bool;
+
+    /// Enables or disables adaptive query planning (enabled by default).
+    fn with_ballista_adaptive_query_planner(self, enabled: bool) -> Self;
+
+    /// Set user defined metadata keys in Ballista gRPC requests
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
+
+    /// Get a `tonic` interceptor configured to decorate the provided metadata keys
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor>;
+
+    /// Set a custom endpoint override function for gRPC client endpoint configuration
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: EndpointOverrideFn,
+    ) -> Self;
+
+    /// Get the custom endpoint override function for gRPC client endpoint configuration
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
+
+    /// Set whether to use TLS for executor connections (cluster-wide setting)
+    fn with_ballista_use_tls(self, use_tls: bool) -> Self;
+
+    /// Get whether to use TLS for executor connections
+    fn ballista_use_tls(&self) -> bool;
+
+    /// Returns whether the AQE coalesce-shuffle-partitions rule is enabled.
+    fn ballista_coalesce_enabled(&self) -> bool;
+    /// Sets whether the AQE coalesce-shuffle-partitions rule is enabled.
+    fn with_ballista_coalesce_enabled(self, enabled: bool) -> Self;
+
+    /// Returns the target post-coalesce partition byte size in bytes.
+    fn ballista_coalesce_target_partition_bytes(&self) -> usize;
+    /// Sets the target post-coalesce partition byte size in bytes.
+    fn with_ballista_coalesce_target_partition_bytes(self, bytes: usize) -> Self;
+
+    /// Returns the small-partition merge factor (Spark legacy).
+    fn ballista_coalesce_small_partition_factor(&self) -> f64;
+    /// Sets the small-partition merge factor (Spark legacy).
+    fn with_ballista_coalesce_small_partition_factor(self, factor: f64) -> Self;
+
+    /// Returns the merged-partition early-flush factor (Spark legacy).
+    fn ballista_coalesce_merged_partition_factor(&self) -> f64;
+    /// Sets the merged-partition early-flush factor (Spark legacy).
+    fn with_ballista_coalesce_merged_partition_factor(self, factor: f64) -> Self;
+}
+
+/// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
+/// which are used internally (not exposed in client)
+pub trait SessionConfigHelperExt {
+    /// converts [SessionConfig] to proto
+    fn to_key_value_pairs(&self) -> Vec<KeyValuePair>;
+    /// updates [SessionConfig] from proto
+    fn update_from_key_value_pair(self, key_value_pairs: &[KeyValuePair]) -> Self;
+    /// updates mut [SessionConfig] from proto
+    fn update_from_key_value_pair_mut(&mut self, key_value_pairs: &[KeyValuePair]);
+    /// changes some of default datafusion configuration
+    /// in order to make it suitable for ballista
+    fn ballista_restricted_configuration(self) -> Self;
+}
+
+impl SessionStateExt for SessionState {
+    fn new_ballista_state(
+        scheduler_url: String,
+    ) -> datafusion::error::Result<SessionState> {
+        let session_config = SessionConfig::new_with_ballista();
+        let planner = BallistaQueryPlanner::<LogicalPlanNode>::new(
+            scheduler_url,
+            BallistaConfig::default(),
+        );
+
+        let runtime_env = RuntimeEnvBuilder::new().build()?;
+        let session_state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(session_config)
+            .with_cache_factory(Some(Arc::new(BallistaCacheFactory::new())))
+            .with_runtime_env(Arc::new(runtime_env))
+            .with_query_planner(Arc::new(planner))
+            .with_optimizer_rules(crate::optimizer::ballista_default_optimizer_rules())
+            .with_scalar_functions(ballista_scalar_functions())
+            .with_aggregate_functions(ballista_aggregate_functions())
+            .with_window_functions(ballista_window_functions())
+            .build();
+
+        Ok(session_state)
+    }
+
+    fn upgrade_for_ballista(
+        self,
+        scheduler_url: String,
+    ) -> datafusion::error::Result<SessionState> {
+        let codec_logical = self.config().ballista_logical_extension_codec();
+        let planner_override = self.config().ballista_query_planner();
+
+        let session_config = self.config().clone().upgrade_for_ballista();
+
+        let ballista_config = session_config.ballista_config();
+
+        let optimizer_rules =
+            crate::optimizer::with_ballista_optimizer_rules(self.optimizers());
+
+        let builder = SessionStateBuilder::new_from_existing(self)
+            .with_config(session_config)
+            .with_optimizer_rules(optimizer_rules)
+            .with_cache_factory(Some(Arc::new(BallistaCacheFactory::new())));
+
+        let builder = match planner_override {
+            Some(planner) => builder.with_query_planner(planner),
+            None => {
+                let planner = BallistaQueryPlanner::<LogicalPlanNode>::with_extension(
+                    scheduler_url,
+                    ballista_config,
+                    codec_logical,
+                );
+                builder.with_query_planner(Arc::new(planner))
+            }
+        };
+
+        let session_state = builder
+            .with_scalar_functions(ballista_scalar_functions())
+            .with_aggregate_functions(ballista_aggregate_functions())
+            .with_window_functions(ballista_window_functions())
+            .build();
+
+        Ok(session_state)
+    }
+}
+
+/// Calls the `SessionConfig` setter matching `$ty`, converting `$val` first
+/// when the type needs it (only `f64` does, via `set_str`/`to_string()`,
+/// since `SessionConfig` has no `set_f64`).
+macro_rules! ballista_set_scalar {
+    (bool, $self:expr, $const:expr, $val:expr) => {
+        $self.set_bool($const, $val)
+    };
+    (usize, $self:expr, $const:expr, $val:expr) => {
+        $self.set_usize($const, $val)
+    };
+    (u64, $self:expr, $const:expr, $val:expr) => {
+        $self.set_u64($const, $val)
+    };
+    (f64, $self:expr, $const:expr, $val:expr) => {
+        $self.set_str($const, &$val.to_string())
+    };
+}
+
+/// Generates a `SessionConfigExt` getter/setter pair backed by a [BallistaConfig]
+/// value. The getter is named `ballista_<config_method>` and falls back to
+/// `BallistaConfig::default()` when the extension is unset; the setter is
+/// named `with_ballista_<config_method>`, takes a single `value: $ty`
+/// argument, and initializes the extension first if it's not already
+/// present. The `SessionConfig` setter (and any value conversion) is derived
+/// from `$ty` via [ballista_set_scalar].
+///
+/// Generated trait method name is derived from `$config_method`,
+/// this couples `BallistaConfig`'s public getter names to `SessionConfigExt`'s
+/// public method names: the two can no longer be renamed independently, since
+/// renaming a `BallistaConfig` getter also renames the `SessionConfigExt`
+/// method(s) generated for it here.
+///
+/// Write `<config_method> as <setter_name>` when the setter doesn't follow
+/// the `with_ballista_<config_method>` convention.
+macro_rules! ballista_config_option {
+    ($ty:ident, $config_method:ident as $setter:ident, $const:expr) => {
+        pastey::paste! {
+            fn [<ballista_ $config_method>](&self) -> $ty {
+                self.options()
+                    .extensions
+                    .get::<BallistaConfig>()
+                    .map(|c| c.$config_method())
+                    .unwrap_or_else(|| BallistaConfig::default().$config_method())
+            }
+
+            fn $setter(self, value: $ty) -> Self {
+                if self.options().extensions.get::<BallistaConfig>().is_some() {
+                    ballista_set_scalar!($ty, self, $const, value)
+                } else {
+                    ballista_set_scalar!(
+                        $ty, self.with_option_extension(BallistaConfig::default()), $const, value
+                    )
+                }
+            }
+        }
+    };
+
+    ($ty:ident, $config_method:ident, $const:expr) => {
+        pastey::paste! {
+            fn [<ballista_ $config_method>](&self) -> $ty {
+                self.options()
+                    .extensions
+                    .get::<BallistaConfig>()
+                    .map(|c| c.$config_method())
+                    .unwrap_or_else(|| BallistaConfig::default().$config_method())
+            }
+
+            fn [<with_ballista_ $config_method>](self, value: $ty) -> Self {
+                if self.options().extensions.get::<BallistaConfig>().is_some() {
+                    ballista_set_scalar!($ty, self, $const, value)
+                } else {
+                    ballista_set_scalar!(
+                        $ty, self.with_option_extension(BallistaConfig::default()), $const, value
+                    )
+                }
+            }
+        }
+    };
+}
+
+impl SessionConfigExt for SessionConfig {
+    fn new_with_ballista() -> SessionConfig {
+        SessionConfig::new()
+            .with_option_extension(BallistaConfig::default())
+            .with_information_schema(true)
+            .with_target_partitions(16)
+            .ballista_restricted_configuration()
+    }
+
+    fn upgrade_for_ballista(self) -> SessionConfig {
+        // Ballista's opinionated DataFusion defaults are applied once, when a
+        // plain config is first upgraded. The `BallistaConfig` extension marks a
+        // config that has already been through this path; re-applying the
+        // defaults on such a config would overwrite any values the user set
+        // afterwards (e.g. via `-c`/`SET`), so they are left untouched.
+        let already_upgraded =
+            self.options().extensions.get::<BallistaConfig>().is_some();
+
+        let ballista_config = self.ballista_config();
+        let config = self.with_option_extension(ballista_config);
+
+        if already_upgraded {
+            config
+        } else {
+            config.ballista_restricted_configuration()
+        }
+    }
+
+    fn ballista_config(&self) -> BallistaConfig {
+        self.options()
+            .extensions
+            .get::<BallistaConfig>()
+            .cloned()
+            .unwrap_or_else(BallistaConfig::default)
+    }
+
+    fn with_ballista_job_name(self, job_name: &str) -> Self {
+        if self.options().extensions.get::<BallistaConfig>().is_some() {
+            self.set_str(BALLISTA_JOB_NAME, job_name)
+        } else {
+            self.with_option_extension(BallistaConfig::default())
+                .set_str(BALLISTA_JOB_NAME, job_name)
+        }
+    }
+
+    fn with_ballista_logical_extension_codec(
+        self,
+        codec: Arc<dyn LogicalExtensionCodec>,
+    ) -> SessionConfig {
+        let extension = BallistaConfigExtensionLogicalCodec::new(codec);
+        self.with_extension(Arc::new(extension))
+    }
+    fn with_ballista_physical_extension_codec(
+        self,
+        codec: Arc<dyn PhysicalExtensionCodec>,
+    ) -> SessionConfig {
+        let extension = BallistaConfigExtensionPhysicalCodec::new(codec);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_logical_extension_codec(&self) -> Arc<dyn LogicalExtensionCodec> {
+        self.get_extension::<BallistaConfigExtensionLogicalCodec>()
+            .map(|c| c.codec())
+            .unwrap_or_else(|| Arc::new(BallistaLogicalExtensionCodec::default()))
+    }
+    fn ballista_physical_extension_codec(&self) -> Arc<dyn PhysicalExtensionCodec> {
+        self.get_extension::<BallistaConfigExtensionPhysicalCodec>()
+            .map(|c| c.codec())
+            .unwrap_or_else(|| Arc::new(BallistaPhysicalExtensionCodec::default()))
+    }
+
+    fn with_ballista_query_planner(
+        self,
+        planner: Arc<dyn QueryPlanner + Send + Sync + 'static>,
+    ) -> SessionConfig {
+        let extension = BallistaQueryPlannerExtension::new(planner);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_query_planner(
+        &self,
+    ) -> Option<Arc<dyn QueryPlanner + Send + Sync + 'static>> {
+        self.get_extension::<BallistaQueryPlannerExtension>()
+            .map(|c| c.planner())
+    }
+
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
+        let extension = BallistaGrpcMetadataInterceptor::new(metadata);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor> {
+        self.get_extension::<BallistaGrpcMetadataInterceptor>()
+            .unwrap_or_default()
+    }
+
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        let extension = BallistaConfigGrpcEndpoint::new(override_f);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>> {
+        self.get_extension::<BallistaConfigGrpcEndpoint>()
+    }
+
+    ballista_config_option!(
+        usize,
+        standalone_parallelism,
+        BALLISTA_STANDALONE_PARALLELISM
+    );
+
+    ballista_config_option!(
+        usize,
+        grpc_client_max_message_size,
+        BALLISTA_CLIENT_GRPC_MAX_MESSAGE_SIZE
+    );
+
+    ballista_config_option!(
+        usize,
+        broadcast_join_threshold_bytes,
+        BALLISTA_BROADCAST_JOIN_THRESHOLD_BYTES
+    );
+
+    ballista_config_option!(
+        usize,
+        broadcast_join_threshold_rows,
+        BALLISTA_BROADCAST_JOIN_THRESHOLD_ROWS
+    );
+
+    ballista_config_option!(
+        usize,
+        hash_join_max_build_partition_bytes,
+        BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES
+    );
+
+    ballista_config_option!(
+        usize,
+        shuffle_reader_maximum_concurrent_requests,
+        BALLISTA_SHUFFLE_READER_MAX_REQUESTS
+    );
+
+    ballista_config_option!(
+        bool,
+        shuffle_reader_force_remote_read,
+        BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ
+    );
+
+    ballista_config_option!(
+        bool,
+        shuffle_reader_remote_prefer_flight,
+        BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT
+    );
+
+    ballista_config_option!(
+        bool,
+        adaptive_query_planner_enabled as with_ballista_adaptive_query_planner,
+        BALLISTA_ADAPTIVE_PLANNER_ENABLED
+    );
+
+    ballista_config_option!(bool, use_tls, BALLISTA_CLIENT_USE_TLS);
+
+    ballista_config_option!(bool, coalesce_enabled, BALLISTA_COALESCE_ENABLED);
+
+    ballista_config_option!(
+        usize,
+        coalesce_target_partition_bytes,
+        BALLISTA_COALESCE_TARGET_PARTITION_BYTES
+    );
+
+    ballista_config_option!(
+        f64,
+        coalesce_small_partition_factor,
+        BALLISTA_COALESCE_SMALL_PARTITION_FACTOR
+    );
+
+    ballista_config_option!(
+        f64,
+        coalesce_merged_partition_factor,
+        BALLISTA_COALESCE_MERGED_PARTITION_FACTOR
+    );
+}
+
+impl SessionConfigHelperExt for SessionConfig {
+    fn to_key_value_pairs(&self) -> Vec<KeyValuePair> {
+        self.options()
+            .entries()
+            .iter()
+            // TODO: revisit this log once we this option is removed
+            //
+            // filtering this key as it's creating a lot of warning logs
+            // at the executor side.
+            .filter(|c| {
+                c.key != "datafusion.sql_parser.enable_options_value_normalization"
+            })
+            .map(|datafusion::config::ConfigEntry { key, value, .. }| {
+                log::trace!(
+                    "sending configuration key: `{key}`, value`{:?}`",
+                    value.as_deref().map(|v| redact_config_value(key, v))
+                );
+                KeyValuePair {
+                    key: key.to_owned(),
+                    value: value.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn update_from_key_value_pair(self, key_value_pairs: &[KeyValuePair]) -> Self {
+        let mut s = self;
+        s.update_from_key_value_pair_mut(key_value_pairs);
+        s
+    }
+
+    fn update_from_key_value_pair_mut(&mut self, key_value_pairs: &[KeyValuePair]) {
+        for KeyValuePair { key, value } in key_value_pairs {
+            match value {
+                Some(value) => {
+                    log::trace!(
+                        "setting up configuration key: `{key}`, value: `{:?}`",
+                        redact_config_value(key, value)
+                    );
+                    if let Err(e) = self.options_mut().set(key, value) {
+                        // there is not much we can do about this error at the moment.
+                        // it used to be warning but it gets very verbose
+                        // as even datafusion properties can't be parsed
+                        log::debug!(
+                            "could not set configuration key: `{key}`, value: `{:?}`, reason: {e}",
+                            redact_config_value(key, value)
+                        )
+                    }
+                }
+                None => {
+                    log::trace!(
+                        "can't set up configuration key: `{key}`, as value is None",
+                    )
+                }
+            }
+        }
+    }
+
+    fn ballista_restricted_configuration(self) -> Self {
+        let ballista_defaults = BallistaConfig::default();
+        self
+            // round robbin repartition does not work well with ballista.
+            // this setting it will also be enforced by the scheduler
+            // thus user will not be able to override it.
+            .with_round_robin_repartition(false)
+            // There is issue with Utv8View(s) where Arrow IPC will generate
+            // frames which would be too big to send using Arrow Flight.
+            //
+            // This configuration option will be disabled temporary.
+            //
+            // This configuration is not enforced by the scheduler, thus
+            // user could override this setting using `SET` operation.
+            //
+            // TODO: enable this option once we get to root of the problem
+            //       between `IpcWriter` and `ViewTypes`
+            .set_bool(
+                "datafusion.execution.parquet.schema_force_view_types",
+                false,
+            )
+            // same like previous comment
+            .set_bool("datafusion.sql_parser.map_string_types_to_utf8view", false)
+            //
+            // A build side smaller than these thresholds is collected into a
+            // CollectLeft (broadcast) hash join rather than being repartitioned.
+            // The values mirror Ballista's own broadcast thresholds so a single
+            // set of `ballista.optimizer.broadcast_join_threshold_*` defaults
+            // drives both DataFusion's built-in JoinSelection (static planner)
+            // and Ballista's AQE join selection.
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                ballista_defaults.broadcast_join_threshold_bytes() as u64,
+            )
+            .set_u64(
+                "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                ballista_defaults.broadcast_join_threshold_rows() as u64,
+            )
+            //
+            // DataFusion's hash join has no spill support, so each parallel
+            // task on an executor must hold the full build side in memory.
+            // Default to sort-merge join, which spills, until DataFusion gains
+            // a spilling hash join. Users can opt back in with
+            // `SET datafusion.optimizer.prefer_hash_join = true`.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1648
+            .set_bool("datafusion.optimizer.prefer_hash_join", false)
+            //
+            // DataFusion 54 plans uncorrelated scalar subqueries as a physical
+            // `ScalarSubqueryExec` wrapping a `ScalarSubqueryExpr` that reads an
+            // in-process shared results container. That container cannot cross
+            // process or stage boundaries, and `datafusion-proto` can only
+            // deserialize the expr inside its surrounding exec, so when Ballista
+            // splits a plan into stages the expr is serialized without its exec
+            // and the executor fails to decode it. Disabling this option makes
+            // the optimizer rewrite uncorrelated scalar subqueries to joins,
+            // which Ballista distributes correctly.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1909
+            .set_bool(
+                "datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery",
+                false,
+            )
+            //
+            // DataFusion's dynamic filters are populated at runtime by an
+            // upstream operator (a hash join build side, a TopK heap, a partial
+            // aggregate) and read by a downstream scan within the same plan.
+            // Ballista splits a plan into stages at shuffle and broadcast
+            // boundaries that run as independent tasks, so when the producing
+            // operator and the consuming scan land in different stages the
+            // filter is never populated across the boundary and the scan blocks
+            // forever. Disable dynamic filter pushdown until Ballista can carry
+            // dynamic filters across stage boundaries.
+            //
+            // See https://github.com/apache/datafusion-ballista/issues/1375
+            .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", false)
+    }
+}
+
+/// Wrapper for [SessionConfig] extension
+/// holding [LogicalExtensionCodec] if overridden
+struct BallistaConfigExtensionLogicalCodec {
+    codec: Arc<dyn LogicalExtensionCodec>,
+}
+
+impl BallistaConfigExtensionLogicalCodec {
+    fn new(codec: Arc<dyn LogicalExtensionCodec>) -> Self {
+        Self { codec }
+    }
+    fn codec(&self) -> Arc<dyn LogicalExtensionCodec> {
+        self.codec.clone()
+    }
+}
+
+/// Wrapper for [SessionConfig] extension
+/// holding [PhysicalExtensionCodec] if overridden
+struct BallistaConfigExtensionPhysicalCodec {
+    codec: Arc<dyn PhysicalExtensionCodec>,
+}
+
+impl BallistaConfigExtensionPhysicalCodec {
+    fn new(codec: Arc<dyn PhysicalExtensionCodec>) -> Self {
+        Self { codec }
+    }
+    fn codec(&self) -> Arc<dyn PhysicalExtensionCodec> {
+        self.codec.clone()
+    }
+}
+
+/// Wrapper for [SessionConfig] extension
+/// holding overridden [QueryPlanner]
+struct BallistaQueryPlannerExtension {
+    planner: Arc<dyn QueryPlanner + Send + Sync + 'static>,
+}
+
+impl BallistaQueryPlannerExtension {
+    fn new(planner: Arc<dyn QueryPlanner + Send + Sync + 'static>) -> Self {
+        Self { planner }
+    }
+    fn planner(&self) -> Arc<dyn QueryPlanner + Send + Sync + 'static> {
+        self.planner.clone()
+    }
+}
+
+/// Wrapper allowing additional metadata keys to be decorated to the scheduler
+/// gRPC request
+#[derive(Default, Clone)]
+pub struct BallistaGrpcMetadataInterceptor {
+    additional_metadata: HashMap<String, String>,
+}
+
+impl BallistaGrpcMetadataInterceptor {
+    /// Create a new interceptor with additional metadata
+    pub fn new(additional_metadata: HashMap<String, String>) -> Self {
+        Self {
+            additional_metadata,
+        }
+    }
+}
+
+impl Interceptor for BallistaGrpcMetadataInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if self.additional_metadata.is_empty() {
+            Ok(request)
+        } else {
+            let mut request_headers = request.metadata().clone().into_headers();
+            for (k, v) in &self.additional_metadata {
+                request_headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?,
+                    v.parse().map_err(|_e| {
+                        Status::invalid_argument(format!(
+                            "{v} is not a valid header value"
+                        ))
+                    })?,
+                );
+            }
+            *request.metadata_mut() = MetadataMap::from_headers(request_headers);
+            Ok(request)
+        }
+    }
+}
+
+/// Wrapper for customizing gRPC client endpoint configuration.
+/// This allows configuring TLS, timeouts, and other transport settings.
+#[derive(Clone)]
+pub struct BallistaConfigGrpcEndpoint {
+    override_f: EndpointOverrideFn,
+}
+
+impl BallistaConfigGrpcEndpoint {
+    /// Create a new endpoint configuration wrapper with the given override function
+    pub fn new(override_f: EndpointOverrideFn) -> Self {
+        Self { override_f }
+    }
+
+    /// Apply the custom configuration to an endpoint
+    pub fn configure_endpoint(
+        &self,
+        endpoint: Endpoint,
+    ) -> Result<Endpoint, Box<dyn Error + Send + Sync>> {
+        (self.override_f)(endpoint)
+    }
+}
+
+#[derive(Debug)]
+struct BallistaCacheFactory;
+
+impl BallistaCacheFactory {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl CacheFactory for BallistaCacheFactory {
+    fn create(
+        &self,
+        plan: LogicalPlan,
+        session_state: &SessionState,
+    ) -> datafusion::error::Result<LogicalPlan> {
+        if session_state.config().ballista_config().cache_noop() {
+            Ok(plan)
+        } else {
+            Ok(LogicalPlan::Extension(Extension {
+                node: Arc::new(BallistaCacheNode::new(
+                    Uuid::new_v4().to_string(),
+                    session_state.session_id().to_string(),
+                    plan,
+                )),
+            }))
+        }
+    }
+}
+
+/// Ballista logical Extension for caching.
+#[derive(PartialEq, Eq, PartialOrd, Hash, Debug)]
+pub struct BallistaCacheNode {
+    cache_id: String,
+    session_id: String,
+    input: LogicalPlan,
+    exprs: Vec<Expr>,
+}
+
+impl BallistaCacheNode {
+    /// Create a new cache node from provided logical input plan and cache infos.
+    pub fn new(cache_id: String, session_id: String, input: LogicalPlan) -> Self {
+        Self {
+            cache_id,
+            session_id,
+            input,
+            exprs: vec![],
+        }
+    }
+
+    /// Returns cache id.
+    pub fn cache_id(&self) -> &str {
+        self.cache_id.as_str()
+    }
+
+    /// Returns session id.
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+}
+
+impl UserDefinedLogicalNodeCore for BallistaCacheNode {
+    fn name(&self) -> &str {
+        "BallistaCacheNode"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![&self.input]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        self.input.schema()
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        self.exprs.clone()
+    }
+
+    fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<datafusion::prelude::Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        let [input] = <[LogicalPlan; 1]>::try_from(inputs).map_err(|_| {
+            datafusion::error::DataFusionError::Plan("input size must be one".to_string())
+        })?;
+
+        Ok(Self {
+            cache_id: self.cache_id.clone(),
+            session_id: self.session_id.clone(),
+            input,
+            exprs,
+        })
+    }
+}
+#[cfg(test)]
+mod test {
+    use datafusion::{
+        execution::{SessionState, SessionStateBuilder},
+        prelude::SessionConfig,
+    };
+
+    use crate::{
+        config::BALLISTA_JOB_NAME,
+        extension::{SessionConfigExt, SessionConfigHelperExt, SessionStateExt},
+    };
+
+    // Ballista disables round robin repatriations
+    #[tokio::test]
+    async fn should_disable_round_robin_repartition() {
+        let state =
+            SessionState::new_ballista_state("scheduler_url".to_string()).unwrap();
+
+        assert!(!state.config().round_robin_repartition());
+
+        let state = SessionStateBuilder::new().build();
+
+        assert!(state.config().round_robin_repartition());
+        let state = state
+            .upgrade_for_ballista("scheduler_url".to_string())
+            .unwrap();
+
+        assert!(!state.config().round_robin_repartition());
+    }
+
+    // User overrides of Ballista's soft defaults must survive `upgrade_for_ballista`;
+    // re-applying the defaults would discard them. See #1901.
+    #[test]
+    fn should_preserve_user_overrides_on_upgrade() {
+        // Ballista defaults these to prefer_hash_join=false and the threshold to
+        // 128 MB. The overrides below differ from those defaults so the assertions
+        // prove the user's values survived `upgrade_for_ballista`.
+        let mut config = SessionConfig::new_with_ballista();
+        config
+            .options_mut()
+            .set("datafusion.optimizer.prefer_hash_join", "true")
+            .unwrap();
+        config
+            .options_mut()
+            .set(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                "5242880",
+            )
+            .unwrap();
+
+        let upgraded = config.upgrade_for_ballista();
+
+        assert!(upgraded.options().optimizer.prefer_hash_join);
+        assert_eq!(
+            upgraded
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold,
+            5242880
+        );
+    }
+
+    // A plain (non-Ballista) config still receives Ballista's opinionated
+    // defaults when upgraded.
+    #[test]
+    fn should_apply_defaults_when_upgrading_plain_config() {
+        let config = SessionConfig::new().upgrade_for_ballista();
+
+        assert!(!config.options().optimizer.prefer_hash_join);
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold,
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold_rows,
+            1_000_000
+        );
+    }
+
+    // Uncorrelated scalar subqueries must be rewritten to joins rather than
+    // planned as a physical `ScalarSubqueryExec`, whose `ScalarSubqueryExpr`
+    // cannot be deserialized once Ballista splits the plan into stages. See
+    // #1909.
+    #[test]
+    fn should_disable_physical_uncorrelated_scalar_subquery() {
+        let config = SessionConfig::new().upgrade_for_ballista();
+        assert!(
+            !config
+                .options()
+                .optimizer
+                .enable_physical_uncorrelated_scalar_subquery
+        );
+    }
+
+    #[test]
+    fn should_convert_to_key_value_pairs() {
+        // key value pairs should contain datafusion and ballista values
+
+        let config =
+            SessionConfig::new_with_ballista().with_ballista_job_name("job_name");
+        let pairs = config.to_key_value_pairs();
+
+        assert!(pairs.iter().any(|p| p.key == BALLISTA_JOB_NAME));
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.key == "datafusion.catalog.information_schema")
+        )
+    }
+
+    #[test]
+    fn should_round_trip_all_macro_generated_options() {
+        let config = SessionConfig::new_with_ballista()
+            .with_ballista_standalone_parallelism(123)
+            .with_ballista_grpc_client_max_message_size(456)
+            .with_ballista_broadcast_join_threshold_bytes(789)
+            .with_ballista_broadcast_join_threshold_rows(42)
+            .with_ballista_hash_join_max_build_partition_bytes(999)
+            .with_ballista_shuffle_reader_maximum_concurrent_requests(7)
+            .with_ballista_coalesce_target_partition_bytes(2048)
+            .with_ballista_shuffle_reader_force_remote_read(true)
+            .with_ballista_shuffle_reader_remote_prefer_flight(true)
+            .with_ballista_use_tls(true)
+            .with_ballista_coalesce_enabled(true)
+            .with_ballista_adaptive_query_planner(false)
+            .with_ballista_coalesce_small_partition_factor(1.5)
+            .with_ballista_coalesce_merged_partition_factor(2.5);
+
+        assert!(!config.ballista_adaptive_query_planner_enabled());
+        assert!(config.ballista_shuffle_reader_force_remote_read());
+        assert!(config.ballista_shuffle_reader_remote_prefer_flight());
+        assert!(config.ballista_use_tls());
+        assert!(config.ballista_coalesce_enabled());
+        assert_eq!(config.ballista_standalone_parallelism(), 123);
+        assert_eq!(config.ballista_grpc_client_max_message_size(), 456);
+        assert_eq!(config.ballista_broadcast_join_threshold_bytes(), 789);
+        assert_eq!(config.ballista_broadcast_join_threshold_rows(), 42);
+        assert_eq!(config.ballista_hash_join_max_build_partition_bytes(), 999);
+        assert_eq!(config.ballista_coalesce_target_partition_bytes(), 2048);
+        assert_eq!(config.ballista_coalesce_small_partition_factor(), 1.5);
+        assert_eq!(config.ballista_coalesce_merged_partition_factor(), 2.5);
+        assert_eq!(
+            config.ballista_shuffle_reader_maximum_concurrent_requests(),
+            7
+        );
+    }
+
+    #[test]
+    fn should_round_trip_macro_generated_options_insert_ballista_config() {
+        let config = SessionConfig::new().with_ballista_standalone_parallelism(123);
+        assert_eq!(config.ballista_standalone_parallelism(), 123);
+
+        let config = SessionConfig::new().with_ballista_grpc_client_max_message_size(456);
+        assert_eq!(config.ballista_grpc_client_max_message_size(), 456);
+
+        let config =
+            SessionConfig::new().with_ballista_broadcast_join_threshold_bytes(789);
+        assert_eq!(config.ballista_broadcast_join_threshold_bytes(), 789);
+
+        let config = SessionConfig::new().with_ballista_use_tls(true);
+        assert!(config.ballista_use_tls());
+
+        let config = SessionConfig::new().with_ballista_use_tls(false);
+        assert!(!config.ballista_use_tls());
+
+        let config = SessionConfig::new().with_ballista_coalesce_enabled(true);
+        assert!(config.ballista_coalesce_enabled());
+    }
+
+    #[test]
+    fn test_ballista_grpc_metadata_interceptor() {
+        use std::collections::HashMap;
+        use tonic::Request;
+        use tonic::service::Interceptor;
+
+        use super::BallistaGrpcMetadataInterceptor;
+
+        // Test empty interceptor passes through unchanged
+        let mut interceptor = BallistaGrpcMetadataInterceptor::default();
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+        assert!(result.metadata().is_empty());
+
+        // Test interceptor adds metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("x-api-key".to_string(), "test-key".to_string());
+        metadata.insert("x-custom-header".to_string(), "custom-value".to_string());
+
+        let mut interceptor = BallistaGrpcMetadataInterceptor::new(metadata);
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            result
+                .metadata()
+                .get("x-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            result
+                .metadata()
+                .get("x-custom-header")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "custom-value"
+        );
+    }
+
+    #[test]
+    fn test_ballista_grpc_metadata_via_session_config() {
+        use std::collections::HashMap;
+        use tonic::Request;
+        use tonic::service::Interceptor;
+
+        // Test that metadata set via SessionConfig is accessible via interceptor
+        let mut metadata = HashMap::new();
+        metadata.insert("authorization".to_string(), "Bearer token123".to_string());
+
+        let config =
+            SessionConfig::new_with_ballista().with_ballista_grpc_metadata(metadata);
+
+        let interceptor = config.ballista_grpc_interceptor();
+        let mut interceptor = interceptor.as_ref().clone();
+
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            result
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer token123"
+        );
+    }
+
+    #[test]
+    fn test_ballista_endpoint_override_error_handling() {
+        use std::sync::Arc;
+        use tonic::transport::Endpoint;
+
+        use super::BallistaConfigGrpcEndpoint;
+
+        // Test that errors from override function are propagated
+        let override_fn: super::EndpointOverrideFn =
+            Arc::new(|_ep: Endpoint| Err("TLS configuration failed".into()));
+
+        let config_endpoint = BallistaConfigGrpcEndpoint::new(override_fn);
+        let endpoint = Endpoint::from_static("http://localhost:50051");
+        let result = config_endpoint.configure_endpoint(endpoint);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TLS configuration failed")
+        );
+    }
+
+    // Tests for helper functions that register DataFusion functions
+
+    #[test]
+    fn test_ballista_functions_include_datafusion() {
+        use super::{
+            ballista_aggregate_functions, ballista_scalar_functions,
+            ballista_window_functions,
+        };
+
+        // Test scalar functions
+        let scalar_funcs = ballista_scalar_functions();
+        assert!(scalar_funcs.iter().any(|f| f.name() == "abs"));
+        assert!(scalar_funcs.iter().any(|f| f.name() == "ceil"));
+        assert!(scalar_funcs.iter().any(|f| f.name() == "array_length")); // nested function
+
+        // Test aggregate functions
+        let agg_funcs = ballista_aggregate_functions();
+        assert!(agg_funcs.iter().any(|f| f.name() == "count"));
+        assert!(agg_funcs.iter().any(|f| f.name() == "sum"));
+        assert!(agg_funcs.iter().any(|f| f.name() == "avg"));
+
+        // Test window functions
+        let window_funcs = ballista_window_functions();
+        assert!(window_funcs.iter().any(|f| f.name() == "row_number"));
+        assert!(window_funcs.iter().any(|f| f.name() == "rank"));
+        assert!(window_funcs.iter().any(|f| f.name() == "dense_rank"));
+    }
+
+    #[tokio::test]
+    async fn test_ballista_functions_with_session_state() {
+        use super::{
+            ballista_aggregate_functions, ballista_scalar_functions,
+            ballista_window_functions,
+        };
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_scalar_functions(ballista_scalar_functions())
+            .with_aggregate_functions(ballista_aggregate_functions())
+            .with_window_functions(ballista_window_functions())
+            .build();
+
+        // Verify all function types are registered in SessionState
+        assert!(state.scalar_functions().contains_key("abs"));
+        assert!(state.aggregate_functions().contains_key("count"));
+        assert!(state.window_functions().contains_key("row_number"));
+    }
+}

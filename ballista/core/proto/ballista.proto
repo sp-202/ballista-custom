@@ -1,0 +1,1460 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package ballista.protobuf;
+
+option java_multiple_files = true;
+option java_package = "org.apache.datafusion.ballista.protobuf";
+option java_outer_classname = "BallistaProto";
+
+import "datafusion.proto";
+import "datafusion_common.proto";
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ballista Logical Plan
+///////////////////////////////////////////////////////////////////////////////////////////////////
+message BallistaLogicalPlanNode {
+  oneof LogicalPlanType {
+    LogicalPlanCacheNode cache_node = 1;
+  }
+}
+
+message LogicalPlanCacheNode {
+  string cache_id = 1;
+  string session_id = 2;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ballista Physical Plan
+///////////////////////////////////////////////////////////////////////////////////////////////////
+message BallistaPhysicalPlanNode {
+  oneof PhysicalPlanType {
+    ShuffleWriterExecNode shuffle_writer = 1;
+    ShuffleReaderExecNode shuffle_reader = 2;
+    UnresolvedShuffleExecNode unresolved_shuffle = 3;
+    SortShuffleWriterExecNode sort_shuffle_writer = 4;
+    ChaosExecNode chaos_exec = 5;
+    RuntimeStatsExecNode runtime_stats = 6;
+    BufferExecNode buffer = 7;
+    UnorderedRangeRepartitionExecNode unordered_range_repartition = 8;
+    OrderedRangeRepartitionExecNode ordered_range_repartition = 9;
+    PerPartitionFilterExecNode per_partition_filter = 10;
+    PartitionedBoundedWindowAggExecNode partitioned_bounded_window_agg = 11;
+    RangeShuffleReaderExecNode range_shuffle_reader = 12;
+    RangeFilterExecNode range_filter = 13;
+    PrefixMergeExecNode prefix_merge = 14;
+    RangeShuffleWriterExecNode range_shuffle_writer = 15;
+    DistributedQueryExecNode distributed_query = 16;
+    DistributedExplainAnalyzeExecNode distributed_explain_analyze = 17;
+    PipelinedShuffleWriterExecNode pipelined_shuffle_writer = 18;
+    PipelinedShuffleReaderExecNode pipelined_shuffle_reader = 19;
+  }
+}
+
+// Root of a stage in a pipelined job. Instead of writing shuffle files, it
+// routes its input into bounded in-memory queues that consumer tasks stream
+// from over Arrow Flight while the stage runs. The child plan is plumbed by
+// the framework as `inputs[0]`.
+message PipelinedShuffleWriterExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  // Hash repartitioning of the output. Absent for a passthrough stage, which
+  // keeps its input partitioning.
+  datafusion.PhysicalHashRepartition output_partitioning = 3;
+  // Every consumer task reads every output partition in full (the build side
+  // of a broadcast join), so outputs are retained for replay rather than
+  // handed to a single reader.
+  bool broadcast = 4;
+}
+
+// Leaf of a stage in a pipelined job that streams its input from the producer
+// tasks of an upstream stage while they run.
+message PipelinedShuffleReaderExecNode {
+  // One entry per output partition: the producer tasks to stream it from.
+  repeated PipelinedReaderPartition partition = 1;
+  datafusion_common.Schema schema = 2;
+  // The producer stage
+  uint32 stage_id = 3;
+  datafusion.Partitioning partitioning = 4;
+  // A single logical output partition that streams every partition of every
+  // producer task.
+  bool broadcast = 5;
+}
+
+message PipelinedReaderPartition {
+  repeated PipelinedPartitionLocation location = 1;
+}
+
+// Where a producer task of a pipelined stage serves one of its output
+// partitions while it runs.
+message PipelinedPartitionLocation {
+  // Job, producer stage and global output partition.
+  PartitionId partition_id = 1;
+  // The producer task within its stage.
+  uint32 task_id = 2;
+  ExecutorMetadata executor_meta = 3;
+}
+
+message DistributedQueryExecNode {
+  string scheduler_url = 1;
+  repeated KeyValuePair settings = 2;
+  bytes logical_plan = 3;
+  string session_id = 4;
+}
+
+// Wraps a DistributedQueryExec (its single input) and fetches the job
+// metrics from the scheduler once the query has completed.
+message DistributedExplainAnalyzeExecNode {
+  string scheduler_url = 1;
+  datafusion_common.Schema schema = 2;
+  bool verbose = 3;
+}
+
+// Value-range router over N locally-sorted overlapping input partitions.
+// Redistributes them into K range-disjoint output partitions where each
+// output is fully sorted on the routing expression. Uses N × K scatter
+// channels feeding K per-output k-way merges (via DataFusion's SPM
+// internals). Discovery of cut boundaries is identical to the unordered
+// variant — walk the child subtree for a matching `RuntimeStatsExec`, snap
+// its T-Digest.
+message OrderedRangeRepartitionExecNode {
+  // Lexicographic ORDER BY. Routing keys off the first entry; the full
+  // ordering is preserved for downstream operators. Must match the
+  // input's declared `output_ordering` at plan time.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+  // K — number of output partitions. Must be ≥ 2.
+  uint32 output_partitions = 2;
+}
+
+// Runtime-stats tap. Passes batches through unmodified while accumulating:
+//   * per-partition row counts (always)
+//   * a quantile sketch over the first ORDER BY expression's Float64 values
+//     (only when order_by is non-empty)
+// Downstream operators inside the same Ballista task read the stats via a
+// child-tree walk. The child plan is plumbed by the framework as `inputs[0]`.
+message RuntimeStatsExecNode {
+  // Optional lexicographic ORDER BY. Empty means row-count-only mode
+  // (no sketch allocated). When non-empty, the first entry drives the
+  // sketch and the rest are preserved for downstream operators
+  // (SortExec, BoundedWindowAggExec) that need the full ordering.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+}
+
+// A `SortKeySketch` is a wrapper around a KLL, that also includes NULL counts
+//
+// `levels` is an Arrow IPC stream for now. Binary blob encoding was considered
+// so that encoding tricks could be used like delta+varint. These showed a 4x
+// improvement for u64, but only 25% on f64 due to mantissas being effectively
+// random. Ultimately it was decided that a more complex encoder is not worth
+// the added complexity in this PR. We can revisit the decision in the future.
+message SortKeySketchState {
+  // KLL's nominal top-level compactor capacity
+  uint32 k = 1;
+  // Rows whose key was NULL. Not in `levels`, and not recoverable from it.
+  uint64 null_count = 2;
+  // The exact minimum and maximum over every value observed, one element per
+  // ORDER BY expression. Tracked outside the compactor stack so no coin flip
+  // can move them, which is what keeps `quantile(0.0)` and `quantile(1.0)`
+  // exact. Empty when no value was observed.
+  repeated datafusion_common.ScalarValue key_min = 3;
+  repeated datafusion_common.ScalarValue key_max = 4;
+  // The compactor stack: one row per level in level order, single column
+  // `levels: List<Struct<...>>` holding that level's retained keys ascending,
+  // one struct field per ORDER BY expression. An item's weight is
+  // `2^level`, so the row index carries the weight and the total count is
+  // the weighted sum — neither ships.
+  //
+  // Levels are sorted before serialization, so a decoder takes ascending
+  // order as given rather than being told per level.
+  //
+  // A three-level stack over an `Int64` key decodes to one batch of one
+  // column, where the row index is the level:
+  //
+  //   levels: List<item: Struct<expr_0: Int64>>
+  //
+  //   +-------------------------------------------+
+  //   | levels                                    |
+  //   +-------------------------------------------+
+  //   | [{expr_0: 4}, {expr_0: 17}, {expr_0: 23}] |  level 0, weight 1
+  //   | [{expr_0: 9}, {expr_0: 31}]               |  level 1, weight 2
+  //   | [{expr_0: 12}]                            |  level 2, weight 4
+  //   +-------------------------------------------+
+  bytes levels = 5;
+}
+
+// Flow-control operator with an operator-mode enum. The child plan is
+// plumbed by the framework as `inputs[0]` during decode.
+message BufferExecNode {
+  BufferMode mode = 1;
+}
+
+enum BufferMode {
+  // Buffers input while a MemoryReservation grows against the runtime's
+  // MemoryPool; the dam breaks when `try_grow` refuses further allocation.
+  BUFFER_MODE_DAM = 0;
+  // Future modes: PASS_THROUGH, BUFFER_ALL, SPILL_ON_PRESSURE, ...
+  // Add here as they land in Rust.
+}
+
+// Value-range router over unordered inputs. Reads P input partitions with
+// no sort assumption, evaluates the first ORDER BY expression per row, and
+// routes each row to one of K output partitions using cuts discovered at
+// runtime from a sibling RuntimeStatsExec's quantile sketch. The child
+// plan is plumbed by the framework as `inputs[0]`.
+message UnorderedRangeRepartitionExecNode {
+  // Lexicographic ORDER BY carried through from the wrapping window
+  // operator. Routing keys off the first entry today; the full ordering is
+  // preserved so downstream operators (SortExec, BWAG) that need it keep
+  // working.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+  // K — number of output partitions. Must be ≥ 2.
+  uint32 output_partitions = 2;
+}
+
+// Filter with per-input-partition predicates. `predicates[k]` is the
+// boolean expression applied to input partition `k`. Requires
+// `predicates.len() == input_partition_count`. The child plan is
+// plumbed by the framework as `inputs[0]` during decode.
+message PerPartitionFilterExecNode {
+  repeated datafusion.PhysicalExprNode predicates = 1;
+}
+
+// Filter inputs with a per-input-partition half-open range predicate
+// widened by `halo_lo` / `halo_hi`. `raw_bounds[k]` is the cut range for
+// input partition `k` before halo widening; RFE widens internally at
+// resolve time. Zero halo recovers the exact range-repartition trim used
+// above `ShuffleReaderExec`; non-zero halo widens each partition's read
+// range to include a boundary "context" band (bounded RANGE-frame windows).
+// The child plan is plumbed by the framework as `inputs[0]` during decode.
+// Serialization requires bounds to be resolved.
+message RangeFilterExecNode {
+  datafusion.PhysicalExprNode filter_expr = 1;
+  datafusion_common.ScalarValue halo_lo = 2;
+  datafusion_common.ScalarValue halo_hi = 3;
+  repeated RangeBound raw_bounds = 4;
+  // What the operator that produced the cuts says about the rows arriving.
+  // Unset claims nothing, which a nullable `filter_expr` has no answer for:
+  // a NULL has a side in the order, not a position among the values.
+  //
+  // `ordered` is also required of the input, so nothing planted between can
+  // reorder the rows the placement was stated against. `unordered_nulls_first`
+  // states the side without demanding an order, which is what leaves an
+  // unordered range-repartition upstream legal.
+  oneof input_order {
+    bool unordered_nulls_first = 5;
+    SortOptions ordered = 6;
+  }
+}
+
+// An arrow `SortOptions`, which has no proto of its own in the DataFusion
+// descriptors — `PhysicalSortExprNode` carries the pair inline beside an
+// expression this message's users already have.
+message SortOptions {
+  bool descending = 1;
+  bool nulls_first = 2;
+}
+
+// Half-open `[lo, hi)` cut range for one input partition. Either side may be
+// unset to signal ±∞.
+message RangeBound {
+  datafusion_common.ScalarValue lo = 1;
+  datafusion_common.ScalarValue hi = 2;
+}
+
+// Applies scheduler-computed prefix state to a window-aggregate column, so
+// each range-disjoint task's local running aggregate becomes a global one.
+message PrefixMergeExecNode {
+  // One entry per output column needing correction. Empty makes the operator
+  // a passthrough.
+  repeated WindowApplyNode applies = 1;
+  // Resolved prefix state, one entry per input partition, `[k]` summarising
+  // every partition before `k`. Encoding refuses while unresolved — an
+  // over-the-wire plan always ships with state bound, since an executor has
+  // no way to obtain it.
+  repeated FinalizedPartitionStateNode per_partition_state = 2;
+}
+
+// How to correct one window-function output column.
+message WindowApplyNode {
+  oneof apply {
+    ScalarWindowApplyNode scalar = 1;
+    AggregateWindowApplyNode aggregate = 2;
+  }
+}
+
+// Fast path: combine each row's value with a per-partition scalar.
+message ScalarWindowApplyNode {
+  ScalarOpNode op = 1;
+  // One scalar per input partition.
+  repeated datafusion_common.ScalarValue offset = 2;
+  uint32 output_column = 3;
+}
+
+// How a scalar offset combines with a row's existing value.
+enum ScalarOpNode {
+  SCALAR_OP_NODE_ADD = 0;
+  SCALAR_OP_NODE_MIN = 1;
+  SCALAR_OP_NODE_MAX = 2;
+  // Ignores the row's value entirely.
+  SCALAR_OP_NODE_OVERWRITE = 3;
+}
+
+// Fallback path: seed a fresh accumulator from the prefix state and replay
+// each row through it. Needed where a row's output is not itself a valid
+// partial state — AVG, and sketch-backed aggregates like approx_distinct.
+message AggregateWindowApplyNode {
+  // Resolved from the executor's function registry on decode.
+  string udf_name = 1;
+  repeated datafusion.PhysicalExprNode args = 2;
+  uint32 output_column = 3;
+  // Position in the upstream window operator's `window_expr()` list, which
+  // is what indexes into each FinalizedPartitionStateNode.
+  uint32 window_expr_index = 4;
+}
+
+// Prefix state for one input partition: one slot per window expression.
+message FinalizedPartitionStateNode {
+  repeated AggregateStateSlotNode slots = 1;
+}
+
+message AggregateStateSlotNode {
+  // Unset when that window expression published no state — a non-aggregate
+  // window function. Distinct from a present-but-empty state.
+  AggregateStateNode state = 1;
+}
+
+message AggregateStateNode {
+  repeated datafusion_common.ScalarValue values = 1;
+}
+
+// Wrapper for `BoundedWindowAggExec` that overrides
+// `required_input_distribution` to `Unspecified` — see the module doc on
+// `execution_plans::partitioned_bounded_window_agg` for what makes that safe.
+// The child plan is plumbed by the framework as `inputs[0]` during decode.
+// `input_order_mode` and `can_repartition` are hardcoded on the decode side
+// per the rule's shape gates; only `window_expr` needs to cross the wire.
+message PartitionedBoundedWindowAggExecNode {
+  repeated datafusion.PhysicalWindowExprNode window_expr = 1;
+}
+
+message ChaosExecNode {
+  double failure_probability = 1;
+  string fault_type = 2;
+  uint64 seed = 3;
+}
+
+message ShuffleWriterExecNode {
+  //TODO it seems redundant to provide job and stage id here since we also have them
+  // in the TaskDefinition that wraps this plan
+  string job_id = 1;
+  uint32 stage_id = 2;
+  datafusion.PhysicalPlanNode input = 3;
+  datafusion.PhysicalHashRepartition output_partitioning = 4;
+}
+
+// Sort-based shuffle writer that produces consolidated files with index
+message SortShuffleWriterExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  datafusion.PhysicalPlanNode input = 3;
+  datafusion.PhysicalHashRepartition output_partitioning = 4;
+  // Target batch size in rows when materializing buffered shuffle data.
+  uint64 batch_size = 8;
+  // Per-task buffered-bytes budget at which the writer spills its in-memory
+  // batches to disk. A value of 0 disables the per-task budget so spilling is
+  // driven solely by runtime memory-pool pressure. Optional so a plan produced
+  // before this field existed decodes to the built-in default rather than 0.
+  optional uint64 memory_limit_per_task_bytes = 9;
+}
+
+// Passthrough shuffle writer that emits the seekable Arrow IPC file format.
+// Carries no output partitioning: like `ShuffleWriterExecNode`'s passthrough
+// case it writes its input's partitioning through, one file per partition.
+message RangeShuffleWriterExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  datafusion.PhysicalPlanNode input = 3;
+}
+
+message UnresolvedShuffleExecNode {
+  uint32 stage_id = 1;
+  datafusion_common.Schema schema = 2;
+  datafusion.Partitioning partitioning = 5;
+  bool broadcast = 6;
+  uint32 upstream_partition_count = 7;
+  // Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
+  optional CoalescePlan coalesce = 8;
+}
+
+message ShuffleReaderExecNode {
+  repeated ShuffleReaderPartition partition = 1;
+  datafusion_common.Schema schema = 2;
+  // The stage to read from
+  uint32 stage_id = 3;
+  datafusion.Partitioning partitioning = 4;
+  bool broadcast = 5;
+  uint32 upstream_partition_count = 6;
+  // Optional coalesce metadata. Absent means "no coalesce" (legacy one-to-one read behavior).
+  optional CoalescePlan coalesce = 7;
+}
+
+message ShuffleReaderPartition {
+  // each partition of a shuffle read can read data from multiple locations
+  repeated PartitionLocation location = 1;
+}
+
+// Ordering-preserving shuffle reader. Reuses `ShuffleReaderPartition` for the
+// M-shape source layout. Partitioning is derived from `partition.len()`
+// (always `UnknownPartitioning`, range-partitioned by `merge_ordering`).
+message RangeShuffleReaderExecNode {
+  repeated ShuffleReaderPartition partition = 1;
+  datafusion_common.Schema schema = 2;
+  uint32 stage_id = 3;
+  // Sort key the reader's k-way merge preserves. Advertised on the reader's
+  // `PlanProperties.eq_properties` for downstream consumers.
+  repeated datafusion.PhysicalSortExprNode merge_ordering = 4;
+  // Row limit pushed down by a consuming merge. Absent means read everything.
+  optional uint64 fetch = 5;
+  // Half-open value range each output partition covers, halo already applied.
+  // One per output partition, or empty when the scheduler had no cuts. Lets
+  // the reader skip the parts of an indexed source that cannot hold a row the
+  // partition wants; the consuming RangeFilterExec still does the exact trim.
+  repeated RangeBound bounds = 6;
+}
+
+// CoalescePartitionsRule output: groups upstream partitions into coalesced output partitions.
+// Empty when no coalesce is applied (the optional field on the parent message is absent).
+message CoalescePlan {
+  // Original number of upstream partitions (M) before coalescing. Required for EXPLAIN's "K of M" rendering.
+  uint32 upstream_partition_count = 1;
+  // Coalesced output groups. Length is K (the post-coalesce partition count).
+  repeated PartitionGroup groups = 2;
+}
+
+// One coalesced output partition's source list: a set of upstream partition indices in [0, upstream_partition_count).
+// Default algorithm produces only contiguous indices, but proto allows arbitrary index sets for future strategies.
+message PartitionGroup {
+  repeated uint32 upstream_indices = 1;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ballista Scheduling
+///////////////////////////////////////////////////////////////////////////////////////////////////
+message ExecutionGraph {
+  string job_id = 1;
+  string session_id = 2;
+  JobStatus status = 3;
+  repeated ExecutionGraphStage stages = 4;
+  uint64 output_partitions = 5;
+  repeated PartitionLocation output_locations = 6;
+  string scheduler_id = 7;
+  repeated StageAttempts failed_attempts = 9;
+  string job_name = 10;
+  uint64 start_time = 11;
+  uint64 end_time = 12;
+  uint64 queued_at = 13;
+}
+
+message StageAttempts {
+  uint32 stage_id = 1;
+  repeated uint32 stage_attempt_num = 2;
+}
+
+message ExecutionGraphStage {
+  oneof StageType {
+    UnResolvedStage unresolved_stage = 1;
+    ResolvedStage resolved_stage = 2;
+    SuccessfulStage successful_stage = 3;
+    FailedStage failed_stage = 4;
+  }
+}
+
+message UnResolvedStage {
+  uint32 stage_id = 1;
+  repeated uint32 output_links = 3;
+  repeated  GraphStageInput inputs = 4;
+  bytes plan = 5;
+  uint32 stage_attempt_num = 6;
+  repeated string last_attempt_failure_reasons = 7;
+}
+
+message ResolvedStage {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated uint32 output_links = 4;
+  repeated  GraphStageInput inputs = 5;
+  bytes plan = 6;
+  uint32 stage_attempt_num = 7;
+  repeated string last_attempt_failure_reasons = 8;
+}
+
+message SuccessfulStage {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated uint32 output_links = 4;
+  repeated  GraphStageInput inputs = 5;
+  bytes plan = 6;
+  repeated TaskInfo task_infos = 7;
+  repeated OperatorMetricsSet stage_metrics = 8;
+  uint32 stage_attempt_num = 9;
+}
+
+message FailedStage {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated uint32 output_links = 4;
+  bytes plan = 5;
+  repeated TaskInfo task_infos = 6;
+  repeated OperatorMetricsSet stage_metrics = 7;
+  string error_message = 8;
+  uint32 stage_attempt_num = 9;
+}
+
+message TaskInfo {
+  uint32 task_id = 1;
+  uint32 partition_id = 2;
+  // Scheduler schedule time
+  uint64 scheduled_time = 3;
+  // Scheduler launch time
+  uint64 launch_time = 4;
+  // The time the Executor start to run the task
+  uint64 start_exec_time = 5;
+  // The time the Executor finish the task
+  uint64 end_exec_time = 6;
+  // Scheduler side finish time
+  uint64 finish_time = 7;
+  oneof status {
+    RunningTask running = 8;
+    FailedTask failed = 9;
+    SuccessfulTask successful = 10;
+  }
+}
+
+message GraphStageInput {
+  uint32 stage_id = 1;
+  repeated TaskInputPartitions partition_locations = 2;
+  bool complete = 3;
+}
+
+message TaskInputPartitions {
+  uint32 partition = 1;
+  repeated PartitionLocation partition_location = 2;
+}
+
+message KeyValuePair {
+  string key = 1;
+  optional string value = 2;
+}
+
+message Action {
+
+  oneof ActionType {
+    // Fetch a partition from an executor
+    FetchPartition fetch_partition = 3;
+    // Stream a partition from a running pipelined producer task
+    FetchPipelinedPartition fetch_pipelined_partition = 4;
+  }
+
+  // configuration settings
+  repeated KeyValuePair settings = 100;
+}
+
+message ExecutePartition {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  repeated uint32 partition_id = 3;
+  datafusion.PhysicalPlanNode plan = 4;
+  // The task could need to read partitions from other executors
+  repeated PartitionLocation partition_location = 5;
+  // Output partition for shuffle writer
+  datafusion.PhysicalHashRepartition output_partitioning = 6;
+}
+
+// How a shuffle writer laid its output out on disk. Selects the path shape,
+// and with it how a client parses the index beside the data. It says nothing
+// about the framing of the bytes inside the data file.
+enum ShuffleLayout {
+  // {stage_id}/{partition_id}/data-{file_id}.arrow — one file per output
+  // partition, written by the passthrough and range writers.
+  SHUFFLE_LAYOUT_PASSTHROUGH = 0;
+  // {stage_id}/{file_id}/data.arrow — one file per task holding every
+  // partition, written by the sort-based writer.
+  SHUFFLE_LAYOUT_SORT = 1;
+}
+
+// Which of the files making up a shuffle output is being asked for. Which
+// index sits beside the data, and how to read it, follows from the layout, so
+// it is not spelled out here.
+enum ShuffleFileKind {
+  SHUFFLE_FILE_KIND_DATA = 0;
+  SHUFFLE_FILE_KIND_INDEX = 1;
+}
+
+// A half-open byte range of a file: `[offset, offset + length)`.
+message ByteRange {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
+message FetchPartition {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 partition_id = 3;
+  string host = 5;
+  uint32 port = 6;
+  optional uint64 file_id = 7;
+  // How the producing writer laid its output out, which is what turns the
+  // identifiers above into a path.
+  ShuffleLayout layout = 9;
+  // Which file beside that partition to serve.
+  ShuffleFileKind file_kind = 10;
+  // Ranges to return, concatenated in request order, as absolute offsets into
+  // the file.
+  //
+  // Empty asks for whatever the identifiers above address. Under the sort
+  // layout that is the named partition's slice, which the executor resolves
+  // through its own index — one round trip, as it has always been. Under the
+  // passthrough layout it is the whole file.
+  //
+  // With ranges given the executor serves bytes and nothing else: no index
+  // read, no comparison, no notion of what a range means. That is what a
+  // consumer needs against object storage, where there is no executor to ask,
+  // and it is why the range shuffle's index carries byte offsets at all.
+  repeated ByteRange byte_ranges = 11;
+
+  // reserved after removing deprecated `path`.
+  reserved 4;
+  reserved "path";
+  // reserved after `is_sort_shuffle` became `layout`: the bool selected a path
+  // shape, which reads as data-vs-index once a file_kind exists beside it.
+  reserved 8;
+  reserved "is_sort_shuffle";
+}
+
+// Stream one output partition of a running pipelined producer task. The
+// executor waits a bounded time for the task to start if it has not yet.
+message FetchPipelinedPartition {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 task_id = 3;
+  uint32 partition_id = 4;
+  // The executor serving the partition, for proxies that forward the request.
+  string host = 5;
+  uint32 port = 6;
+  // How long the executor waits for the producer task to start, from the
+  // consumer's session. Zero uses the executor's default.
+  uint64 registration_timeout_ms = 7;
+}
+
+message PartitionLocation {
+  // partition_id of the map stage who produces the shuffle.
+  uint32 map_partition_id = 1;
+  // partition_id of the shuffle, a composition of(job_id + map_stage_id + partition_id).
+  PartitionId partition_id = 2;
+  ExecutorMetadata executor_meta = 3;
+  PartitionStats partition_stats = 4;
+  optional uint64 file_id = 6;
+  bool is_sort_shuffle = 7;
+
+  // reserved after removing deprecated `path`.
+  reserved 5;
+  reserved "path";
+}
+
+// Unique identifier for a materialized partition of data
+message PartitionId {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 partition_id = 4;
+}
+
+// Within-stage task identity (paired with job_id + stage_id on the parent
+// MultiTaskDefinition). One task processes a slice of partitions;
+// `task_id` names the task within the stage (it's the task's append-order
+// slot in `RunningStage.task_infos`, so (job_id, stage_id, task_id) is
+// globally unique). `global_output_partition_ids` gives the concrete
+// global partition ids the task's restricted plan is covering. Writers
+// use these to name shuffle files with global identity (via
+// `create_shuffle_path`) so downstream reads have a stable, canonical
+// address regardless of how the scheduler split the work.
+message TaskId {
+  uint32 task_id = 1;
+  uint32 task_attempt_num = 2;
+  // Global partition ids covered by this task, in slice order. Position i in
+  // the restricted plan corresponds to `global_output_partition_ids[i]` globally.
+  // `[packed=false]` keeps the single-partition case wire-compatible with the
+  // legacy `uint32 partition_id = 3` field: one element writes as a single
+  // varint at tag 3, exactly matching the old scalar encoding.
+  repeated uint32 global_output_partition_ids = 3 [packed=false];
+  // Vcores this task consumed from the executor's budget at bind time.
+  // The executor uses this to size the task's memory pool proportionally
+  // (`pool = total_memory * vcores_consumed / total_vcores`), so a
+  // multi-partition task claiming N vcores gets N/total of the executor's
+  // memory budget rather than a single per-vcore share.
+  uint32 vcores_consumed = 5;
+}
+
+message PartitionStats {
+  int64 num_rows = 1;
+  int64 num_batches = 2;
+  int64 num_bytes = 3;
+  repeated ColumnStats column_stats = 4;
+}
+
+message ColumnStats {
+  datafusion_common.ScalarValue min_value = 1;
+  datafusion_common.ScalarValue max_value = 2;
+  uint32 null_count = 3;
+  uint32 distinct_count = 4;
+}
+
+message OperatorMetricsSet {
+  repeated OperatorMetric metrics = 1;
+}
+
+
+message NamedCount {
+  string name = 1;
+  uint64 value = 2;
+}
+
+message NamedGauge {
+  string name = 1;
+  uint64 value = 2;
+}
+
+message NamedTime {
+  string name = 1;
+  uint64 value = 2;
+}
+
+message NamedPruningMetrics {
+  string name = 1;
+  uint64 pruned = 2;
+  uint64 matched = 3;
+}
+
+message NamedRatio {
+  string name = 1;
+  uint64 part = 2;
+  uint64 total = 3;
+}
+
+message OperatorMetric {
+  oneof metric {
+    uint64 output_rows = 1;
+    uint64 elapse_time = 2;
+    uint64 spill_count = 3;
+    uint64 spilled_bytes = 4;
+    uint64 current_memory_usage = 5;
+    NamedCount count = 6;
+    NamedGauge gauge = 7;
+    NamedTime time = 8;
+    int64 start_timestamp = 9;
+    int64 end_timestamp = 10;
+    uint64 spilled_rows = 11;
+    uint64 output_bytes = 12;
+    NamedPruningMetrics pruning_metrics = 13;
+    NamedRatio ratio = 14;
+    uint64 output_batches = 15;
+  }
+  // Local partition index within the reporting task's plan (0..slice_len-1).
+  // The scheduler maps this to a global partition id via the task's
+  // `global_input_partition_ids` when folding metrics into stage metrics.
+  optional uint32 partition = 16;
+}
+
+// Used by scheduler
+message ExecutorMetadata {
+  string id = 1;
+  string host = 2;
+  uint32 port = 3;
+  uint32 grpc_port = 4;
+  ExecutorSpecification specification = 5;
+  ExecutorOperatingSystemSpecification os_info = 6;
+}
+
+
+// Used for scheduler-executor
+// communication
+message ExecutorRegistration {
+  string id = 1;
+  optional string host = 2;
+  uint32 port = 3;
+  uint32 grpc_port = 4;
+  ExecutorSpecification specification = 5;
+  ExecutorOperatingSystemSpecification os_info = 6;
+  // Wire-protocol version this executor was built against. The scheduler
+  // rejects heartbeats/registrations whose version does not match its own
+  // compiled-in BALLISTA_PROTOCOL_VERSION. Old executors that predate this
+  // field default to 0, which is never a valid scheduler version.
+  uint32 ballista_protocol_version = 7;
+}
+
+message ExecutorHeartbeat {
+  string executor_id = 1;
+  // Unix epoch-based timestamp in seconds
+  uint64 timestamp = 2;
+  repeated ExecutorMetric metrics = 3;
+  ExecutorStatus status = 4;
+  uint64 peak_proc_physical_memory = 5;
+  uint64 peak_proc_virtual_memory = 6;
+}
+
+message ExecutorMetric {
+  // TODO add more metrics
+  oneof metric {
+    uint64 available_memory = 1;
+    uint64 total_memory = 2;
+    uint64 used_memory = 3;
+    uint64 proc_physical_memory = 4;
+    uint64 proc_virtual_memory = 5;
+    uint64 peak_physical_memory = 6;
+    uint64 peak_virtual_memory = 7;
+    // Bytes currently reserved across the memory pools of the executor's
+    // running tasks.
+    uint64 memory_pool_reserved = 8;
+    // The executor's total memory pool budget, in bytes. Absent when the
+    // pool is unbounded.
+    uint64 memory_pool_size = 9;
+    // Outstanding bytes allocated by the executor process, as counted by its
+    // global allocator. Includes memory the pools do not track.
+    uint64 allocated_memory = 10;
+  }
+}
+
+message ExecutorStatus {
+  oneof status {
+    string active = 1;
+    string dead = 2;
+    string unknown = 3;
+    string terminating = 4;
+  }
+}
+
+message ExecutorSpecification {
+  repeated ExecutorResource resources = 1;
+}
+
+// Virtual cores this executor has been assigned at runtime — analogous to
+// YARN vcores (yarn.nodemanager.resource.cpu-vcores) or Spark's
+// spark.executor.cores. Not physical `nproc`: may over- or under-subscribe.
+// One task per executor drives this many DataFusion partitions in parallel
+// through one plan-Arc.
+message ExecutorResource {
+  oneof resource {
+    uint32 vcores = 1;
+  }
+}
+
+message ExecutorOperatingSystemSpecification {
+  string system_name = 1;
+  string kernel_ver = 2;
+  string os_ver = 3;
+  string os_ver_long = 4;
+  uint32 physical_cores = 5;
+  uint32 num_disks = 6;
+  uint64 total_disk_space = 7;
+  uint64 total_available_disk_space = 8;
+  uint64 open_files_limit = 9;
+}
+
+// One instance per executor. Tracks free vcores for scheduler-side task
+// binding. See ExecutorResource for the vcore definition (YARN vcores or
+// Spark's spark.executor.cores).
+message AvailableVcores {
+  string executor_id = 1;
+  uint32 vcores = 2;
+}
+
+message ExecutorVcores {
+  repeated AvailableVcores vcores = 1;
+}
+
+message ExecutorData {
+  string executor_id = 1;
+  repeated ExecutorResourcePair resources = 2;
+}
+
+message ExecutorResourcePair {
+  ExecutorResource total = 1;
+  ExecutorResource available = 2;
+}
+
+message RunningTask {
+  string executor_id = 1;
+}
+
+message FailedTask {
+  string error = 1;
+  bool retryable = 2;
+  // Whether this task failure should be counted to the maximum number of times the task is allowed to retry
+  bool count_to_failures = 3;
+  oneof failed_reason {
+    ExecutionError execution_error = 4;
+    FetchPartitionError fetch_partition_error = 5;
+    IOError io_error = 6;
+    ExecutorLost executor_lost = 7;
+    // A successful task's result is lost due to executor lost
+    ResultLost result_lost = 8;
+    TaskKilled task_killed = 9;
+  }
+}
+
+// Per-column statistics for one task's shuffle output. An empty list on
+// SuccessfulTask means stats were not collected for that task.
+message TaskColumnStats {
+  // Index into the output schema's fields.
+  uint32 column      = 1;
+  uint64 null_count  = 2;
+  repeated ColumnSketch sketches = 3;
+}
+
+message ColumnSketch {
+  SketchType type = 1;
+  bytes data = 2;
+}
+
+enum SketchType {
+  SKETCH_TYPE_UNSPECIFIED = 0;
+  SKETCH_TYPE_HLL = 1;
+}
+
+message SuccessfulTask {
+  string executor_id = 1;
+  // TODO tasks are currently always shuffle writes but this will not always be the case
+  // so we might want to think about some refactoring of the task definitions
+  repeated ShuffleWritePartition partitions = 2;
+  // Reports from `RuntimeStatsExec` operators in this task's plan that
+  // are still valid at the plan's output (walked from the top through
+  // distribution-preserving nodes only — see
+  // `range_repartition_common::preserves_distribution`). Empty when the
+  // plan has no such stats-taps. Currently reports one entry per
+  // executed `RuntimeStatsExec`; the scheduler groups by `order_by` tag
+  // to combine reports across tasks/executors.
+  repeated RuntimeStatsReport runtime_stats = 3;
+  // Finalized window-aggregate state captured during this task, one entry
+  // per (output partition, window expression, PARTITION BY group) that
+  // closed. Empty unless the plan contains an ever-expanding-frame window
+  // (`UNBOUNDED PRECEDING`), which is the only shape DataFusion will
+  // publish accumulator state for. The scheduler prefix-merges these across
+  // tasks and bakes the result into a downstream `PrefixMergeExec`.
+  //
+  // TODO: watch the size of this. Task completion is a hot, frequent
+  // message, and sketch-backed aggregates make the payload unbounded in a
+  // way row counts and quantile sketches are not — an HLL or KLL state is
+  // kilobytes per window expression per partition, and a task covering a
+  // wide partition slice carries one of each. If it stops being small,
+  // write the state as a sidecar next to the shuffle files instead, the way
+  // sort-shuffle already writes `<data>.arrow.index` beside its data
+  // (`sort_shuffle::get_index_path`), and send only a reference here. That
+  // keeps the completion message fixed-size regardless of aggregate.
+  repeated WindowStateReport window_state = 4;
+  repeated TaskColumnStats task_column_stats = 5;
+}
+
+// One finalized window-aggregate state from a task's
+// `BoundedWindowAggExec`.
+message WindowStateReport {
+  // The stage's *global* output partition this state belongs to.
+  uint32 global_partition_id = 1;
+  // Position in the window operator's `window_expr()` list. Indexes window
+  // expressions, not partitions.
+  uint32 window_expr_index = 2;
+  // The PARTITION BY tuple that closed. Empty for a window with no
+  // PARTITION BY, which is the only shape the prefix rewrite plants today.
+  repeated datafusion_common.ScalarValue partition_key = 3;
+  // `Accumulator::state` for the closed group: one element for SUM / COUNT /
+  // MIN / MAX, two for AVG's (sum, count), one opaque Binary for
+  // sketch-backed aggregates like approx_distinct. Carried as ScalarValue
+  // rather than a numeric field so non-decomposable aggregates work
+  // unchanged.
+  repeated datafusion_common.ScalarValue state = 4;
+}
+
+// One report per `RuntimeStatsExec` in the executed plan.
+message RuntimeStatsReport {
+  // What the operator was sampling. Empty = row-count-only mode. When
+  // non-empty, the first entry identifies which routing expression this
+  // sketch describes; the scheduler groups sketches by this tag to
+  // combine samples across tasks that were sampling the same expression.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+  // Per-partition observations. Interpretation depends on the operator's
+  // position in the plan — pre-repartition gets one entry per input
+  // partition, post-repartition gets one per output sub-partition. The
+  // scheduler groups by `order_by` tag and aggregates.
+  repeated RuntimeStatsPartitionEntry partitions = 2;
+  // Every partition's observations folded into one sketch, merged on the
+  // executor before the report is sent. Absent in row-count-only mode,
+  // and when no partition observed a value.
+  optional SortKeySketchState sketch = 3;
+}
+
+// One partition's observations from a `RuntimeStatsExec`.
+message RuntimeStatsPartitionEntry {
+  uint32 partition_id = 1;
+  uint64 row_count = 2;
+  reserved 3; // was TDigest
+  reserved "sketch";
+  // This partition's exact key range, one element per ORDER BY expression.
+  // `cut_partitions` routes a whole shuffle file into every downstream
+  // partition whose range overlaps `[key_min, key_max]`, so these are the
+  // only per-partition facts a router needs — never the distribution, which
+  // is why the sketch beside them is merged rather than repeated here.
+  //
+  // Both empty when this partition observed no value, which `null_count`
+  // then distinguishes: some NULLs means a file of NULLs with no value range
+  // to overlap, none means the partition saw nothing at all.
+  repeated datafusion_common.ScalarValue key_min = 4;
+  repeated datafusion_common.ScalarValue key_max = 5;
+  // Rows in this partition whose key was NULL. Folds to the report-level
+  // `SortKeySketchState.null_count`.
+  uint64 null_count = 6;
+}
+
+message ExecutionError {
+}
+
+message FetchPartitionError {
+  string executor_id = 1;
+  uint32 map_stage_id = 2;
+  uint32 map_partition_id = 3;
+}
+
+message IOError {
+}
+
+message ExecutorLost {
+}
+
+message ResultLost {
+}
+
+message TaskKilled {
+}
+
+message ShuffleWritePartition {
+  uint64 partition_id = 1;
+  uint64 num_batches = 3;
+  uint64 num_rows = 4;
+  uint64 num_bytes = 5;
+  optional uint64 file_id = 6;
+  bool is_sort_shuffle = 7;
+
+  // reserved after removing path
+  reserved 2;
+  reserved "path";
+}
+
+message TaskStatus {
+  // Task's append-order slot in `RunningStage.task_infos`; (job_id,
+  // stage_id, task_id) is globally unique. Under the multi-partition-task
+  // model one task processes a partition slice, so this names the task,
+  // not a single partition.
+  uint32 task_id = 1;
+  string job_id = 2;
+  uint32 stage_id = 3;
+  uint32 stage_attempt_num = 4;
+  uint64 launch_time = 6;
+  uint64 start_exec_time = 7;
+  uint64 end_exec_time = 8;
+  oneof status {
+    RunningTask running = 9;
+    FailedTask failed = 10;
+    SuccessfulTask successful = 11;
+  }
+  repeated OperatorMetricsSet metrics = 12;
+}
+
+message PollWorkParams {
+  ExecutorRegistration metadata = 1;
+  uint32 num_free_vcores = 2;
+  // All tasks must be reported until they reach the failed or completed state
+  repeated TaskStatus task_status = 3;
+}
+
+// Pull-based single-task dispatch. One task processes a slice of
+// partitions; `task_id` names the task within the stage (its append-order
+// slot in `RunningStage.task_infos`), `global_output_partition_ids` gives
+// the concrete global partition ids it covers. The task's plan is
+// scheduler-side shrink-restricted so its leaves report `slice.len()`
+// partitions; the writer uses `global_output_partition_ids` to attach
+// global identity to shuffle files (except in cases where the plan itself
+// resets partitioning: the writer walks its child plan to detect
+// SortPreservingMergeExec or RepartitionExec::Hash and picks the right
+// global mapping).
+message TaskDefinition {
+  uint32 task_id = 1;
+  uint32 task_attempt_num = 2;
+  string job_id = 3;
+  uint32 stage_id = 4;
+  uint32 stage_attempt_num = 5;
+  bytes plan = 7;
+  string session_id = 9;
+  uint64 launch_time = 10;
+  repeated KeyValuePair props = 11;
+  // Global partition ids covered by this task, in slice order.
+  repeated uint32 global_output_partition_ids = 12;
+  // Vcores this task consumed at bind time — see TaskId.vcores_consumed.
+  uint32 vcores_consumed = 13;
+}
+
+// A set of tasks in the same stage
+message MultiTaskDefinition {
+  repeated TaskId task_ids = 1;
+  string job_id = 2;
+  uint32 stage_id = 3;
+  uint32 stage_attempt_num = 4;
+  bytes plan = 5;
+  string session_id = 7;
+  uint64 launch_time = 8;
+  repeated KeyValuePair props = 9;
+}
+
+message JobSessionConfig {
+  string session_id = 1;
+  repeated KeyValuePair configs = 2;
+}
+
+message PollWorkResult {
+  repeated TaskDefinition tasks = 1;
+  repeated CleanJobDataParams jobs_to_clean = 2;
+}
+
+message RegisterExecutorParams {
+  ExecutorRegistration metadata = 1;
+}
+
+message RegisterExecutorResult {
+  bool success = 1;
+}
+
+message HeartBeatParams {
+  string executor_id = 1;
+  repeated ExecutorMetric metrics = 2;
+  ExecutorStatus status = 3;
+  ExecutorRegistration metadata = 4;
+}
+
+message HeartBeatResult {
+  // TODO it's from Spark for BlockManager
+  bool reregister = 1;
+}
+
+message StopExecutorParams {
+  string executor_id = 1;
+  // stop reason
+  string reason = 2;
+  // force to stop the executor immediately
+  bool force = 3;
+}
+
+message StopExecutorResult {
+}
+
+message ExecutorStoppedParams {
+  string executor_id = 1;
+  // stop reason
+  string reason = 2;
+}
+
+message ExecutorStoppedResult {
+}
+
+message UpdateTaskStatusParams {
+  string executor_id = 1;
+  // All tasks must be reported until they reach the failed or completed state
+  repeated TaskStatus task_status = 2;
+}
+
+message UpdateTaskStatusResult {
+  bool success = 1;
+}
+
+message ExecuteQueryParams {
+  oneof query {
+    bytes logical_plan = 1;
+    bytes substrait_plan = 6;
+    // An already-built physical plan, serialized with the scheduler's
+    // physical extension codec. Lets clients bypass logical-plan creation
+    // on the scheduler, e.g. for plans containing custom operators that
+    // have no logical-plan representation.
+    bytes physical_plan = 7;
+  }
+  // reserved after removing deprecated `sql` query type.
+  reserved 2;
+  reserved "sql";
+
+  string session_id = 3;
+  repeated KeyValuePair settings = 4;
+  // operation_id is unique number for each request
+  // client makes. it helps mapping requests between
+  // client and scheduler
+  string operation_id = 5;
+}
+
+message CreateUpdateSessionParams {
+  string session_id = 2;
+  repeated KeyValuePair settings = 1;
+}
+
+message CreateUpdateSessionResult {
+  string session_id = 1;
+}
+
+message UpdateSessionParams {
+  string session_id = 1;
+  repeated KeyValuePair settings = 2;
+}
+
+message UpdateSessionResult {
+  bool success = 1;
+}
+
+message RemoveSessionParams {
+  string session_id = 1;
+}
+
+message RemoveSessionResult {
+  bool success = 1;
+}
+
+message ExecuteSqlParams {
+  string sql = 1;
+}
+
+message ExecuteQueryResult {
+  oneof result {
+    ExecuteQuerySuccessResult success = 1;
+    ExecuteQueryFailureResult failure = 2;
+  }
+  string operation_id = 3;
+}
+
+message ExecuteQuerySuccessResult {
+  string job_id = 1;
+  string session_id = 2;
+}
+
+message ExecuteQueryFailureResult {
+  oneof failure {
+    string session_not_found = 1;
+    string plan_parsing_failure = 2;
+    string sql_parsing_failure = 3;
+  }
+}
+
+message GetJobStatusParams {
+  string job_id = 1;
+}
+
+message GetJobMetricsParams {
+  string job_id = 1;
+}
+
+message JobStageMetrics {
+  uint32 stage_id = 1;
+  uint32 partitions = 2;
+  repeated OperatorWithMetrics operators = 3;
+}
+
+message OperatorWithMetrics {
+  uint32 depth = 1;
+  string operator_type = 2;
+  string operator_desc = 3;
+  repeated OperatorMetric metrics = 4;
+}
+
+message GetJobMetricsResult {
+  repeated JobStageMetrics stages = 1;
+}
+
+message SuccessfulJob {
+  repeated PartitionLocation partition_location = 1;
+  uint64 queued_at = 2;
+  uint64 started_at = 3;
+  uint64 ended_at = 4;
+  // For a pipelined job: where its final stage served each output partition,
+  // the same as in its running status. A small result can finish before a
+  // polling client has seen the job running; the client can still read it.
+  repeated PipelinedPartitionLocation pipelined_output_locations = 5;
+}
+
+message QueuedJob {
+  uint64 queued_at = 1;
+}
+
+// TODO: add progress report
+message RunningJob {
+  uint64 queued_at = 1;
+  uint64 started_at = 2;
+  string scheduler = 3;
+  // Set for a pipelined job once its tasks are placed: where the final stage
+  // serves each output partition. The client streams these while the job is
+  // still running, since the final stage cannot finish until it is drained.
+  repeated PipelinedPartitionLocation pipelined_output_locations = 4;
+}
+
+message FailedJob {
+  string error = 1;
+  uint64 queued_at = 2;
+  uint64 started_at = 3;
+  uint64 ended_at = 4;
+}
+
+message JobStatus {
+  string job_id = 5;
+  string job_name = 6;
+
+  oneof status {
+    QueuedJob queued = 1;
+    RunningJob running = 2;
+    FailedJob failed = 3;
+    SuccessfulJob successful = 4;
+  }
+}
+
+message GetJobStatusResult {
+  JobStatus status = 1;
+  oneof flight_proxy {
+      bool local = 2;
+      string external = 3;
+  }
+}
+
+message FilePartitionMetadata {
+  repeated string filename = 1;
+}
+
+message CancelJobParams {
+  string job_id = 1;
+}
+
+message CancelJobResult {
+  bool cancelled = 1;
+}
+
+message CleanJobDataParams {
+  string job_id = 1;
+  // Specific stage ids to remove within the job dir.
+  // Empty means remove the whole job dir (legacy behavior).
+  repeated uint32 remove_stage_ids = 2;
+}
+
+message CleanJobDataResult {
+}
+
+message LaunchTaskParams {
+  // Allow to launch a task set to an executor at once
+  repeated TaskDefinition tasks = 1;
+  // Scheduler callback endpoint in host:port format.
+  string scheduler_endpoint = 2;
+}
+
+message LaunchMultiTaskParams {
+  // Allow to launch a task set to an executor at once
+  repeated MultiTaskDefinition multi_tasks = 1;
+  // Scheduler callback endpoint in host:port format.
+  string scheduler_endpoint = 2;
+}
+
+message LaunchTaskResult {
+  bool success = 1;
+  // TODO when part of the task set are scheduled successfully
+}
+
+message LaunchMultiTaskResult {
+  reserved 1;
+  reserved "success";
+  // Job IDs the executor could not decode/validate. These jobs are failed
+  // individually while the rest of the batch still runs; an empty list means
+  // the whole batch was accepted. A successful RPC does not imply every job ran.
+  repeated string failed_jobs = 2;
+}
+
+message CancelTasksParams {
+  repeated RunningTaskInfo task_infos = 1;
+}
+
+message CancelTasksResult {
+  bool cancelled = 1;
+}
+
+message RemoveJobDataParams {
+  string job_id = 1;
+  // Specific stage ids to remove within the job dir.
+  // Empty means remove the whole job dir (legacy behavior).
+  repeated uint32 remove_stage_ids = 2;
+}
+
+message RemoveJobDataResult {
+}
+
+message RunningTaskInfo {
+  // Per-stage append-order slot; (job_id, stage_id, task_id) is globally
+  // unique (see TaskStatus).
+  uint32 task_id = 1;
+  string job_id = 2;
+  uint32 stage_id = 3;
+}
+
+service SchedulerGrpc {
+  // Executors must poll the scheduler for heartbeat and to receive tasks
+  rpc PollWork (PollWorkParams) returns (PollWorkResult) {}
+
+  rpc RegisterExecutor(RegisterExecutorParams) returns (RegisterExecutorResult) {}
+
+  // Push-based task scheduler will only leverage this interface
+  // rather than the PollWork interface to report executor states
+  rpc HeartBeatFromExecutor (HeartBeatParams) returns (HeartBeatResult) {}
+
+  rpc UpdateTaskStatus (UpdateTaskStatusParams) returns (UpdateTaskStatusResult) {}
+
+  rpc CreateUpdateSession (CreateUpdateSessionParams) returns (CreateUpdateSessionResult) {}
+
+  rpc RemoveSession (RemoveSessionParams) returns (RemoveSessionResult) {}
+
+  rpc ExecuteQueryPush (ExecuteQueryParams) returns (stream GetJobStatusResult) {}
+
+  rpc ExecuteQuery (ExecuteQueryParams) returns (ExecuteQueryResult) {}
+
+  rpc GetJobStatus (GetJobStatusParams) returns (GetJobStatusResult) {}
+
+  rpc GetJobMetrics (GetJobMetricsParams) returns (GetJobMetricsResult) {}
+
+  // Used by Executor to tell Scheduler it is stopped.
+  rpc ExecutorStopped (ExecutorStoppedParams) returns (ExecutorStoppedResult) {}
+
+  rpc CancelJob (CancelJobParams) returns (CancelJobResult) {}
+
+  rpc CleanJobData (CleanJobDataParams) returns (CleanJobDataResult) {}
+}
+
+service ExecutorGrpc {
+  rpc LaunchTask (LaunchTaskParams) returns (LaunchTaskResult) {}
+
+  rpc LaunchMultiTask (LaunchMultiTaskParams) returns (LaunchMultiTaskResult) {}
+
+  rpc StopExecutor (StopExecutorParams) returns (StopExecutorResult) {}
+
+  rpc CancelTasks (CancelTasksParams) returns (CancelTasksResult) {}
+
+  rpc RemoveJobData (RemoveJobDataParams) returns (RemoveJobDataResult) {}
+}

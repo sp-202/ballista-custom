@@ -1,0 +1,819 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Ballista executor logic
+
+use crate::execution_engine::DefaultExecutionEngine;
+use crate::execution_engine::ExecutionEngine;
+use crate::execution_engine::QueryStageExecutor;
+use crate::execution_loop::any_to_string;
+use crate::metrics::LoggingMetricsCollector;
+use crate::metrics::{ExecutorMemoryMetrics, ExecutorMetricsCollector};
+use crate::runtime_cache::SessionRuntimeCache;
+use ballista_core::ConfigProducer;
+use ballista_core::JobId;
+use ballista_core::RuntimeProducer;
+use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::PipelinedRegistry;
+use ballista_core::registry::BallistaFunctionRegistry;
+use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
+use ballista_core::serde::scheduler::TaskKey;
+use dashmap::DashMap;
+use datafusion::execution::context::TaskContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::prelude::SessionConfig;
+use futures::FutureExt;
+use futures::future::AbortHandle;
+use futures::task::AtomicWaker;
+use log::error;
+use log::warn;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
+
+/// A future that resolves when all active tasks on an executor have completed.
+///
+/// This is used during graceful shutdown to wait for in-flight tasks to drain
+/// before terminating the executor process.
+pub struct TasksDrainedFuture(
+    /// The executor instance to monitor for task completion.
+    pub Arc<Executor>,
+);
+
+impl Future for TasksDrainedFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.tasks_drained_waker.register(cx.waker());
+        if !self.0.abort_handles.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+type AbortHandles = Arc<DashMap<TaskKey, AbortHandle>>;
+
+/// Ballista executor
+#[derive(Clone)]
+pub struct Executor {
+    /// Metadata
+    pub metadata: ExecutorRegistration,
+
+    /// Directory for storing partial results
+    pub work_dir: String,
+
+    /// Function registry
+    pub function_registry: Arc<BallistaFunctionRegistry>,
+
+    /// Creates [RuntimeEnv] based on [SessionConfig]
+    pub runtime_producer: RuntimeProducer,
+
+    /// Creates default [SessionConfig]
+    pub config_producer: ConfigProducer,
+
+    /// Collector for runtime execution metrics
+    pub metrics_collector: Arc<dyn ExecutorMetricsCollector>,
+
+    /// Virtual cores assigned to this executor. See CLI docs on `--vcores`.
+    pub vcores: usize,
+
+    /// Handles to abort executing tasks
+    abort_handles: AbortHandles,
+
+    tasks_drained_waker: Arc<AtomicWaker>,
+
+    /// Execution engine that the executor will delegate to
+    /// for executing query stages
+    pub(crate) execution_engine: Arc<dyn ExecutionEngine>,
+
+    /// Optional session-keyed cache of shared base runtime envs. When set,
+    /// `produce_runtime_for_session` reuses read-side state across a session's
+    /// tasks; when `None`, each task builds a runtime from `runtime_producer`.
+    session_runtime_cache: Option<Arc<dyn SessionRuntimeCache>>,
+
+    /// Executor-wide memory usage, sampled for heartbeats. Set when the
+    /// executor was started with memory metrics enabled.
+    memory_metrics: Option<ExecutorMemoryMetrics>,
+
+    /// Output partitions of the pipelined producer tasks running here, served
+    /// to consumers by the Flight service.
+    pipelined_registry: Arc<PipelinedRegistry>,
+
+    /// The runtime each pipelined job's tasks here share, by job id. See
+    /// [`Executor::produce_runtime_for_pipelined_task`].
+    pipelined_runtimes: Arc<parking_lot::Mutex<HashMap<String, Weak<RuntimeEnv>>>>,
+}
+
+impl Executor {
+    /// Create a new executor instance with given [RuntimeEnv]
+    /// It will use default scalar, aggregate and window functions
+    pub fn new_basic(
+        metadata: ExecutorRegistration,
+        work_dir: &str,
+        runtime_producer: RuntimeProducer,
+        config_producer: ConfigProducer,
+        vcores: usize,
+    ) -> Self {
+        Self::new(
+            metadata,
+            work_dir,
+            runtime_producer,
+            config_producer,
+            Arc::new(BallistaFunctionRegistry::default()),
+            Arc::new(LoggingMetricsCollector::default()),
+            vcores,
+            Arc::new(DefaultExecutionEngine::new()),
+        )
+    }
+
+    /// Create a new executor instance with given [RuntimeEnv],
+    /// [datafusion::logical_expr::ScalarUDF], [datafusion::logical_expr::AggregateUDF] and [datafusion::logical_expr::WindowUDF]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        metadata: ExecutorRegistration,
+        work_dir: &str,
+        runtime_producer: RuntimeProducer,
+        config_producer: ConfigProducer,
+        function_registry: Arc<BallistaFunctionRegistry>,
+        metrics_collector: Arc<dyn ExecutorMetricsCollector>,
+        vcores: usize,
+        execution_engine: Arc<dyn ExecutionEngine>,
+    ) -> Self {
+        let pipelined_registry = Arc::new(PipelinedRegistry::new(metadata.id.clone()));
+        Self {
+            metadata,
+            work_dir: work_dir.to_owned(),
+            function_registry,
+            runtime_producer,
+            config_producer,
+            metrics_collector,
+            vcores,
+            abort_handles: Default::default(),
+            tasks_drained_waker: Default::default(),
+            execution_engine,
+            session_runtime_cache: None,
+            memory_metrics: None,
+            pipelined_registry,
+            pipelined_runtimes: Default::default(),
+        }
+    }
+    /// Creates new Executor with default `ExecutionEngine`.
+    /// Default `ExecutionEngine` does not cache client connections.
+    pub fn with_default_execution_engine(
+        metadata: ExecutorRegistration,
+        work_dir: &str,
+        runtime_producer: RuntimeProducer,
+        config_producer: ConfigProducer,
+        function_registry: Arc<BallistaFunctionRegistry>,
+        metrics_collector: Arc<dyn ExecutorMetricsCollector>,
+        vcores: usize,
+    ) -> Self {
+        Self::new(
+            metadata,
+            work_dir,
+            runtime_producer,
+            config_producer,
+            function_registry,
+            metrics_collector,
+            vcores,
+            Arc::new(DefaultExecutionEngine::new()),
+        )
+    }
+}
+
+impl Executor {
+    fn wake_tasks_drained(&self) {
+        if self.abort_handles.is_empty() {
+            self.tasks_drained_waker.wake();
+        }
+    }
+
+    /// Creates a [`RuntimeEnv`] using the configured runtime producer.
+    pub fn produce_runtime(
+        &self,
+        config: &SessionConfig,
+    ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
+        (self.runtime_producer)(config)
+    }
+
+    /// Attaches (or clears) the session-keyed runtime cache. Cloning the
+    /// `Executor` shares the same cache via `Arc`.
+    pub fn with_session_runtime_cache(
+        mut self,
+        cache: Option<Arc<dyn SessionRuntimeCache>>,
+    ) -> Self {
+        self.session_runtime_cache = cache;
+        self
+    }
+
+    /// Attaches (or clears) the executor-wide memory metrics reported in
+    /// heartbeats. It should be the same handle the memory pool policy
+    /// registers task pools with.
+    pub(crate) fn with_memory_metrics(
+        mut self,
+        metrics: Option<ExecutorMemoryMetrics>,
+    ) -> Self {
+        self.memory_metrics = metrics;
+        self
+    }
+
+    /// The executor-wide memory metrics, when memory metrics are enabled.
+    pub(crate) fn memory_metrics(&self) -> Option<&ExecutorMemoryMetrics> {
+        self.memory_metrics.as_ref()
+    }
+
+    /// Produces the runtime for a task, reusing the session's shared read-side
+    /// state when a session cache is attached; otherwise builds a runtime per
+    /// task via the `runtime_producer`. `vcores_consumed` is the number of
+    /// vcores this task claimed at bind time; the memory pool policy uses it
+    /// to size the per-task pool proportionally.
+    pub fn produce_runtime_for_session(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+        vcores_consumed: u32,
+    ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
+        match &self.session_runtime_cache {
+            Some(cache) => cache.produce_runtime(session_id, config, vcores_consumed),
+            None => (self.runtime_producer)(config),
+        }
+    }
+
+    /// Produces the runtime for a task of the pipelined job `job_id`.
+    ///
+    /// A pipelined job's tasks on this executor run at the same time, on one
+    /// reservation of `reserved_vcores`. So they share one runtime, and with it
+    /// one memory pool sized by that reservation: pools sized task by task
+    /// would add up to more than the executor's memory.
+    pub fn produce_runtime_for_pipelined_task(
+        &self,
+        job_id: &str,
+        session_id: &str,
+        config: &SessionConfig,
+        reserved_vcores: u32,
+    ) -> datafusion::error::Result<Arc<RuntimeEnv>> {
+        let mut runtimes = self.pipelined_runtimes.lock();
+        if let Some(runtime) = runtimes.get(job_id).and_then(Weak::upgrade) {
+            return Ok(runtime);
+        }
+        // Forget jobs whose tasks here have all finished.
+        runtimes.retain(|_, runtime| runtime.strong_count() > 0);
+        let runtime =
+            self.produce_runtime_for_session(session_id, config, reserved_vcores)?;
+        runtimes.insert(job_id.to_owned(), Arc::downgrade(&runtime));
+        Ok(runtime)
+    }
+
+    /// Creates a default [`SessionConfig`] using the configured config producer,
+    /// with this executor's pipelined registry attached: that is how a task's
+    /// pipelined writer and readers find it.
+    pub fn produce_config(&self) -> SessionConfig {
+        (self.config_producer)().with_extension(self.pipelined_registry.clone())
+    }
+
+    /// Execute one partition of a query stage and persist the result to disk in IPC format. On
+    /// success, return a RecordBatch containing metadata about the results, including path
+    /// and statistics.
+    pub async fn execute_query_stage(
+        &self,
+        key: TaskKey,
+        query_stage_exec: Arc<dyn QueryStageExecutor>,
+        task_ctx: Arc<TaskContext>,
+    ) -> Result<Vec<ShuffleWritePartition>, BallistaError> {
+        let (task, abort_handle) = futures::future::abortable(
+            query_stage_exec.execute_query_stage(key.task_id, task_ctx),
+        );
+
+        self.abort_handles.insert(key.clone(), abort_handle);
+
+        let partitions = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            Ok(Ok(result)) => result.map_err(BallistaError::from),
+            Ok(Err(_)) => {
+                warn!("Task has been aborted!");
+                Err(BallistaError::Cancelled)
+            }
+            Err(p) => {
+                let error_msg = format!("{:#?}", any_to_string(&p));
+                error!("{error_msg}");
+                Err(BallistaError::Internal(error_msg))
+            }
+        };
+
+        // cancel_task only signals the abort; this task owns removal after unwinding.
+        self.abort_handles.remove(&key);
+        self.wake_tasks_drained();
+
+        self.metrics_collector.record_stage(
+            &key.job_id,
+            key.stage_id,
+            key.task_id,
+            query_stage_exec,
+        );
+
+        partitions
+    }
+
+    /// Cancels a running task by aborting its execution.
+    ///
+    /// Returns `Ok(true)` if the task was found and cancelled, `Ok(false)` if not found.
+    pub async fn cancel_task(
+        &self,
+        job_id: JobId,
+        stage_id: usize,
+        task_id: usize,
+    ) -> Result<bool, BallistaError> {
+        // execute_query_stage removes the handle after the aborted task unwinds.
+        if let Some(handle) = self.abort_handles.get(&TaskKey {
+            job_id,
+            stage_id,
+            task_id,
+        }) {
+            handle.abort();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns the working directory path for this executor.
+    pub fn work_dir(&self) -> &str {
+        &self.work_dir
+    }
+
+    /// The output partitions of the pipelined producer tasks running on this
+    /// executor.
+    pub fn pipelined_registry(&self) -> &Arc<PipelinedRegistry> {
+        &self.pipelined_registry
+    }
+
+    /// Forgets the pipelined outputs of `job_id`, or of just `stage_ids` when
+    /// given, once the scheduler has cleaned the job up.
+    pub fn remove_pipelined_job_data(&self, job_id: &JobId, stage_ids: &[u32]) {
+        if stage_ids.is_empty() {
+            self.pipelined_registry.remove_job(job_id);
+            self.pipelined_runtimes.lock().remove(job_id.as_str());
+        } else {
+            for stage_id in stage_ids {
+                self.pipelined_registry
+                    .remove_stage(job_id, *stage_id as usize);
+            }
+        }
+    }
+
+    /// Returns the number of tasks currently executing on this executor.
+    pub fn active_task_count(&self) -> usize {
+        self.abort_handles.len()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::execution_engine::{DefaultQueryStageExec, ShuffleWriterVariant};
+    use crate::executor::{Executor, TasksDrainedFuture};
+    use crate::runtime_cache::{
+        DefaultSessionRuntimeCache, MemoryPoolPolicy, SessionRuntimeCache,
+    };
+    use ballista_core::RuntimeProducer;
+    use ballista_core::error::BallistaError;
+    use ballista_core::execution_plans::ShuffleWriterExec;
+    use ballista_core::serde::protobuf::{ExecutorRegistration, ShuffleWritePartition};
+    use ballista_core::serde::scheduler::TaskKey;
+    use ballista_core::utils::default_config_producer;
+    use datafusion::arrow::datatypes::{Schema, SchemaRef};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::error::{DataFusionError, Result};
+    use datafusion::execution::context::TaskContext;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        RecordBatchStream, SendableRecordBatchStream,
+    };
+    use datafusion::prelude::SessionConfig;
+    use datafusion::prelude::SessionContext;
+    use futures::Stream;
+    use futures::task::{ArcWake, waker_ref};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// A RecordBatchStream that will never terminate
+    struct NeverendingRecordBatchStream;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl RecordBatchStream for NeverendingRecordBatchStream {
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::empty())
+        }
+    }
+
+    impl Stream for NeverendingRecordBatchStream {
+        type Item = Result<RecordBatch, DataFusionError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    /// An ExecutionPlan which will never terminate
+    #[derive(Debug)]
+    pub struct NeverendingOperator {
+        properties: Arc<PlanProperties>,
+    }
+
+    impl NeverendingOperator {
+        fn new() -> Self {
+            NeverendingOperator {
+                properties: Arc::new(PlanProperties::new(
+                    datafusion::physical_expr::EquivalenceProperties::new(Arc::new(
+                        Schema::empty(),
+                    )),
+                    Partitioning::UnknownPartitioning(1),
+                    datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                )),
+            }
+        }
+    }
+
+    impl DisplayAs for NeverendingOperator {
+        fn fmt_as(
+            &self,
+            t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            match t {
+                DisplayFormatType::Default
+                | DisplayFormatType::Verbose
+                | DisplayFormatType::TreeRender => {
+                    write!(f, "NeverendingOperator")
+                }
+            }
+        }
+    }
+
+    impl ExecutionPlan for NeverendingOperator {
+        fn name(&self) -> &str {
+            "NeverendingOperator"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::empty())
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+            Ok(Box::pin(NeverendingRecordBatchStream))
+        }
+    }
+
+    /// The result `execute_query_stage` hands back once a spawned task unwinds.
+    type TaskOutcome = Result<Vec<ShuffleWritePartition>, BallistaError>;
+
+    /// Builds an executor over `work_dir`, along with the session context whose
+    /// runtime its tasks run on.
+    fn never_ending_executor(work_dir: &str) -> (Arc<Executor>, SessionContext) {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            ..Default::default()
+        };
+        let config_producer = Arc::new(default_config_producer);
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env().clone();
+        let runtime_producer: RuntimeProducer =
+            Arc::new(move |_| Ok(runtime_env.clone()));
+
+        let executor = Arc::new(Executor::new_basic(
+            executor_registration,
+            work_dir,
+            runtime_producer,
+            config_producer,
+            2,
+        ));
+
+        (executor, ctx)
+    }
+
+    /// Spawns a task that never yields a batch on a separate fiber. The returned
+    /// channel fires once `execute_query_stage` has unwound, which is after it has
+    /// removed its own abort handle.
+    fn spawn_never_ending_task(
+        executor: &Arc<Executor>,
+        ctx: &SessionContext,
+        work_dir: &str,
+        key: TaskKey,
+    ) -> tokio::sync::oneshot::Receiver<TaskOutcome> {
+        let shuffle_write = ShuffleWriterExec::try_new(
+            key.job_id.clone(),
+            key.stage_id,
+            Arc::new(NeverendingOperator::new()),
+            work_dir.to_string(),
+        )
+        .expect("creating shuffle writer");
+        let query_stage_exec =
+            DefaultQueryStageExec::new(ShuffleWriterVariant::Passthrough(shuffle_write));
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let executor = executor.clone();
+        let task_ctx = ctx.task_ctx();
+        tokio::task::spawn(async move {
+            let task_result = executor
+                .execute_query_stage(key, Arc::new(query_stage_exec), task_ctx)
+                .await;
+            sender.send(task_result).expect("sending result");
+        });
+
+        receiver
+    }
+
+    /// A task is only registered once it starts executing, so poll until the
+    /// executor reports the count the test is waiting on.
+    async fn await_active_task_count(executor: &Executor, expected: usize) {
+        for _ in 0..20 {
+            if executor.active_task_count() == expected {
+                break;
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        assert_eq!(executor.active_task_count(), expected);
+    }
+
+    /// Awaits a cancelled task's unwind and asserts it reported failure.
+    async fn await_cancelled_task(receiver: tokio::sync::oneshot::Receiver<TaskOutcome>) {
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("task unwinding before the timeout")
+            .expect("receiving task result")
+            .expect_err("a cancelled task fails");
+    }
+
+    #[tokio::test]
+    async fn test_task_cancellation() {
+        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
+        let (executor, ctx) = never_ending_executor(&work_dir);
+
+        let receiver = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 0,
+            },
+        );
+        await_active_task_count(&executor, 1).await;
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = waker_ref(&wake_counter);
+        let mut context = Context::from_waker(&waker);
+        let mut tasks_drained = Box::pin(TasksDrainedFuture(executor.clone()));
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 0)
+                .await
+                .expect("cancelling task")
+        );
+        assert_eq!(executor.active_task_count(), 1);
+
+        await_cancelled_task(receiver).await;
+
+        assert_eq!(wake_counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[tokio::test]
+    async fn test_tasks_drained_waits_for_last_task() {
+        let work_dir = TempDir::new().unwrap().path().to_str().unwrap().to_string();
+        let (executor, ctx) = never_ending_executor(&work_dir);
+
+        let first = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 0,
+            },
+        );
+        let second = spawn_never_ending_task(
+            &executor,
+            &ctx,
+            &work_dir,
+            TaskKey {
+                job_id: "job-id".into(),
+                stage_id: 1,
+                task_id: 1,
+            },
+        );
+        await_active_task_count(&executor, 2).await;
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = waker_ref(&wake_counter);
+        let mut context = Context::from_waker(&waker);
+        let mut tasks_drained = Box::pin(TasksDrainedFuture(executor.clone()));
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 0)
+                .await
+                .expect("cancelling the first task")
+        );
+        await_cancelled_task(first).await;
+
+        // Draining a task that is not the last one may wake the future, but it must
+        // not resolve it, so re-poll rather than counting wakes.
+        assert_eq!(executor.active_task_count(), 1);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Pending);
+
+        let wakes_before_last = wake_counter.0.load(Ordering::SeqCst);
+        assert!(
+            executor
+                .cancel_task("job-id".into(), 1, 1)
+                .await
+                .expect("cancelling the second task")
+        );
+        await_cancelled_task(second).await;
+
+        // Draining the last task has to wake the waker registered by the re-poll
+        // above; without that, shutdown would never look at the map again.
+        assert!(wake_counter.0.load(Ordering::SeqCst) > wakes_before_last);
+        assert_eq!(executor.active_task_count(), 0);
+        assert_eq!(tasks_drained.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn produce_runtime_for_session_shares_read_side_state() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            ..Default::default()
+        };
+        let config_producer = Arc::new(default_config_producer);
+
+        // A base producer that builds a fresh env each call, plus an identity
+        // pool policy, so shared read-side state is observable via ptr equality.
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        let identity: MemoryPoolPolicy = Arc::new(|base, _, _| Ok(base));
+        let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
+            DefaultSessionRuntimeCache::new(base_producer.clone(), identity, 4),
+        );
+
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            2,
+        )
+        .with_session_runtime_cache(Some(cache));
+
+        let cfg = SessionConfig::new();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e3 = executor.produce_runtime_for_session("s2", &cfg, 1).unwrap();
+
+        assert!(Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
+        assert!(!Arc::ptr_eq(&e1.cache_manager, &e3.cache_manager));
+    }
+
+    #[test]
+    fn produce_runtime_for_session_falls_back_without_cache() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            ..Default::default()
+        };
+        let config_producer = Arc::new(default_config_producer);
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+
+        // No cache attached: each call builds a fresh env.
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            2,
+        );
+
+        let cfg = SessionConfig::new();
+        let e1 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        let e2 = executor.produce_runtime_for_session("s1", &cfg, 1).unwrap();
+        assert!(!Arc::ptr_eq(&e1.cache_manager, &e2.cache_manager));
+    }
+
+    #[test]
+    fn pipelined_tasks_of_a_job_share_one_runtime_sized_by_its_reservation() {
+        let executor_registration = ExecutorRegistration {
+            id: "executor".to_string(),
+            ..Default::default()
+        };
+        let config_producer = Arc::new(default_config_producer);
+        let base_producer: RuntimeProducer =
+            Arc::new(|_| Ok(Arc::new(RuntimeEnv::default())));
+        // Records the vcores each new pool is sized for.
+        let sized: Arc<std::sync::Mutex<Vec<u32>>> = Default::default();
+        let recorder = sized.clone();
+        let policy: MemoryPoolPolicy = Arc::new(move |_, _, vcores| {
+            recorder.lock().unwrap().push(vcores);
+            Ok(Arc::new(RuntimeEnv::default()))
+        });
+        let cache: Arc<dyn SessionRuntimeCache> = Arc::new(
+            DefaultSessionRuntimeCache::new(base_producer.clone(), policy, 4),
+        );
+        let executor = Executor::new_basic(
+            executor_registration,
+            "/tmp",
+            base_producer,
+            config_producer,
+            4,
+        )
+        .with_session_runtime_cache(Some(cache));
+
+        let cfg = SessionConfig::new();
+        let first = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        let second = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        let other = executor
+            .produce_runtime_for_pipelined_task("job2", "s", &cfg, 1)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(*sized.lock().unwrap(), vec![3, 1]);
+
+        // Once the job's tasks here have finished, its runtime is gone, and
+        // a later task gets a new one.
+        drop((first, second));
+        let _again = executor
+            .produce_runtime_for_pipelined_task("job1", "s", &cfg, 3)
+            .unwrap();
+        assert_eq!(*sized.lock().unwrap(), vec![3, 1, 3]);
+    }
+}

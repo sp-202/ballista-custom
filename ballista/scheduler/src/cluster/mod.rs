@@ -1,0 +1,1142 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::cluster::memory::{
+    InMemoryCacheState, InMemoryClusterState, InMemoryJobState,
+};
+use crate::config::{SchedulerConfig, TaskDistributionPolicy};
+use crate::scheduler_server::SessionBuilder;
+use crate::state::cache_registry::{
+    BeginOutcome, CacheKey, CompleteOutcome, MaterializedCache,
+};
+use crate::state::execution_graph::{
+    ExecutionGraphBox, TaskDescription, create_task_info,
+};
+use crate::state::session_manager::share_file_statistics_cache;
+use crate::state::task_manager::JobInfoCache;
+use ballista_core::config::BallistaConfig;
+use ballista_core::error::Result;
+use ballista_core::execution_plans::{RangeShuffleReaderExec, ShuffleReaderExec};
+use ballista_core::serde::protobuf::{
+    AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
+};
+use ballista_core::serde::scheduler::PartitionLocation;
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, TaskKey};
+use ballista_core::utils::{default_config_producer, default_session_builder};
+use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::Stream;
+use log::debug;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// Event broadcasting and subscription for cluster state changes.
+pub mod event;
+/// In-memory cluster state implementation.
+pub mod memory;
+
+/// Test utilities for cluster state testing.
+#[cfg(test)]
+#[allow(clippy::uninlined_format_args)]
+pub mod test_util;
+
+/// Enum to configure the cluster state storage backend.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
+pub enum ClusterStorage {
+    /// In-memory storage (non-persistent).
+    Memory,
+}
+
+#[cfg(feature = "build-binary")]
+impl std::str::FromStr for ClusterStorage {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        clap::ValueEnum::from_str(s, true)
+    }
+}
+
+/// Manages the distributed state of a Ballista cluster.
+///
+/// Combines cluster state (executor registration, heartbeats) with job state
+/// (job submissions, execution graphs).
+#[derive(Clone)]
+pub struct BallistaCluster {
+    /// State for tracking executors and their resources.
+    cluster_state: Arc<dyn ClusterState>,
+    /// State for tracking jobs and their execution progress.
+    job_state: Arc<dyn JobState>,
+    /// State for tracking materialized `DataFrame::cache()` results.
+    cache_state: Arc<dyn CacheState>,
+}
+
+impl BallistaCluster {
+    /// Creates a new `BallistaCluster` with the given cluster and job state
+    /// backends and the default in-memory cache state. Use
+    /// [`with_cache_state`](Self::with_cache_state) to supply a custom cache
+    /// backend.
+    pub fn new(
+        cluster_state: Arc<dyn ClusterState>,
+        job_state: Arc<dyn JobState>,
+    ) -> Self {
+        Self {
+            cluster_state,
+            job_state,
+            cache_state: Arc::new(InMemoryCacheState::default()),
+        }
+    }
+
+    /// Overrides the cache state backend, returning the updated cluster. Lets a
+    /// caller plug in a custom [`CacheState`] without changing [`new`](Self::new).
+    pub fn with_cache_state(mut self, cache_state: Arc<dyn CacheState>) -> Self {
+        self.cache_state = cache_state;
+        self
+    }
+
+    /// Creates a new `BallistaCluster` with in-memory state backends.
+    ///
+    /// Its job state builds every session around one shared file statistics
+    /// cache, see [`share_file_statistics_cache`], unless the session sets
+    /// `ballista.scheduler.share_file_statistics_cache` to `false`. To keep a
+    /// cache per session for all sessions, pass an [`InMemoryJobState`] to
+    /// [`BallistaCluster::new`].
+    pub fn new_memory(
+        scheduler: impl Into<String>,
+        session_builder: SessionBuilder,
+        config_producer: ConfigProducer,
+    ) -> Self {
+        Self {
+            cluster_state: Arc::new(InMemoryClusterState::default()),
+            job_state: Arc::new(InMemoryJobState::new(
+                scheduler,
+                share_file_statistics_cache(session_builder),
+                config_producer,
+            )),
+            cache_state: Arc::new(InMemoryCacheState::default()),
+        }
+    }
+
+    /// Creates a new `BallistaCluster` from scheduler configuration.
+    pub async fn new_from_config(config: &SchedulerConfig) -> Result<Self> {
+        let scheduler = config.scheduler_id.clone();
+
+        let session_builder = config
+            .override_session_builder
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_session_builder));
+
+        let config_producer = config
+            .override_config_producer
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_config_producer));
+
+        Ok(BallistaCluster::new_memory(
+            scheduler,
+            session_builder,
+            config_producer,
+        ))
+    }
+
+    /// Returns the cluster state backend.
+    pub fn cluster_state(&self) -> Arc<dyn ClusterState> {
+        self.cluster_state.clone()
+    }
+
+    /// Returns the job state backend.
+    pub fn job_state(&self) -> Arc<dyn JobState> {
+        self.job_state.clone()
+    }
+
+    /// Returns the cache state backend.
+    pub fn cache_state(&self) -> Arc<dyn CacheState> {
+        self.cache_state.clone()
+    }
+}
+
+/// Stream of `ExecutorHeartbeat` messages.
+///
+/// This stream contains all heartbeats received by any schedulers sharing a `ClusterState`.
+pub type ExecutorHeartbeatStream = Pin<Box<dyn Stream<Item = ExecutorHeartbeat> + Send>>;
+
+/// A task bound to an executor for execution.
+///
+/// Tuple of (executor_id, task_description).
+pub type BoundTask = (String, TaskDescription);
+
+/// An executor slot representing available task capacity.
+///
+/// Tuple of (executor_id, slot_count).
+pub type ExecutorSlot = (String, u32);
+
+/// Trait for maintaining a globally consistent view of cluster resources.
+///
+/// Implementations track executor registration, heartbeats, and free vcores.
+#[async_trait::async_trait]
+pub trait ClusterState: Send + Sync + 'static {
+    /// Initializes the cluster state backend.
+    ///
+    /// This is particularly important for backends with external storage.
+    async fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Binds ready-to-run tasks from active jobs to executor vcores.
+    ///
+    /// If `executors` is provided, only bind on the specified executor IDs.
+    async fn bind_schedulable_tasks(
+        &self,
+        distribution: TaskDistributionPolicy,
+        active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+        executors: Option<HashSet<String>>,
+    ) -> Result<Vec<BoundTask>>;
+
+    /// Releases reserved vcores when tasks finish or fail.
+    ///
+    /// This operation is atomic: either all vcores are released or none are.
+    async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()>;
+
+    /// Registers a new executor in the cluster.
+    async fn register_executor(
+        &self,
+        metadata: ExecutorMetadata,
+        spec: ExecutorData,
+    ) -> Result<()>;
+
+    /// Saves executor metadata, overwriting any existing metadata for the executor ID.
+    ///
+    /// Pull-based executors call this with every poll instead of registering
+    /// through [`Self::register_executor`], so the call also acts as a liveness
+    /// signal. An implementation must refresh the executor's heartbeat
+    /// timestamp here, since [`ExecutorManager`](crate::state::executor_manager::ExecutorManager)
+    /// uses it to decide whether the executor is still alive.
+    ///
+    /// It must not reset the rest of the heartbeat. Status, metrics and peak
+    /// memory come from the executor's own periodic
+    /// [`save_executor_heartbeat`](Self::save_executor_heartbeat) calls, and a
+    /// poll must keep the last values it saved. If the executor has no
+    /// heartbeat yet, insert one with the current timestamp and empty status
+    /// and metrics.
+    async fn save_executor_metadata(&self, metadata: ExecutorMetadata) -> Result<()>;
+
+    /// Returns executor metadata for the given executor ID.
+    ///
+    /// Returns an error if the executor does not exist.
+    async fn get_executor_metadata(&self, executor_id: &str) -> Result<ExecutorMetadata>;
+
+    /// Returns a list of all registered executor metadata.
+    async fn registered_executor_metadata(&self) -> Vec<ExecutorMetadata>;
+
+    /// Saves an executor heartbeat.
+    async fn save_executor_heartbeat(&self, heartbeat: ExecutorHeartbeat) -> Result<()>;
+
+    /// Removes an executor from the cluster.
+    async fn remove_executor(&self, executor_id: &str) -> Result<()>;
+
+    /// Returns the last seen heartbeat for all active executors.
+    fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat>;
+
+    /// Returns the executor heartbeat for the given executor ID, or None if not found.
+    fn get_executor_heartbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat>;
+
+    /// Returns a stream of cluster state events.
+    ///
+    /// Events are published whenever the cluster state changes (e.g., executor registration/removal).
+    async fn cluster_state_events(&self) -> Result<ClusterStateEventStream>;
+}
+
+/// Events related to the state of jobs. Implementations may or may not support all event types.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobStateEvent {
+    /// Event when a job status has been updated
+    JobUpdated {
+        /// Job ID of updated job
+        job_id: JobId,
+        /// New job status
+        status: JobStatus,
+    },
+    /// Event when a scheduler acquires ownership of the job. This happens
+    /// either when a scheduler submits a job (in which case ownership is implied)
+    /// or when a scheduler acquires ownership of a running job release by a
+    /// different scheduler
+    JobAcquired {
+        /// Job ID of the acquired job
+        job_id: JobId,
+        /// The scheduler which acquired ownership of the job
+        owner: String,
+    },
+    /// Event when a scheduler releases ownership of a still active job
+    JobReleased {
+        /// Job ID of the released job
+        job_id: JobId,
+    },
+    /// Event when a new session has been created.
+    SessionAccessed {
+        /// Session ID that was accessed.
+        session_id: String,
+    },
+    /// Event when a session configuration has been removed.
+    SessionRemoved {
+        /// Session ID that was removed.
+        session_id: String,
+    },
+}
+
+/// Events related to the state of the cluster.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClusterStateEvent {
+    /// An executor has been registered with the cluster.
+    RegisteredExecutor {
+        /// ID of the registered executor.
+        executor_id: String,
+    },
+    /// An executor has been removed from the cluster.
+    RemovedExecutor {
+        /// ID of the removed executor.
+        executor_id: String,
+    },
+}
+
+/// Stream of cluster state events.
+pub type ClusterStateEventStream = Pin<Box<dyn Stream<Item = ClusterStateEvent> + Send>>;
+
+/// Stream of job state events.
+///
+/// This stream contains all events received by schedulers sharing a `ClusterState`.
+pub type JobStateEventStream = Pin<Box<dyn Stream<Item = JobStateEvent> + Send>>;
+
+/// Trait for persisting state related to executing jobs.
+///
+/// Implementations handle job lifecycle, execution graphs, and session management.
+#[async_trait::async_trait]
+pub trait JobState: Send + Sync {
+    /// Accepts a job into the scheduler's queue.
+    ///
+    /// Called when a job is received but before it is planned.
+    fn accept_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()>;
+
+    /// Returns the number of queued jobs waiting to be scheduled.
+    fn pending_job_number(&self) -> usize;
+
+    /// Submits a new job to the job state.
+    ///
+    /// The submitter is assumed to own the job.
+    async fn submit_job(
+        &self,
+        job_id: JobId,
+        graph: &ExecutionGraphBox,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<()>;
+
+    /// Returns the set of all active job IDs.
+    async fn get_jobs(&self) -> Result<HashSet<JobId>>;
+
+    /// Returns the set of all job IDs including running, queued, and completed jobs.
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>>;
+
+    /// Returns the status of the specified job.
+    async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>>;
+
+    /// Returns the execution graph for a job.
+    ///
+    /// The job may not belong to the caller, and the graph may be updated
+    /// by another scheduler after this call returns.
+    async fn get_execution_graph(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<ExecutionGraphBox>>;
+
+    /// Persists the current state of an owned job.
+    ///
+    /// Implementations are responsible for applying any backend-specific retry policy.
+    /// Callers must not assume that this operation is safe to retry.
+    ///
+    /// Returns an error if the job is not owned by the caller.
+    async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()>;
+
+    /// Marks an unscheduled job as failed.
+    ///
+    /// Called when a job fails during planning before an execution graph is created.
+    async fn fail_unscheduled_job(&self, job_id: &JobId, reason: String) -> Result<()>;
+
+    /// Deletes a job from the state.
+    async fn remove_job(&self, job_id: &JobId) -> Result<()>;
+
+    /// Attempts to acquire ownership of a job.
+    ///
+    /// Returns the execution graph if the job is still running and successfully acquired,
+    /// otherwise returns None.
+    async fn try_acquire_job(&self, job_id: &JobId) -> Result<Option<ExecutionGraphBox>>;
+
+    /// Returns a stream of job state events.
+    async fn job_state_events(&self) -> Result<JobStateEventStream>;
+
+    /// Creates a new session or updates an existing one.
+    async fn create_or_update_session(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+    ) -> Result<Arc<SessionContext>>;
+
+    /// Removes a session from the state.
+    async fn remove_session(&self, session_id: &str) -> Result<()>;
+
+    /// Produces a session configuration for new sessions.
+    fn produce_config(&self) -> SessionConfig;
+}
+
+/// Scheduler-side metadata store for materialized `DataFrame::cache()` results —
+/// the mapping from a cache key to the shuffle partition locations of its output.
+///
+/// This is the third piece of scheduler state alongside [`ClusterState`] and
+/// [`JobState`], and follows the same shape: an async trait with an in-memory
+/// implementation today ([`InMemoryCacheState`])
+/// and an [`init`](CacheState::init) hook so a future durable backend (e.g. one
+/// backed by an object store) can rehydrate entries on startup. The methods are
+/// `async` even though the in-memory backend does no I/O, so a durable backend
+/// slots in without changing any signatures.
+///
+/// A cache *miss* is simply [`lookup`](CacheState::lookup) returning `None` (the
+/// key is absent, or materialization is still in flight); a *hit* is `Some`.
+#[async_trait::async_trait]
+pub trait CacheState: Send + Sync + 'static {
+    /// Initializes the backend. A no-op for the in-memory backend; durable
+    /// backends load previously persisted entries here.
+    async fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Returns the materialized data for `key`, or `None` on a miss (absent or
+    /// still materializing).
+    async fn lookup(&self, key: &CacheKey) -> Result<Option<MaterializedCache>>;
+
+    /// Attempts to claim `key` for materialization by `job_id`, deduplicating
+    /// concurrent first-time misses to a single [`BeginOutcome::Claimed`].
+    async fn begin_materialization(
+        &self,
+        key: CacheKey,
+        job_id: JobId,
+    ) -> Result<BeginOutcome>;
+
+    /// Records the materialized shuffle locations for `key`, promoting a
+    /// matching pending claim. Returns [`CompleteOutcome::Stale`] if no such
+    /// claim exists so the caller can discard the orphaned output.
+    async fn complete_materialization(
+        &self,
+        key: CacheKey,
+        job_id: JobId,
+        schema: SchemaRef,
+        locations: Vec<Vec<PartitionLocation>>,
+    ) -> Result<CompleteOutcome>;
+
+    /// The job materializing `key`, if it is pending.
+    async fn pending_job(&self, key: &CacheKey) -> Result<Option<JobId>>;
+
+    /// Drops a pending claim for `key` owned by `job_id` (materialization job
+    /// failed/cancelled). Returns whether a claim was removed. Called from the
+    /// job failure and cancel handlers.
+    async fn abort_materialization(&self, key: &CacheKey, job_id: &JobId)
+    -> Result<bool>;
+
+    /// Invalidates a single entry; the next [`lookup`](CacheState::lookup) is a
+    /// miss. Returns the removed materialized entry (if any) so the caller can
+    /// unpin its shuffle data.
+    async fn invalidate(&self, key: &CacheKey) -> Result<Option<MaterializedCache>>;
+
+    /// Invalidates `key` only while it is still `materializing_job`'s,
+    /// atomically: use it when acting on an entry seen earlier.
+    async fn invalidate_if(
+        &self,
+        key: &CacheKey,
+        materializing_job: &JobId,
+    ) -> Result<Option<MaterializedCache>>;
+
+    /// Invalidates every entry holding a partition on `executor_id` (the
+    /// executor-loss policy) and returns the removed entries so the caller can
+    /// unpin their shuffle data.
+    async fn invalidate_executor(
+        &self,
+        executor_id: &str,
+    ) -> Result<Vec<(CacheKey, MaterializedCache)>>;
+
+    /// Removes every entry owned by `session_id` (session teardown) and returns
+    /// the removed materialized entries so the caller can unpin their shuffle
+    /// data.
+    async fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(CacheKey, MaterializedCache)>>;
+
+    /// Returns the `(job_id, stage_id)` shuffle stages that must be pinned past
+    /// normal cleanup because they back a cache entry. Consumed by job-data
+    /// cleanup, which skips these stages.
+    async fn pinned_stages(&self) -> Result<HashSet<(JobId, usize)>>;
+}
+
+/// Whether this stage's plan contains a collapse — any operator whose
+/// `output_partitioning().partition_count() == 1` (`CoalescePartitionsExec`,
+/// `SortPreservingMergeExec`, `AggregateExec(Final, gby=[])`,
+/// `SortExec(preserve_partitioning=false)`, …). Downstream of a collapse
+/// expects the *combined* input; splitting across tasks would give each
+/// task's local collapse only a slice, producing partial results.
+///
+/// Walks past *any* single-child operator: today's writers that bake
+/// partitioning into the shuffle write itself (`SortShuffleWriterExec::Hash`),
+/// and future partition operators that separate partitioning from writing
+/// (e.g. `UnorderedRangeRepartitionExec`). Stops at leaves, multi-child
+/// operators (fan-in / joins), and stage boundaries.
+///
+/// The stage-boundary stop enumerates the leaf readers that terminate a
+/// resolved stage plan: `ShuffleReaderExec` (regular / broadcast / coalesced)
+/// and `RangeShuffleReaderExec` (ordering-preserving). The *general* rule is
+/// "stop at any stage boundary"; if new stage-boundary operators appear, add
+/// them here (or, better, get `ExecutionPlan` upstream to expose an
+/// `is_stage_boundary()` property so we don't keep enumerating).
+fn stage_has_input_collapse(plan_root: &Arc<dyn ExecutionPlan>) -> bool {
+    fn walk(node: &Arc<dyn ExecutionPlan>) -> bool {
+        if node.downcast_ref::<ShuffleReaderExec>().is_some()
+            || node.downcast_ref::<RangeShuffleReaderExec>().is_some()
+        {
+            return false;
+        }
+        if node.properties().output_partitioning().partition_count() == 1 {
+            return true;
+        }
+        match node.children().as_slice() {
+            [child] => walk(child),
+            _ => false,
+        }
+    }
+    let result = match plan_root.children().as_slice() {
+        [child] => walk(child),
+        _ => false,
+    };
+    debug!(
+        "stage_has_input_collapse: root={} root_partitions={} → {result}",
+        plan_root.name(),
+        plan_root
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+    );
+    result
+}
+
+/// Bind a task to an executor: draw a partition slice, append the resulting
+/// `TaskInfo` to the stage, and produce a `TaskDescription` for dispatch.
+///
+/// Vcore accounting under DataFusion's volcano/pull model — the plan is
+/// driven by one tokio task per root output partition, so a task consumes
+/// vcores equal to the number of threads it will actually keep busy:
+///
+/// - **Non-collapse stage**: the root's output partitioning matches the
+///   number of input partitions bundled into this task, so consumption =
+///   `slice.len()`. Leftover budget stays available for another bind on
+///   the same executor in the same scheduling round.
+///
+/// - **Collapse stage** (see [`stage_has_input_collapse`]): the plan's
+///   root has a single output partition, so only 1 thread is ever active
+///   driving the whole pipeline — reserve 1 vcore regardless of how many
+///   input partitions are packed into the task, and let other stages'
+///   tasks run in parallel on the remaining vcores. Correctness still
+///   requires packing the entire pending queue into one bind (a split
+///   collapse would produce partial results downstream can't merge).
+fn bind_one(
+    running_stage: &mut crate::state::execution_stage::RunningStage,
+    session_id: &str,
+    job_id: &JobId,
+    budget: &mut AvailableVcores,
+) -> Option<BoundTask> {
+    let is_collapse = stage_has_input_collapse(&running_stage.plan);
+    // Cap non-collapse slices at the configured `max_partitions_per_task`.
+    // Collapse stages must still pack their full pending queue into a single
+    // task for correctness — a split collapse would produce partial results
+    // downstream can't merge.
+    let cap = running_stage
+        .session_config
+        .options()
+        .extensions
+        .get::<BallistaConfig>()
+        .map(|bc| bc.max_partitions_per_task())
+        .filter(|&n| n > 0)
+        .unwrap_or(usize::MAX);
+    let max_partitions = if is_collapse {
+        usize::MAX
+    } else {
+        (budget.vcores as usize).min(cap)
+    };
+    let input_partition_ids = running_stage.pending.next_slice(max_partitions);
+    if input_partition_ids.is_empty() {
+        return None;
+    }
+    // Non-collapse: DataFusion's volcano/pull model drives one tokio task per
+    // root output partition, so N input partitions bundled into a task need
+    // N vcores of concurrent execution. Collapse: the plan's root has a
+    // single output partition, so only 1 thread is ever active for the
+    // whole pipeline no matter how many inputs the task packs — reserve
+    // one vcore and leave the rest for other stages' tasks on this executor.
+    let vcores_consumed = if is_collapse {
+        1
+    } else {
+        input_partition_ids.len() as u32
+    };
+    debug!(
+        "bind_one: job={} stage={} exec={} vcores={} max={} slice_len={} consumed={} partitions={:?} collapse={}",
+        job_id,
+        running_stage.stage_id,
+        budget.executor_id,
+        budget.vcores,
+        if max_partitions == usize::MAX {
+            -1i64
+        } else {
+            max_partitions as i64
+        },
+        input_partition_ids.len(),
+        vcores_consumed,
+        input_partition_ids,
+        is_collapse,
+    );
+    let executor_id = budget.executor_id.clone();
+    // task_id is the append-order slot in `task_infos` — since we're
+    // about to push, that's `task_infos.len()`. `(job_id, stage_id,
+    // task_id)` is globally unique.
+    let task_id = running_stage.task_infos.len();
+    let task_attempt = input_partition_ids
+        .iter()
+        .map(|pid| running_stage.task_failure_numbers[*pid])
+        .max()
+        .unwrap_or(0);
+    let mut task_info = create_task_info(executor_id.clone(), task_id);
+    task_info.global_input_partition_ids = input_partition_ids.clone();
+    task_info.vcores_consumed = vcores_consumed;
+    running_stage.task_infos.push(task_info);
+    let key = TaskKey {
+        job_id: job_id.clone(),
+        stage_id: running_stage.stage_id,
+        task_id,
+    };
+    let task_desc = TaskDescription {
+        session_id: session_id.to_string(),
+        key,
+        stage_attempt_num: running_stage.stage_attempt_num,
+        task_attempt,
+        global_input_partition_ids: input_partition_ids,
+        vcores_consumed,
+        plan: running_stage.plan.clone(),
+        session_config: running_stage.session_config.clone(),
+    };
+    budget.vcores -= vcores_consumed;
+    Some((executor_id, task_desc))
+}
+
+/// How [`bind_tasks_with`] picks the executor for the next task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindStrategy {
+    /// Keep packing tasks onto the current (largest) executor until its
+    /// vcore budget is drained, then move on to the next one.
+    Bias,
+    /// Hand each task to the next executor in the rotation, so multiple
+    /// running stages each get one executor per round.
+    RoundRobin,
+}
+
+impl BindStrategy {
+    fn name(self) -> &'static str {
+        match self {
+            BindStrategy::Bias => "bias",
+            BindStrategy::RoundRobin => "round robin",
+        }
+    }
+
+    /// Index of the executor that should receive the next task, starting the
+    /// search at `start`. `None` means no executor has vcores left.
+    fn pick(self, budgets: &[&mut AvailableVcores], start: usize) -> Option<usize> {
+        match self {
+            BindStrategy::Bias => (start..budgets.len()).find(|&i| budgets[i].vcores > 0),
+            BindStrategy::RoundRobin => next_with_capacity(budgets, start),
+        }
+    }
+
+    /// Where the next search starts after a task was bound to `picked`.
+    fn advance(self, picked: usize, len: usize) -> usize {
+        match self {
+            BindStrategy::Bias => picked,
+            BindStrategy::RoundRobin => (picked + 1) % len,
+        }
+    }
+}
+
+/// Circular scan for the first executor with free vcores, starting at
+/// `start` and wrapping around once. Returns `None` when `budgets` is empty
+/// or every executor is drained.
+fn next_with_capacity(budgets: &[&mut AvailableVcores], start: usize) -> Option<usize> {
+    let len = budgets.len();
+    (0..len)
+        .map(|offset| (start + offset) % len)
+        .find(|&i| budgets[i].vcores > 0)
+}
+
+/// Shared driver behind [`bind_task_bias`] and [`bind_task_round_robin`].
+///
+/// Walks the running jobs and their running stages, skipping stages for which
+/// `if_skip` returns true, and binds tasks to executors chosen by `strategy`
+/// until either every stage is drained or no executor has vcores left.
+async fn bind_tasks_with(
+    mut budgets: Vec<&mut AvailableVcores>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+    if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
+    strategy: BindStrategy,
+) -> Vec<BoundTask> {
+    let mut schedulable_tasks: Vec<BoundTask> = vec![];
+
+    if budgets.iter().all(|b| b.vcores == 0) {
+        debug!("No executor vcores available for task binding");
+        return schedulable_tasks;
+    }
+
+    // Order by vcores desc: bias packs the largest executor first, round
+    // robin starts its rotation there.
+    budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
+
+    let mut idx = 0usize;
+    for (job_id, job_info) in running_jobs.iter() {
+        if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
+            debug!("Job {job_id} is not in running status and will be skipped");
+            continue;
+        }
+        let mut graph = job_info.execution_graph.write().await;
+        let session_id = graph.session_id().to_string();
+        let mut black_list = vec![];
+        while let Some(running_stage) = graph.fetch_running_stage(&black_list) {
+            if if_skip(running_stage.plan.clone()) {
+                debug!(
+                    "Will skip stage {}/{} for {} task binding",
+                    job_id,
+                    running_stage.stage_id,
+                    strategy.name()
+                );
+                black_list.push(running_stage.stage_id);
+                continue;
+            }
+            loop {
+                let Some(picked) = strategy.pick(&budgets, idx) else {
+                    return schedulable_tasks;
+                };
+                idx = picked;
+                match bind_one(running_stage, &session_id, job_id, &mut *budgets[idx]) {
+                    Some(bound) => {
+                        schedulable_tasks.push(bound);
+                        idx = strategy.advance(idx, budgets.len());
+                    }
+                    None => break, // stage's pending is drained
+                }
+            }
+        }
+    }
+
+    schedulable_tasks
+}
+
+/// Bias: give each stage the biggest executor available, packing tasks onto
+/// it until its vcore budget is drained.
+pub(crate) async fn bind_task_bias(
+    budgets: Vec<&mut AvailableVcores>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+    if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
+) -> Vec<BoundTask> {
+    bind_tasks_with(budgets, running_jobs, if_skip, BindStrategy::Bias).await
+}
+
+/// Round robin across executors so multiple running stages each get one
+/// executor per rotation, starting from the largest.
+pub(crate) async fn bind_task_round_robin(
+    budgets: Vec<&mut AvailableVcores>,
+    running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+    if_skip: fn(Arc<dyn ExecutionPlan>) -> bool,
+) -> Vec<BoundTask> {
+    bind_tasks_with(budgets, running_jobs, if_skip, BindStrategy::RoundRobin).await
+}
+
+/// User provided task distribution policy
+#[async_trait::async_trait]
+pub trait DistributionPolicy: std::fmt::Debug + Send + Sync {
+    // few open questions for later:
+    //
+    // - should scheduling policy type be a parameter
+    //   as we see in the consistent hash, it does not work in
+    //   pull based. Or we find another way to address this concern
+    // - should we add `ClusterState` as method parameter
+    //
+
+    /// User provided custom task distribution policy
+    ///
+    /// # Parameters
+    ///
+    /// * `budgets` - per-executor free-vcore budgets (may be empty)
+    /// * `running_jobs` - (JobId -> JobInfoCache) cache must contain only running jobs
+    ///
+    /// # Returns
+    ///
+    /// vector of task, executor bounding
+    ///
+    async fn bind_tasks(
+        &self,
+        mut budgets: Vec<&mut AvailableVcores>,
+        running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+    ) -> datafusion::error::Result<Vec<BoundTask>>;
+
+    /// Name of [DistributionPolicy]
+    fn name(&self) -> &str;
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use ballista_core::JobId;
+    use ballista_core::error::Result;
+    use ballista_core::serde::protobuf::AvailableVcores;
+    use ballista_core::serde::scheduler::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    };
+
+    use crate::cluster::stage_has_input_collapse;
+    use crate::cluster::{
+        BindStrategy, BoundTask, bind_task_bias, bind_task_round_robin,
+        next_with_capacity,
+    };
+    use crate::state::execution_graph::{ExecutionGraph, StaticExecutionGraph};
+    use crate::state::task_manager::JobInfoCache;
+    use crate::test_utils::{
+        mock_completed_task, revive_graph_and_complete_next_stage,
+        test_aggregation_plan_with_config,
+    };
+    use ballista_core::config::BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK;
+    use ballista_core::extension::SessionConfigExt;
+    use datafusion::prelude::SessionConfig;
+
+    #[tokio::test]
+    async fn test_bind_task_bias() -> Result<()> {
+        let num_partition = 8usize;
+        let active_jobs = mock_active_jobs(num_partition).await?;
+        let mut budgets = mock_budgets();
+        let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
+        let bound_tasks =
+            bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false).await;
+        // 9 total pending partitions (job_a: 2, job_b: 7) — verify all were
+        // covered. Task count is emergent under multi-partition binding.
+        assert_eq!(9, total_partitions_covered(&bound_tasks));
+
+        let result = get_result(bound_tasks);
+
+        // Multi-partition-task binding: each bind consumes slice.len() vcores,
+        // so an executor with leftover vcores keeps taking work under the bias
+        // policy (largest exec stays hot). Distribution depends on HashMap
+        // iteration order across jobs.
+        let mut expected = Vec::new();
+        {
+            // job_a iterated first: exec_3(7) takes job_a's 2 partitions
+            // (exec_3 now has 5 vcores left), then bias keeps exec_3 hot so
+            // it takes 5 of job_b's 7, and exec_2(5) takes the remaining 2.
+            let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
+            let mut entry_a = HashMap::new();
+            entry_a.insert("executor_3".to_string(), 2);
+            let mut entry_b = HashMap::new();
+            entry_b.insert("executor_3".to_string(), 5);
+            entry_b.insert("executor_2".to_string(), 2);
+            expected0.insert("job_a".into(), entry_a);
+            expected0.insert("job_b".into(), entry_b);
+            expected.push(expected0);
+        }
+        {
+            // job_b iterated first: exec_3(7) takes job_b's full 7 partitions,
+            // then exec_2(5) takes job_a's 2.
+            let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
+            let mut entry_b = HashMap::new();
+            entry_b.insert("executor_3".to_string(), 7);
+            let mut entry_a = HashMap::new();
+            entry_a.insert("executor_2".to_string(), 2);
+            expected0.insert("job_a".into(), entry_a);
+            expected0.insert("job_b".into(), entry_b);
+            expected.push(expected0);
+        }
+
+        assert!(
+            expected.contains(&result),
+            "The result {result:?} is not as expected {expected:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bind_task_round_robin() -> Result<()> {
+        let num_partition = 8usize;
+        let active_jobs = mock_active_jobs(num_partition).await?;
+        let mut budgets = mock_budgets();
+        let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
+        let bound_tasks =
+            bind_task_round_robin(budgets_ref, Arc::new(active_jobs), |_| false).await;
+        // 9 total pending partitions (job_a: 2, job_b: 7) — verify all were
+        // covered. Task count is emergent under multi-partition binding.
+        assert_eq!(9, total_partitions_covered(&bound_tasks));
+
+        let result = get_result(bound_tasks);
+
+        // Multi-partition-task binding: same shape as bias variant under this
+        // mock — each executor consumes its full vcore budget in one task per
+        // (job, stage) and round-robin's idx rotation gives the same
+        // ordering. Two variants depending on job HashMap iteration order.
+        let mut expected: Vec<HashMap<JobId, HashMap<String, usize>>> = Vec::new();
+        {
+            // job_a iterated first: exec_3(7) takes job_a's 2 partitions,
+            // then exec_2(5) + exec_1(3) split job_b's 7 as 5/2.
+            let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
+            let mut entry_a = HashMap::new();
+            entry_a.insert("executor_3".to_string(), 2);
+            let mut entry_b = HashMap::new();
+            entry_b.insert("executor_2".to_string(), 5);
+            entry_b.insert("executor_1".to_string(), 2);
+            expected0.insert("job_a".into(), entry_a);
+            expected0.insert("job_b".into(), entry_b);
+            expected.push(expected0);
+        }
+        {
+            // job_b iterated first: exec_3(7) takes job_b's full 7,
+            // then exec_2(5) takes job_a's 2.
+            let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
+            let mut entry_b = HashMap::new();
+            entry_b.insert("executor_3".to_string(), 7);
+            let mut entry_a = HashMap::new();
+            entry_a.insert("executor_2".to_string(), 2);
+            expected0.insert("job_a".into(), entry_a);
+            expected0.insert("job_b".into(), entry_b);
+            expected.push(expected0);
+        }
+
+        assert!(
+            expected.contains(&result),
+            "The result {result:?} is not as expected {expected:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Sum partitions covered per (job, executor). Under multi-partition
+    /// tasks one task covers a slice of partitions rather than exactly one,
+    /// so counting bound tasks would understate the distribution. Summing
+    /// `global_input_partition_ids.len()` preserves the "N partitions distributed as
+    /// X/Y/Z across executors" invariant the assertions actually care about.
+    fn get_result(bound_tasks: Vec<BoundTask>) -> HashMap<JobId, HashMap<String, usize>> {
+        let mut result = HashMap::new();
+
+        for bound_task in bound_tasks {
+            let entry = result
+                .entry(bound_task.1.key.job_id)
+                .or_insert_with(HashMap::new);
+            let n = entry.entry(bound_task.0).or_insert_with(|| 0);
+            *n += bound_task.1.global_input_partition_ids.len();
+        }
+
+        result
+    }
+
+    /// Total partitions covered across every bound task — the multi-partition
+    /// analogue of "how many tasks did we bind" for tests that used to assert
+    /// on `bound_tasks.len()`.
+    fn total_partitions_covered(bound_tasks: &[BoundTask]) -> usize {
+        bound_tasks
+            .iter()
+            .map(|(_, task)| task.global_input_partition_ids.len())
+            .sum()
+    }
+
+    async fn mock_active_jobs(
+        num_partition: usize,
+    ) -> Result<HashMap<JobId, JobInfoCache>> {
+        let graph_a = mock_graph(&"job_a".into(), num_partition, 2).await?;
+
+        let graph_b = mock_graph(&"job_b".into(), num_partition, 7).await?;
+
+        let mut active_jobs = HashMap::new();
+        active_jobs.insert(
+            graph_a.job_id().to_owned(),
+            JobInfoCache::new(Box::new(graph_a)),
+        );
+        active_jobs.insert(
+            graph_b.job_id().to_owned(),
+            JobInfoCache::new(Box::new(graph_b)),
+        );
+
+        Ok(active_jobs)
+    }
+
+    async fn mock_graph(
+        job_id: &JobId,
+        num_target_partitions: usize,
+        num_pending_task: usize,
+    ) -> Result<StaticExecutionGraph> {
+        // These tests validate the *multi-partition* binding path: expected
+        // task distributions include slice sizes up to 7. That requires an
+        // unbounded `max_partitions_per_task`, which is also the default —
+        // set explicitly here so the mock keeps exercising that path even if
+        // the default changes again.
+        let session_config = Arc::new(
+            SessionConfig::new_with_ballista()
+                .set_str(BALLISTA_SCHEDULER_MAX_PARTITIONS_PER_TASK, "0"),
+        );
+        let mut graph = test_aggregation_plan_with_config(
+            num_target_partitions,
+            job_id,
+            session_config,
+        )
+        .await;
+        let executor = ExecutorMetadata {
+            id: "executor_0".to_string(),
+            host: "localhost".to_string(),
+            port: 50051,
+            grpc_port: 50052,
+            specification: ExecutorSpecification::default().with_vcores(32),
+            os_info: ExecutorOperatingSystemSpecification::default(),
+        };
+
+        // complete first stage
+        revive_graph_and_complete_next_stage(&mut graph)?;
+
+        for _ in 0..num_target_partitions - num_pending_task {
+            if let Some(task) = graph.pop_next_task(&executor.id)? {
+                let task_status = mock_completed_task(task, &executor.id);
+                graph.update_task_status(&executor, vec![task_status], 1, 1)?;
+            }
+        }
+
+        Ok(graph)
+    }
+
+    fn mock_budgets() -> Vec<AvailableVcores> {
+        vec![
+            AvailableVcores {
+                executor_id: "executor_1".to_string(),
+                vcores: 3,
+            },
+            AvailableVcores {
+                executor_id: "executor_2".to_string(),
+                vcores: 5,
+            },
+            AvailableVcores {
+                executor_id: "executor_3".to_string(),
+                vcores: 7,
+            },
+        ]
+    }
+
+    /// Both shuffle reader kinds are stage boundaries — walking through them
+    /// to detect an input collapse would mis-classify the *next* stage's leaf
+    /// as this stage's collapse. `stage_has_input_collapse` must return false
+    /// as soon as a reader is seen. Guard the range variant explicitly since
+    /// `UnknownPartitioning(1)` would otherwise trigger the single-partition
+    /// arm.
+    #[test]
+    fn stage_has_input_collapse_stops_at_range_reader() {
+        use ballista_core::execution_plans::RangeShuffleReaderExec;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+        let sort_expr = PhysicalSortExpr::new_default(Arc::new(Column::new("v", 0)));
+        let merge_ordering = LexOrdering::new(vec![sort_expr]).unwrap();
+        // Single output partition — the case where the `partition_count == 1`
+        // arm would fire without the reader guard.
+        let reader = Arc::new(
+            RangeShuffleReaderExec::try_new(1, vec![vec![]], schema, merge_ordering)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let root: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(reader));
+
+        assert!(
+            !stage_has_input_collapse(&root),
+            "a range-shuffle reader is a stage boundary, not an input collapse",
+        );
+    }
+
+    fn vcores(values: &[u32]) -> Vec<AvailableVcores> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &vcores)| AvailableVcores {
+                executor_id: format!("exec-{i}"),
+                vcores,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_with_capacity_handles_empty_and_drained_budgets() {
+        let mut empty = vcores(&[]);
+        let empty_ref: Vec<&mut AvailableVcores> = empty.iter_mut().collect();
+        assert_eq!(next_with_capacity(&empty_ref, 0), None);
+
+        let mut drained = vcores(&[0, 0, 0]);
+        let drained_ref: Vec<&mut AvailableVcores> = drained.iter_mut().collect();
+        for start in 0..3 {
+            assert_eq!(next_with_capacity(&drained_ref, start), None);
+        }
+    }
+
+    #[test]
+    fn next_with_capacity_wraps_around() {
+        let mut budgets = vcores(&[2, 0, 0, 1]);
+        let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
+        assert_eq!(next_with_capacity(&budgets_ref, 0), Some(0));
+        assert_eq!(next_with_capacity(&budgets_ref, 1), Some(3));
+        assert_eq!(next_with_capacity(&budgets_ref, 3), Some(3));
+
+        let mut only_first = vcores(&[4, 0, 0]);
+        let only_first_ref: Vec<&mut AvailableVcores> = only_first.iter_mut().collect();
+        assert_eq!(next_with_capacity(&only_first_ref, 2), Some(0));
+    }
+
+    #[test]
+    fn next_with_capacity_single_executor() {
+        let mut busy = vcores(&[3]);
+        let busy_ref: Vec<&mut AvailableVcores> = busy.iter_mut().collect();
+        assert_eq!(next_with_capacity(&busy_ref, 0), Some(0));
+
+        let mut idle = vcores(&[0]);
+        let idle_ref: Vec<&mut AvailableVcores> = idle.iter_mut().collect();
+        assert_eq!(next_with_capacity(&idle_ref, 0), None);
+    }
+
+    #[test]
+    fn bias_strategy_never_wraps_back() {
+        let mut budgets = vcores(&[2, 0, 1]);
+        let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
+        assert_eq!(BindStrategy::Bias.pick(&budgets_ref, 0), Some(0));
+        assert_eq!(BindStrategy::Bias.pick(&budgets_ref, 1), Some(2));
+        assert_eq!(BindStrategy::Bias.pick(&budgets_ref, 3), None);
+        assert_eq!(BindStrategy::Bias.advance(2, 3), 2);
+        assert_eq!(BindStrategy::RoundRobin.advance(2, 3), 0);
+    }
+}

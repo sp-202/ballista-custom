@@ -1,0 +1,1602 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ballista_core::error::{BallistaError, Result};
+use ballista_core::event_loop::{EventLoop, EventSender};
+use ballista_core::serde::BallistaCodec;
+use ballista_core::serde::protobuf::TaskStatus;
+use ballista_core::shutdown::Shutdown;
+use ballista_core::{JobId, JobStatusSubscriber};
+
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_proto::logical_plan::AsLogicalPlan;
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use ferroid::base32::Base32SnowExt;
+use ferroid::futures::SnowflakeGeneratorAsyncTokioExt;
+use ferroid::generator::AtomicSnowflakeGenerator;
+use ferroid::id::SnowflakeMastodonId;
+use ferroid::time::MonotonicClock;
+use tokio::sync::broadcast;
+
+use crate::cache::{contains_cache, strip_caches};
+use crate::cluster::{BallistaCluster, ClusterStateEventStream, JobStateEventStream};
+use crate::config::SchedulerConfig;
+use crate::metrics::SchedulerMetricsCollector;
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
+use log::{debug, info, warn};
+
+use crate::scheduler_server::event::{Admission, QueryStageSchedulerEvent, SubmitPlan};
+use crate::scheduler_server::query_stage_scheduler::QueryStageScheduler;
+
+use crate::state::SchedulerState;
+use crate::state::task_manager::TaskLauncher;
+
+// include the generated protobuf source as a submodule
+#[cfg(feature = "keda-scaler")]
+#[allow(clippy::all)]
+#[allow(missing_docs)]
+pub mod externalscaler {
+    include!(concat!(env!("OUT_DIR"), "/externalscaler.rs"));
+}
+
+/// Events for the scheduler event loop.
+pub mod event;
+/// Builds `HistoryEvent`s emitted from the event loop into the event log.
+///
+/// Depends on `crate::api::dto_build`, which is only compiled with the
+/// `rest-api` feature (the default), so this module and the event-log wiring
+/// into `QueryStageScheduler` are gated the same way.
+#[cfg(feature = "rest-api")]
+mod event_log;
+#[cfg(feature = "keda-scaler")]
+mod external_scaler;
+mod grpc;
+pub(crate) mod query_stage_scheduler;
+
+/// Function type for building DataFusion session states from configuration.
+pub type SessionBuilder =
+    Arc<dyn Fn(SessionConfig) -> datafusion::common::Result<SessionState> + Send + Sync>;
+
+/// Generates unique identifiers for submitted jobs.
+///
+/// Schedulers use one `JobIdGenerator` instance for their lifetime, calling
+/// [`next_id`](JobIdGenerator::next_id) once per job submission.
+/// Implementations must be safe to call concurrently from multiple tasks and
+/// must never return the same id twice, since job ids are used to key
+/// scheduler-wide state.
+///
+/// A default snowflake-based generator is used unless a
+/// custom implementation is supplied via
+/// [`SchedulerConfig::job_id_generator`](crate::config::SchedulerConfig::job_id_generator).
+#[async_trait::async_trait]
+pub trait JobIdGenerator: Sync + Send {
+    /// Returns a new, globally unique job id.
+    async fn next_id(&self) -> String;
+}
+
+/// A monotonically increasing sortable snowflake job id generator
+/// which does not capture machine id as part result.
+pub(crate) struct DefaultJobGenerator {
+    generator: AtomicSnowflakeGenerator<SnowflakeMastodonId, MonotonicClock>,
+}
+
+impl Default for DefaultJobGenerator {
+    fn default() -> Self {
+        // default implementation does not support multi machine
+        // setups
+        let generator = AtomicSnowflakeGenerator::new(
+            0, // machine id is hard-coded to 0
+            MonotonicClock::<1>::default(),
+        );
+
+        Self { generator }
+    }
+}
+
+#[async_trait::async_trait]
+impl JobIdGenerator for DefaultJobGenerator {
+    async fn next_id(&self) -> String {
+        let id = self.generator.next_id_async().await;
+        id.encode().to_string()
+    }
+}
+
+/// The error for a new job at a scheduler that is shutting down: an
+/// `Unavailable` status, so a client knows to submit elsewhere or retry.
+fn shutting_down() -> BallistaError {
+    BallistaError::GrpcError(Box::new(tonic::Status::unavailable(
+        "the scheduler is shutting down and is not accepting new jobs",
+    )))
+}
+
+/// The main scheduler server that coordinates distributed query execution.
+///
+/// The `SchedulerServer` is responsible for:
+/// - Accepting job submissions from clients
+/// - Planning and scheduling query execution across executors
+/// - Managing executor lifecycle and health
+/// - Tracking job progress and handling failures
+#[derive(Clone)]
+pub struct SchedulerServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    /// Unique identifier for this scheduler instance.
+    pub scheduler_id: String,
+    /// Scheduler callback endpoint in host:port format.
+    pub scheduler_endpoint: String,
+    /// Timestamp when this scheduler was started.
+    pub start_time: u128,
+    /// Shared scheduler state for job and executor management.
+    pub state: Arc<SchedulerState<T, U>>,
+    /// Event loop for processing query stage scheduling events.
+    pub(crate) query_stage_event_loop: EventLoop<QueryStageSchedulerEvent>,
+    #[cfg(feature = "rest-api")]
+    /// Query stage scheduler for REST API access.
+    query_stage_scheduler: Arc<QueryStageScheduler<T, U>>,
+    /// Scheduler configuration.
+    config: Arc<SchedulerConfig>,
+    /// generates job ids
+    generator: Arc<dyn JobIdGenerator>,
+    /// Broadcasts the shutdown signal to the dead-executor reaper and, via
+    /// [`subscribe_for_shutdown`](Self::subscribe_for_shutdown), to the serving future.
+    shutdown_tx: broadcast::Sender<()>,
+    /// Set once the scheduler is shutting down: it keeps serving the jobs it
+    /// has, but takes no new ones and reports itself not ready.
+    draining: Arc<AtomicBool>,
+    /// Submissions admitted and not yet registered as running jobs, see
+    /// [`Admission`].
+    admissions: Arc<AtomicUsize>,
+}
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {
+    /// Creates a new `SchedulerServer` with the given configuration.
+    pub fn new(
+        scheduler_endpoint: String,
+        cluster: BallistaCluster,
+        codec: BallistaCodec<T, U>,
+        config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+    ) -> Self {
+        let scheduler_id = config.scheduler_id.clone();
+        let state = Arc::new(SchedulerState::new(
+            cluster,
+            codec,
+            scheduler_id.clone(),
+            scheduler_endpoint.clone(),
+            config.clone(),
+        ));
+
+        Self::from_state(
+            scheduler_id,
+            scheduler_endpoint,
+            state,
+            config,
+            metrics_collector,
+        )
+    }
+
+    /// Creates a new `SchedulerServer` with a custom task launcher.
+    #[allow(dead_code)]
+    pub fn new_with_task_launcher(
+        scheduler_endpoint: String,
+        cluster: BallistaCluster,
+        codec: BallistaCodec<T, U>,
+        config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+        task_launcher: Arc<dyn TaskLauncher>,
+    ) -> Self {
+        let scheduler_id = config.scheduler_id.clone();
+        let state = Arc::new(SchedulerState::new_with_task_launcher(
+            cluster,
+            codec,
+            scheduler_id.clone(),
+            config.clone(),
+            task_launcher,
+        ));
+
+        Self::from_state(
+            scheduler_id,
+            scheduler_endpoint,
+            state,
+            config,
+            metrics_collector,
+        )
+    }
+
+    fn from_state(
+        scheduler_id: String,
+        scheduler_endpoint: String,
+        state: Arc<SchedulerState<T, U>>,
+        config: Arc<SchedulerConfig>,
+        metrics_collector: Arc<dyn SchedulerMetricsCollector>,
+    ) -> Self {
+        #[cfg(feature = "rest-api")]
+        let event_log = config.event_log_dir.as_ref().map(|dir| {
+            ballista_history::writer::EventLogWriter::new(
+                std::path::PathBuf::from(dir),
+                config.event_loop_buffer_size as usize,
+            )
+        });
+        let query_stage_scheduler = Arc::new(QueryStageScheduler::new(
+            state.clone(),
+            metrics_collector,
+            config.clone(),
+            #[cfg(feature = "rest-api")]
+            event_log,
+        ));
+        let query_stage_event_loop = EventLoop::new(
+            "query_stage".to_owned(),
+            config.event_loop_buffer_size as usize,
+            query_stage_scheduler.clone(),
+        );
+
+        // The state's generator, which also names cache build jobs.
+        let generator = state.job_id_generator.clone();
+
+        info!("Scheduler id: {scheduler_id}");
+        info!("Scheduler callback endpoint: {scheduler_endpoint}");
+
+        Self {
+            scheduler_id,
+            scheduler_endpoint,
+            start_time: timestamp_millis() as u128,
+            state,
+            query_stage_event_loop,
+            #[cfg(feature = "rest-api")]
+            query_stage_scheduler,
+            config,
+            generator,
+            shutdown_tx: broadcast::channel(1).0,
+            draining: Arc::new(AtomicBool::new(false)),
+            admissions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Returns a handle that resolves once [`trigger_shutdown`](Self::trigger_shutdown) is called.
+    ///
+    /// Callers that never call `trigger_shutdown` (e.g. tests, the standalone
+    /// scheduler, embedders that manage their own lifecycle) see no behavior
+    /// change: the returned handle simply never resolves.
+    ///
+    /// Must be called *before* `trigger_shutdown`: the underlying broadcast
+    /// isn't latched, so a handle obtained after the signal has already been
+    /// sent waits forever rather than resolving immediately. Every current
+    /// caller subscribes at startup, well before shutdown, so this isn't a
+    /// live bug, but it's a sharp edge for future callers.
+    pub fn subscribe_for_shutdown(&self) -> Shutdown {
+        Shutdown::new(self.shutdown_tx.subscribe())
+    }
+
+    /// Signals the dead-executor reaper and the serving future to shut down
+    /// gracefully. The event loop and the other background tasks keep running
+    /// until the process exits.
+    ///
+    /// Safe to call more than once: later calls broadcast again, which every
+    /// current receiver simply ignores once it has already seen one signal.
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+
+    /// Stops the scheduler taking new jobs and makes [`is_ready`](Self::is_ready)
+    /// false, while the jobs it already has keep running. Executors and
+    /// clients are served as before.
+    pub fn start_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// True once [`start_draining`](Self::start_draining) was called.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Initializes the scheduler and starts background tasks.
+    pub async fn init(&mut self) -> Result<()> {
+        self.state.init().await?;
+        self.query_stage_event_loop.start()?;
+        self.expire_dead_executors()?;
+
+        Ok(())
+    }
+
+    /// Returns the number of jobs waiting in the queue.
+    pub fn pending_job_number(&self) -> usize {
+        self.state.task_manager.pending_job_number()
+    }
+
+    /// Returns the number of currently running jobs.
+    pub fn running_job_number(&self) -> usize {
+        self.state.task_manager.running_job_number()
+    }
+
+    /// Returns the number of jobs that are being submitted, queued or running.
+    ///
+    /// A job is admitted, then pending, then running, and the stages are read in
+    /// that order. The step from pending to running isn't atomic: a job leaves
+    /// `queued_jobs` before it enters the active job cache, so for a moment the
+    /// pending and running counts miss it. Only its [`Admission`], which lasts
+    /// until planning has registered it as running, covers that gap and the one
+    /// between admission and the pending count.
+    pub fn active_job_number(&self) -> usize {
+        self.admissions.load(Ordering::SeqCst)
+            + self.pending_job_number()
+            + self.running_job_number()
+    }
+
+    /// Admits a job submission, or refuses it if the scheduler is shutting
+    /// down. [`submit_plan`](Self::submit_plan) puts the [`Admission`] in the
+    /// [`JobQueued`](QueryStageSchedulerEvent::JobQueued) event for the job, and
+    /// it ends when the job is running or has failed to plan.
+    ///
+    /// The count goes up before the flag is checked, and
+    /// [`start_draining`](Self::start_draining) sets the flag before anyone
+    /// reads the count, so a submission is either refused or counted.
+    pub(crate) fn admit(&self) -> Result<Admission> {
+        let admission = Admission::new(&self.admissions);
+        if self.is_draining() {
+            return Err(shutting_down());
+        }
+        Ok(admission)
+    }
+
+    /// Returns a stream of job state events from the configured state backend.
+    pub async fn job_state_events(&self) -> Result<JobStateEventStream> {
+        self.state.task_manager.job_state_events().await
+    }
+
+    /// Returns a stream of cluster state events from the configured state backend.
+    pub async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
+        self.state.executor_manager.cluster_state_events().await
+    }
+
+    /// True when at least `min_ready_executors` executors currently have
+    /// live heartbeats and the scheduler isn't [draining](Self::start_draining).
+    /// Embedders can call this from their own health/readiness handler and AND
+    /// it with whatever app-specific state they track. The built-in `/readyz`
+    /// endpoint (see `api::health`) reports the same value.
+    pub fn is_ready(&self) -> bool {
+        let alive = self.state.executor_manager.get_alive_executors().len();
+        !self.is_draining() && alive >= self.state.config.min_ready_executors
+    }
+    #[cfg(feature = "rest-api")]
+    pub(crate) fn metrics_collector(&self) -> &dyn SchedulerMetricsCollector {
+        self.query_stage_scheduler.metrics_collector()
+    }
+    /// Cancels job for given job_id
+    pub async fn cancel_job(&self, job_id: JobId) -> Result<()> {
+        log::debug!("Received cancellation request for job {job_id}");
+
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::JobCancel(job_id.to_owned()))
+            .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn fail_job(
+        &self,
+        job_id: JobId,
+        fail_message: String,
+    ) -> Result<()> {
+        log::debug!("Received fail job request for job {job_id}");
+
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::JobRunningFailed {
+                job_id,
+                fail_message,
+                queued_at: timestamp_millis(),
+                failed_at: timestamp_millis(),
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Shared entry point for logical and physical submissions.
+    ///
+    /// A plan holding `DataFrame::cache()` nodes returns the read job's id at
+    /// once; its caches are built as jobs of their own.
+    pub async fn submit_plan(
+        &self,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: &SubmitPlan,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<JobId> {
+        log::debug!("Received submit request for job {job_name}");
+        let admission = self.admit()?;
+
+        // Caches run inline if disabled, and are never built for EXPLAIN.
+        let rewritten = match plan {
+            SubmitPlan::Logical(logical) if contains_cache(logical) => {
+                if self.state.config.disable_dataframe_cache {
+                    Some(SubmitPlan::Logical(strip_caches(logical)?))
+                } else if matches!(logical, LogicalPlan::Explain(_)) {
+                    Some(SubmitPlan::Logical(
+                        self.state.explain_cache_plan(logical).await?,
+                    ))
+                } else {
+                    let sender = self.query_stage_event_loop.get_sender()?;
+                    return self
+                        .state
+                        .submit_cache_plan(
+                            &sender, job_name, ctx, logical, subscriber, admission,
+                        )
+                        .await;
+                }
+            }
+            _ => None,
+        };
+        let plan = rewritten.as_ref().unwrap_or(plan);
+
+        let job_id: JobId = self.generator.next_id().await.into();
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::JobQueued {
+                job_id: job_id.clone(),
+                job_name: job_name.to_owned(),
+                session_ctx: ctx,
+                plan: Box::new(plan.clone()),
+                queued_at: timestamp_millis(),
+                subscriber,
+                admission,
+            })
+            .await?;
+
+        Ok(job_id)
+    }
+
+    /// Submit a logical plan for distributed execution, returning the job id.
+    pub async fn submit_job(
+        &self,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: &LogicalPlan,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<JobId> {
+        self.submit_plan(
+            job_name,
+            ctx,
+            &SubmitPlan::Logical(plan.clone()),
+            subscriber,
+        )
+        .await
+    }
+
+    /// Submit an already-built physical plan for distributed execution. The physical
+    /// plan is planned with the static distributed planner; adaptive query planning
+    /// (AQE) is not available for this path.
+    pub async fn submit_physical_plan(
+        &self,
+        job_name: &str,
+        ctx: Arc<SessionContext>,
+        plan: Arc<dyn ExecutionPlan>,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<JobId> {
+        self.submit_plan(job_name, ctx, &SubmitPlan::Physical(plan), subscriber)
+            .await
+    }
+
+    /// It just send task status update event to the channel,
+    /// and will not guarantee the event processing completed after return
+    pub(crate) async fn update_task_status(
+        &self,
+        executor_id: &str,
+        tasks_status: Vec<TaskStatus>,
+    ) -> Result<()> {
+        // We might receive buggy task updates from dead executors.
+        if self.state.config.is_push_staged_scheduling()
+            && self.state.executor_manager.is_dead_executor(executor_id)
+        {
+            let error_msg = format!(
+                "Receive buggy tasks status from dead Executor {executor_id}, task status update ignored."
+            );
+            warn!("{error_msg}");
+            return Ok(());
+        }
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::TaskUpdating(
+                executor_id.to_owned(),
+                tasks_status,
+            ))
+            .await
+    }
+
+    pub(crate) async fn revive_offers(&self) -> Result<()> {
+        self.query_stage_event_loop
+            .get_sender()?
+            .post_event(QueryStageSchedulerEvent::ReviveOffers)
+            .await
+    }
+
+    /// Spawn an async task which periodically check the active executors' status and
+    /// expire the dead executors
+    fn expire_dead_executors(&self) -> Result<tokio::task::JoinHandle<()>> {
+        let state = self.state.clone();
+        let event_sender = self.query_stage_event_loop.get_sender()?;
+        let mut shutdown = self.subscribe_for_shutdown();
+        let handle = tokio::task::spawn(async move {
+            loop {
+                let expired_executors = state.executor_manager.get_expired_executors();
+                debug!("expire_dead_executors: {expired_executors:?}");
+                for expired in expired_executors {
+                    let executor_id = expired.executor_id.clone();
+
+                    let sender_clone = event_sender.clone();
+
+                    let terminating = matches!(
+                        expired
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.status.as_ref()),
+                        Some(ballista_core::serde::protobuf::executor_status::Status::Terminating(_))
+                    );
+
+                    let stop_reason = if terminating {
+                        format!(
+                            "TERMINATING executor {executor_id} heartbeat timed out after {}s",
+                            state.config.executor_termination_grace_period,
+                        )
+                    } else {
+                        format!(
+                            "ACTIVE executor {executor_id} heartbeat timed out after {}s",
+                            state.config.executor_timeout_seconds,
+                        )
+                    };
+
+                    warn!("{stop_reason}");
+
+                    // If executor is expired, remove it immediately
+                    Self::remove_executor(
+                        state.clone(),
+                        sender_clone,
+                        &executor_id,
+                        Some(stop_reason.clone()),
+                        0,
+                    );
+
+                    // If executor is not already terminating then stop it. If it is terminating then it should already be shutting
+                    // down and we do not need to do anything here.
+                    if !terminating {
+                        state
+                            .executor_manager
+                            .stop_executor(&executor_id, stop_reason)
+                            .await;
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(
+                        state.config.expire_dead_executor_interval_seconds,
+                    )) => {}
+                    _ = shutdown.recv() => {
+                        debug!("expire_dead_executors stopping on shutdown");
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(handle)
+    }
+
+    /// Removes an executor after `wait_secs`, in the background. The removal
+    /// itself is [`SchedulerState::remove_executor`], so this path and the one
+    /// taken when a task launch fails cannot drift apart.
+    pub(crate) fn remove_executor(
+        state: Arc<SchedulerState<T, U>>,
+        event_sender: EventSender<QueryStageSchedulerEvent>,
+        executor_id: &str,
+        reason: Option<String>,
+        wait_secs: u64,
+    ) {
+        debug!("remove executor: {executor_id}");
+        let executor_id = executor_id.to_owned();
+        tokio::spawn(async move {
+            // Wait for `wait_secs` before removing executor
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+
+            state
+                .remove_executor(&executor_id, reason, &event_sender)
+                .await;
+        });
+    }
+
+    async fn do_register_executor(&self, metadata: ExecutorMetadata) -> Result<()> {
+        let executor_data = ExecutorData {
+            executor_id: metadata.id.clone(),
+            total_vcores: metadata.specification.vcores,
+            available_vcores: metadata.specification.vcores,
+        };
+
+        // Save the executor to state
+        self.state
+            .executor_manager
+            .register_executor(metadata, executor_data)
+            .await?;
+
+        // If we are using push-based scheduling then reserve this executors slots and send
+        // them for scheduling tasks.
+        if self.state.config.is_push_staged_scheduling() {
+            self.revive_offers().await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Returns the current timestamp in seconds since UNIX epoch.
+pub fn timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs()
+}
+
+/// Returns the current timestamp in milliseconds since UNIX epoch.
+pub fn timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ballista_core::JobId;
+    use ballista_core::extension::SessionConfigExt;
+    use ballista_core::serde::protobuf::job_status::Status;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions_aggregate::sum::sum;
+    use datafusion::logical_expr::{LogicalPlan, col};
+
+    use datafusion::prelude::SessionConfig;
+    use datafusion::test_util::scan_empty_with_partitions;
+    use datafusion_proto::protobuf::LogicalPlanNode;
+    use datafusion_proto::protobuf::PhysicalPlanNode;
+    use futures::StreamExt;
+
+    use crate::cluster::ClusterStateEvent;
+    use crate::config::SchedulerConfig;
+    use ballista_core::config::TaskSchedulingPolicy;
+    use ballista_core::error::Result;
+
+    use ballista_core::serde::BallistaCodec;
+    use ballista_core::serde::protobuf::{
+        ExecutionError, FailedTask, JobStatus, MultiTaskDefinition,
+        ShuffleWritePartition, SuccessfulJob, SuccessfulTask, TaskId, TaskStatus,
+        failed_task, job_status, task_status,
+    };
+    use ballista_core::serde::scheduler::{
+        ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
+        ExecutorSpecification,
+    };
+
+    use crate::scheduler_server::{SchedulerServer, timestamp_millis};
+
+    use crate::test_utils::{
+        ExplodingTableProvider, PanickingTableProvider, RejectingTaskLauncher,
+        SchedulerTest, TaskRunnerFn, TestMetricsCollector, assert_completed_event,
+        assert_failed_event, assert_no_submitted_event, assert_submitted_event,
+        test_cluster_context,
+    };
+
+    #[tokio::test]
+    async fn test_scheduler_exposes_cluster_state_events() -> Result<()> {
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PushStaged).await?;
+        let mut events = scheduler.cluster_state_events().await?;
+        let (executor_metadata, executor_data) =
+            test_executors(2).into_iter().next().unwrap();
+        let executor_id = executor_metadata.id.clone();
+
+        scheduler
+            .state
+            .executor_manager
+            .register_executor(executor_metadata, executor_data)
+            .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("cluster state event should arrive");
+        assert_eq!(
+            event,
+            Some(ClusterStateEvent::RegisteredExecutor { executor_id })
+        );
+
+        Ok(())
+    }
+
+    /// `trigger_shutdown` must both resolve outstanding `subscribe_for_shutdown`
+    /// handles and stop the dead-executor reaper loop it starts as part of
+    /// `init`, rather than leaving it looping until process exit.
+    #[tokio::test]
+    async fn trigger_shutdown_stops_the_dead_executor_reaper() -> Result<()> {
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PushStaged).await?;
+
+        let mut shutdown = scheduler.subscribe_for_shutdown();
+        assert!(!shutdown.is_shutdown());
+
+        // A second reaper, independent of the one `init` already started, so
+        // this test can observe its task actually finishing.
+        let reaper = scheduler.expire_dead_executors()?;
+
+        scheduler.trigger_shutdown();
+
+        tokio::time::timeout(Duration::from_secs(5), shutdown.recv())
+            .await
+            .expect("the subscription should resolve promptly after trigger_shutdown");
+
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .expect("expire_dead_executors should stop once shutdown is triggered")
+            .expect("reaper task should not panic");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pull_scheduling() -> Result<()> {
+        let plan = test_plan();
+        // this test will fail when AQE scheduling is used.
+        // as AQE will fold plan due to empty scan
+        let total_vcores = 4;
+
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PullStaged).await?;
+
+        let executors = test_executors(total_vcores);
+        for (executor_metadata, executor_data) in executors {
+            scheduler
+                .state
+                .executor_manager
+                .register_executor(executor_metadata, executor_data)
+                .await?;
+        }
+
+        let config = SessionConfig::new_with_ballista()
+            .with_target_partitions(total_vcores)
+            // Asserts the static planner's stage/partition layout.
+            .with_ballista_adaptive_query_planner(false);
+
+        let ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session("session_id", &config)
+            .await?;
+
+        let job_id: JobId = "job".into();
+
+        // Enqueue job
+        scheduler
+            .state
+            .task_manager
+            .queue_job(&job_id, "", timestamp_millis())?;
+
+        // Submit job
+        scheduler
+            .state
+            .task_manager
+            .submit_job(&job_id, "", ctx, &plan, 0, None)
+            .await
+            .expect("submitting plan");
+
+        // Refresh the ExecutionGraph
+        while let Some(graph) = scheduler
+            .state
+            .task_manager
+            .get_active_execution_graph(&job_id)
+        {
+            let task = {
+                let mut graph = graph.write().await;
+                graph.pop_next_task("executor-1")?
+            };
+            if let Some(task) = task {
+                let mut partitions: Vec<ShuffleWritePartition> = vec![];
+
+                let num_partitions = task.get_output_partition_number();
+
+                for partition_id in 0..num_partitions {
+                    partitions.push(ShuffleWritePartition {
+                        partition_id: partition_id as u64,
+                        num_batches: 1,
+                        num_rows: 1,
+                        num_bytes: 1,
+                        file_id: None,
+                        is_sort_shuffle: false,
+                    })
+                }
+
+                // Complete the task
+                let task_status = TaskStatus {
+                    task_id: task.key.task_id as u32,
+                    job_id: task.key.job_id.clone().into(),
+                    stage_id: task.key.stage_id as u32,
+                    stage_attempt_num: task.stage_attempt_num as u32,
+                    launch_time: 0,
+                    start_exec_time: 0,
+                    end_exec_time: 0,
+                    metrics: vec![],
+                    status: Some(task_status::Status::Successful(SuccessfulTask {
+                        executor_id: "executor-1".to_owned(),
+                        partitions,
+                        runtime_stats: vec![],
+                        task_column_stats: vec![],
+                        window_state: vec![],
+                    })),
+                };
+
+                scheduler
+                    .state
+                    .update_task_statuses("executor-1", vec![task_status])
+                    .await?;
+            } else {
+                break;
+            }
+        }
+
+        let final_graph = scheduler
+            .state
+            .task_manager
+            .get_active_execution_graph(&job_id)
+            .expect("Fail to find graph in the cache");
+
+        let final_graph = final_graph.read().await;
+        assert!(final_graph.is_successful());
+        assert_eq!(final_graph.output_locations().len(), 4);
+
+        for output_location in final_graph.output_locations() {
+            assert_eq!(output_location.executor_meta.host, "localhost1".to_owned())
+        }
+
+        Ok(())
+    }
+
+    // Pipelined execution is not wired into the scheduler yet, so a session
+    // that asks for it must be refused rather than planned as blocking.
+    #[tokio::test]
+    async fn test_pipelined_execution_mode_is_rejected() -> Result<()> {
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PushStaged).await?;
+
+        let config = SessionConfig::new_with_ballista()
+            .set_str(ballista_core::config::BALLISTA_EXECUTION_MODE, "pipelined");
+        let ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session("session_id", &config)
+            .await?;
+
+        let job_id: JobId = "pipelined_job".into();
+        scheduler
+            .state
+            .task_manager
+            .queue_job(&job_id, "", timestamp_millis())?;
+
+        let err = scheduler
+            .state
+            .task_manager
+            .submit_job(&job_id, "", ctx, &test_plan(), 0, None)
+            .await
+            .expect_err("a pipelined job should be rejected");
+        assert!(
+            err.to_string().contains("pipelined is not supported yet"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            scheduler
+                .state
+                .task_manager
+                .get_active_execution_graph(&job_id)
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    // Verify a job can be submitted as an already-built physical plan.
+    #[tokio::test]
+    async fn test_submit_physical_plan() -> Result<()> {
+        let logical_plan = test_plan();
+        let total_vcores = 4;
+
+        let scheduler = test_scheduler(TaskSchedulingPolicy::PullStaged).await?;
+
+        let executors = test_executors(total_vcores);
+        for (executor_metadata, executor_data) in executors {
+            scheduler
+                .state
+                .executor_manager
+                .register_executor(executor_metadata, executor_data)
+                .await?;
+        }
+
+        let config = SessionConfig::new_with_ballista()
+            .with_target_partitions(total_vcores)
+            // Asserts the static planner's stage/partition layout.
+            .with_ballista_adaptive_query_planner(false);
+
+        let ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session("session_id", &config)
+            .await?;
+
+        // Plan the logical plan into a physical plan and submit it directly.
+        let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
+
+        let job_id: JobId = "physical_job".into();
+
+        scheduler
+            .state
+            .task_manager
+            .queue_job(&job_id, "", timestamp_millis())?;
+
+        scheduler
+            .state
+            .task_manager
+            .submit_physical_plan(&job_id, "", ctx, physical_plan, 0, None)
+            .await
+            .expect("submitting physical plan");
+
+        assert!(
+            scheduler
+                .state
+                .task_manager
+                .get_active_execution_graph(&job_id)
+                .is_some()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_push_scheduling() -> Result<()> {
+        let plan = test_plan();
+        // this test will fail when AQE scheduling is used.
+        // as AQE will fold plan due to empty scan
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            None,
+        )
+        .await?;
+
+        let (status, job_id) = test.run("", &plan).await.expect("running plan");
+
+        match status.status {
+            Some(job_status::Status::Successful(SuccessfulJob {
+                partition_location,
+                ..
+            })) => {
+                assert_eq!(partition_location.len(), 4);
+            }
+            other => {
+                panic!("Expected success status but found {other:?}");
+            }
+        }
+
+        assert_submitted_event(&job_id, &metrics_collector);
+        assert_completed_event(&job_id, &metrics_collector);
+
+        Ok(())
+    }
+
+    // checks if job subscriber is getting same events
+    #[tokio::test]
+    async fn test_push_scheduling_with_subscriber() -> Result<()> {
+        let plan = test_plan();
+        // this test will fail when AQE scheduling is used.
+        // as AQE will fold plan due to empty scan
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            None,
+        )
+        .await?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let (status, job_id) = test
+            .run_with_subscriber("", &plan, Some(tx))
+            .await
+            .expect("running plan");
+
+        match status.status {
+            Some(job_status::Status::Successful(SuccessfulJob {
+                partition_location,
+                ..
+            })) => {
+                assert_eq!(partition_location.len(), 4);
+            }
+            other => {
+                panic!("Expected success status but found {other:?}");
+            }
+        }
+
+        assert_submitted_event(&job_id, &metrics_collector);
+        assert_completed_event(&job_id, &metrics_collector);
+
+        let mut buffer = vec![];
+        rx.recv_many(&mut buffer, 16).await;
+        assert!(!buffer.is_empty());
+
+        let successful_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Successful(_))));
+
+        assert!(successful_job.is_some());
+
+        let failed_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Failed(_))));
+
+        assert!(failed_job.is_none());
+
+        Ok(())
+    }
+
+    // Simulate a task failure and ensure the job status is updated correctly
+    #[tokio::test]
+    async fn test_job_failure() -> Result<()> {
+        let plan = test_plan();
+
+        let runner = Arc::new(TaskRunnerFn::new(
+            |_executor_id: String, task: MultiTaskDefinition| {
+                let mut statuses = vec![];
+
+                for TaskId { task_id, .. } in task.task_ids {
+                    let timestamp = timestamp_millis();
+                    statuses.push(TaskStatus {
+                        task_id,
+                        job_id: task.job_id.clone(),
+                        stage_id: task.stage_id,
+                        stage_attempt_num: task.stage_attempt_num,
+                        launch_time: timestamp,
+                        start_exec_time: timestamp,
+                        end_exec_time: timestamp,
+                        metrics: vec![],
+                        status: Some(task_status::Status::Failed(FailedTask {
+                            error: "ERROR".to_string(),
+                            retryable: false,
+                            count_to_failures: false,
+                            failed_reason: Some(
+                                failed_task::FailedReason::ExecutionError(
+                                    ExecutionError {},
+                                ),
+                            ),
+                        })),
+                    });
+                }
+
+                statuses
+            },
+        ));
+
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            Some(runner),
+        )
+        .await?;
+
+        let (status, job_id) = test.run("", &plan).await.expect("running plan");
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "{}",
+            "Expected job status to be failed but it was {status:?}"
+        );
+
+        assert_submitted_event(&job_id, &metrics_collector);
+        assert_failed_event(&job_id, &metrics_collector);
+
+        Ok(())
+    }
+
+    // Simulate a task failure and ensure the job status is updated correctly
+    // it also checks if job subscriber is getting same events
+    #[tokio::test]
+    async fn test_job_failure_subscriber() -> Result<()> {
+        let plan = test_plan();
+
+        let runner = Arc::new(TaskRunnerFn::new(
+            |_executor_id: String, task: MultiTaskDefinition| {
+                let mut statuses = vec![];
+
+                for TaskId { task_id, .. } in task.task_ids {
+                    let timestamp = timestamp_millis();
+                    statuses.push(TaskStatus {
+                        task_id,
+                        job_id: task.job_id.clone(),
+                        stage_id: task.stage_id,
+                        stage_attempt_num: task.stage_attempt_num,
+                        launch_time: timestamp,
+                        start_exec_time: timestamp,
+                        end_exec_time: timestamp,
+                        metrics: vec![],
+                        status: Some(task_status::Status::Failed(FailedTask {
+                            error: "ERROR".to_string(),
+                            retryable: false,
+                            count_to_failures: false,
+                            failed_reason: Some(
+                                failed_task::FailedReason::ExecutionError(
+                                    ExecutionError {},
+                                ),
+                            ),
+                        })),
+                    });
+                }
+
+                statuses
+            },
+        ));
+
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            Some(runner),
+        )
+        .await?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (status, job_id) = test
+            .run_with_subscriber("", &plan, Some(tx))
+            .await
+            .expect("running plan");
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "{}",
+            "Expected job status to be failed but it was {status:?}"
+        );
+
+        assert_submitted_event(&job_id, &metrics_collector);
+        assert_failed_event(&job_id, &metrics_collector);
+
+        let mut buffer = vec![];
+        rx.recv_many(&mut buffer, 16).await;
+
+        assert!(!buffer.is_empty());
+
+        let failed_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Failed(_))));
+
+        assert!(failed_job.is_some());
+
+        let successful_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Successful(_))));
+
+        assert!(successful_job.is_none());
+
+        Ok(())
+    }
+
+    // If the physical planning fails, the job should be marked as failed.
+    // Here we simulate a planning failure using ExplodingTableProvider to test this.
+    #[tokio::test]
+    async fn a_draining_scheduler_refuses_new_jobs_and_is_not_ready() -> Result<()> {
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(SchedulerConfig {
+                    min_ready_executors: 0,
+                    ..Default::default()
+                }),
+                Arc::new(TestMetricsCollector::default()),
+            );
+        scheduler.init().await?;
+        assert!(scheduler.is_ready());
+        assert_eq!(scheduler.active_job_number(), 0);
+
+        scheduler.start_draining();
+
+        assert!(scheduler.is_draining());
+        assert!(!scheduler.is_ready());
+        let error = scheduler
+            .submit_job(
+                "",
+                Arc::new(datafusion::prelude::SessionContext::new()),
+                &test_plan(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ballista_core::error::BallistaError::GrpcError(status)
+                if status.code() == tonic::Code::Unavailable),
+            "{error}"
+        );
+        assert!(error.to_string().contains("shutting down"), "{error}");
+        Ok(())
+    }
+
+    async fn scheduler_that_is_ready_without_executors()
+    -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(SchedulerConfig {
+                    min_ready_executors: 0,
+                    ..Default::default()
+                }),
+                Arc::new(TestMetricsCollector::default()),
+            );
+        scheduler.init().await?;
+        Ok(scheduler)
+    }
+
+    /// A submission is paused after it was admitted and before its job is
+    /// registered, so no job is visible yet. Draining starts meanwhile. The
+    /// scheduler must not count itself idle until the submission is done.
+    #[tokio::test(start_paused = true)]
+    async fn an_admitted_submission_keeps_the_scheduler_busy() -> Result<()> {
+        let scheduler = scheduler_that_is_ready_without_executors().await?;
+
+        let admission = scheduler.admit()?;
+        assert_eq!(scheduler.pending_job_number(), 0);
+        assert_eq!(scheduler.running_job_number(), 0);
+
+        scheduler.start_draining();
+        assert_eq!(scheduler.active_job_number(), 1);
+
+        let idle =
+            ballista_core::utils::wait_until_idle(|| scheduler.active_job_number());
+        tokio::pin!(idle);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut idle)
+                .await
+                .is_err(),
+            "must keep waiting while the submission is in progress"
+        );
+
+        // Clones share the admission, as when the event is cloned.
+        let clone = admission.clone();
+        drop(admission);
+        assert_eq!(scheduler.active_job_number(), 1);
+        drop(clone);
+        tokio::time::timeout(Duration::from_secs(5), idle)
+            .await
+            .expect("must become idle once the submission is done");
+        assert_eq!(scheduler.active_job_number(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_submission_after_draining_started_is_refused_and_not_counted() -> Result<()>
+    {
+        let scheduler = scheduler_that_is_ready_without_executors().await?;
+        scheduler.start_draining();
+
+        assert!(scheduler.admit().is_err());
+        assert_eq!(scheduler.active_job_number(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_planning_failure() -> Result<()> {
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            None,
+        )
+        .await?;
+
+        let ctx = test.ctx().await?;
+
+        ctx.register_table("explode", Arc::new(ExplodingTableProvider))?;
+
+        let plan = ctx
+            .sql("SELECT * FROM explode")
+            .await?
+            .into_optimized_plan()?;
+
+        // This should fail when we try and create the physical plan
+        let (status, job_id) = test.run("", &plan).await?;
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "{}",
+            "Expected job status to be failed but it was {status:?}"
+        );
+
+        assert_no_submitted_event(&job_id, &metrics_collector);
+        assert_failed_event(&job_id, &metrics_collector);
+
+        Ok(())
+    }
+
+    // If the physical planning fails, the job should be marked as failed.
+    // Here we simulate a planning failure using ExplodingTableProvider to test this.
+    // it also checks if job subscriber is getting same events
+    #[tokio::test]
+    async fn test_planning_failure_with_subscriber() -> Result<()> {
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            None,
+        )
+        .await?;
+
+        let ctx = test.ctx().await?;
+
+        ctx.register_table("explode", Arc::new(ExplodingTableProvider))?;
+
+        let plan = ctx
+            .sql("SELECT * FROM explode")
+            .await?
+            .into_optimized_plan()?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        // This should fail when we try and create the physical plan
+        let (status, job_id) = test.run_with_subscriber("", &plan, Some(tx)).await?;
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "{}",
+            "Expected job status to be failed but it was {status:?}"
+        );
+
+        assert_no_submitted_event(&job_id, &metrics_collector);
+        assert_failed_event(&job_id, &metrics_collector);
+
+        let mut buffer = vec![];
+        rx.recv_many(&mut buffer, 16).await;
+        assert!(!buffer.is_empty());
+
+        let failed_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Failed(_))));
+
+        assert!(failed_job.is_some());
+
+        let successful_job = buffer
+            .iter()
+            .find(|s| matches!(s.status, Some(Status::Successful(_))));
+
+        assert!(successful_job.is_none());
+
+        Ok(())
+    }
+
+    // A panic while planning must fail the job like any other planning error, and
+    // release the job's admission so a draining scheduler can go idle.
+    #[tokio::test]
+    async fn a_panic_while_planning_fails_the_job() -> Result<()> {
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector.clone(),
+            4,
+            1,
+            None,
+        )
+        .await?;
+
+        let ctx = test.ctx().await?;
+        ctx.register_table("panic", Arc::new(PanickingTableProvider))?;
+        let plan = ctx
+            .sql("SELECT * FROM panic")
+            .await?
+            .into_optimized_plan()?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        // Without the fix the job never leaves the queue, so don't wait forever.
+        let (status, job_id) = tokio::time::timeout(
+            Duration::from_secs(10),
+            test.run_with_subscriber("", &plan, Some(tx)),
+        )
+        .await
+        .expect("a panic while planning must fail the job")?;
+
+        let Some(job_status::Status::Failed(failed)) = &status.status else {
+            panic!("Expected job status to be failed but it was {status:?}");
+        };
+        assert!(
+            failed.error.contains("PanickingTableProvider just panics!"),
+            "unexpected error: {}",
+            failed.error
+        );
+        assert_no_submitted_event(&job_id, &metrics_collector);
+        assert_failed_event(&job_id, &metrics_collector);
+        assert_eq!(test.active_job_number(), 0);
+
+        let subscriber_status = rx.recv().await.expect("subscriber must be notified");
+        assert!(matches!(
+            subscriber_status.status,
+            Some(job_status::Status::Failed(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deterministic_launch_rejection_fails_job() -> Result<()> {
+        // A launcher that always rejects with gRPC InvalidArgument (an executor that
+        // cannot decode the task). The job must fail fast instead of hanging (#1908).
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+        let mut test = SchedulerTest::new_with_launcher(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged),
+            metrics_collector,
+            1,
+            1,
+            None,
+            Arc::new(RejectingTaskLauncher::default()),
+        )
+        .await?;
+
+        let plan = test_plan();
+
+        // `run` submits the job and polls until it reaches a terminal state.
+        // Hard wall-clock bound so a stuck job fails the test instead of hanging.
+        let (status, _job_id) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            test.run("", &plan),
+        )
+        .await
+        .expect(
+            "job did not reach a terminal state within 10s — likely not being failed",
+        )?;
+
+        assert!(
+            matches!(
+                status,
+                JobStatus {
+                    status: Some(job_status::Status::Failed(_)),
+                    ..
+                }
+            ),
+            "expected job to fail on task rejection, got {status:?}"
+        );
+
+        Ok(())
+    }
+
+    async fn test_scheduler(
+        scheduling_policy: TaskSchedulingPolicy,
+    ) -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default().with_scheduler_policy(scheduling_policy);
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster,
+                BallistaCodec::default(),
+                Arc::new(config),
+                Arc::new(TestMetricsCollector::default()),
+            );
+        scheduler.init().await?;
+
+        Ok(scheduler)
+    }
+
+    fn test_executors(num_partitions: usize) -> Vec<(ExecutorMetadata, ExecutorData)> {
+        let vcores = (num_partitions as u32).div_ceil(2);
+
+        vec![
+            (
+                ExecutorMetadata {
+                    id: "executor-1".to_string(),
+                    host: "localhost1".to_string(),
+                    port: 8080,
+                    grpc_port: 9090,
+                    specification: ExecutorSpecification::default().with_vcores(vcores),
+                    os_info: ExecutorOperatingSystemSpecification::default(),
+                },
+                ExecutorData {
+                    executor_id: "executor-1".to_owned(),
+                    total_vcores: vcores,
+                    available_vcores: vcores,
+                },
+            ),
+            (
+                ExecutorMetadata {
+                    id: "executor-2".to_string(),
+                    host: "localhost2".to_string(),
+                    port: 8080,
+                    grpc_port: 9090,
+                    specification: ExecutorSpecification::default()
+                        .with_vcores(num_partitions as u32 - vcores),
+                    os_info: ExecutorOperatingSystemSpecification::default(),
+                },
+                ExecutorData {
+                    executor_id: "executor-2".to_owned(),
+                    total_vcores: num_partitions as u32 - vcores,
+                    available_vcores: num_partitions as u32 - vcores,
+                },
+            ),
+        ]
+    }
+
+    fn test_plan() -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("gmv", DataType::UInt64, false),
+        ]);
+
+        // partitions need to be > 1 for the datafusion's optimizer to insert a repartition node
+        // behavior changed with: https://github.com/apache/datafusion/pull/11875
+        scan_empty_with_partitions(None, &schema, Some(vec![0, 1]), 2)
+            .unwrap()
+            .aggregate(vec![col("id")], vec![sum(col("gmv"))])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+}

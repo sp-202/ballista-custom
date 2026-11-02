@@ -1,0 +1,125 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "ballista-scheduler"
+description = "Ballista Distributed Compute - Scheduler"
+license = { workspace = true }
+version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = "README.md"
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = [
+    # used via the `ballista_core::assert_plan!` macro, which expands to `insta::assert_snapshot!`
+    "insta",
+    # used by the `keda-scaler` gRPC code generated into OUT_DIR by build.rs
+    "tonic-prost",
+]
+
+[[bin]]
+name = "ballista-scheduler"
+path = "src/bin/main.rs"
+required-features = ["build-binary"]
+
+[[bin]]
+name = "ballista-history-server"
+path = "src/bin/history_server.rs"
+required-features = ["build-binary", "rest-api"]
+
+[features]
+build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing", "ballista-core/build-binary"]
+default = ["build-binary", "rest-api"]
+# job info can cache stage plans, in some cases where
+# task plans can be re-computed, cache behavior may need to be disabled.
+disable-stage-plan-cache = []
+# Arrow Flight SQL frontend, so generic SQL clients (JDBC/ODBC, BI tools,
+# Python ADBC) can run queries. Off by default; enable at runtime with
+# `--flight-sql`.
+flight-sql = ["dep:ballista-flight-sql"]
+graphviz-support = ["dep:graphviz-rust"]
+keda-scaler = ["dep:tonic-prost-build", "dep:tonic-prost"]
+prometheus-metrics = ["prometheus", "once_cell"]
+rest-api = [
+    "ballista-api-types?/utoipa",
+    "ballista-core/utoipa",
+    "dep:ballista-api-types",
+    "dep:ballista-history",
+    "dep:serde_json",
+    "dep:utoipa",
+]
+substrait = ["dep:datafusion-substrait"]
+
+[dependencies]
+arrow-flight = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+ballista-api-types = { workspace = true, optional = true }
+ballista-core = { workspace = true }
+ballista-flight-sql = { workspace = true, optional = true }
+ballista-history = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+dashmap = { workspace = true }
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+datafusion-substrait = { workspace = true, optional = true }
+ferroid = { version = "2.0", features = ["alloc", "std", "snowflake", "atomic", "base32", "async-tokio"] }
+futures = { workspace = true }
+graphviz-rust = { version = "0.9", optional = true }
+http = "1.4"
+itertools = { workspace = true }
+log = { workspace = true }
+object_store = { workspace = true }
+once_cell = { version = "1.21.4", optional = true }
+parking_lot = { workspace = true }
+prometheus = { version = "0.14", features = ["process"], optional = true }
+prost = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["router"] }
+tonic-prost = { workspace = true, optional = true }
+tower-http = { version = "0.7", features = ["cors", "set-header"] }
+tracing = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+url-escape = { workspace = true }
+utoipa = { workspace = true, optional = true }
+uuid = { workspace = true }
+
+[[test]]
+name = "tpch_plan_stability"
+path = "tests/tpch_plan_stability/main.rs"
+
+[dev-dependencies]
+ballista-executor = { path = "../executor", version = "55.0.0", default-features = false }
+insta = { workspace = true }
+regex = "1"
+rstest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }

@@ -1,0 +1,554 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use chrono::{TimeZone, Utc};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
+use datafusion::physical_plan::metrics::{
+    Count, Gauge, MetricValue, MetricsSet, PruningMetrics, RatioMetrics, Time, Timestamp,
+};
+use datafusion::physical_plan::{ExecutionPlan, Metric};
+use datafusion::prelude::SessionConfig;
+use datafusion_proto::logical_plan::AsLogicalPlan;
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use std::collections::HashMap;
+use std::convert::TryInto;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::error::BallistaError;
+use crate::extension::SessionConfigHelperExt;
+use crate::serde::protobuf::{NamedPruningMetrics, NamedRatio};
+use crate::serde::scheduler::{
+    Action, BallistaFunctionRegistry, ByteRange, ExecutorData, ExecutorMetadata,
+    ExecutorOperatingSystemSpecification, ExecutorSpecification, PartitionId,
+    PartitionLocation, PartitionStats, PipelinedPartitionLocation, TaskDefinition,
+};
+
+use crate::serde::{BallistaCodec, protobuf};
+use crate::{JobId, RuntimeProducer};
+use protobuf::{NamedCount, NamedGauge, NamedTime, operator_metric};
+
+impl TryInto<Action> for protobuf::Action {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<Action, Self::Error> {
+        match self.action_type {
+            Some(protobuf::action::ActionType::FetchPartition(fetch)) => {
+                Ok(Action::FetchPartition {
+                    job_id: fetch.job_id.into(),
+                    stage_id: fetch.stage_id as usize,
+                    partition_id: fetch.partition_id as usize,
+                    file_id: fetch.file_id,
+                    host: fetch.host,
+                    port: fetch.port as u16,
+                    layout: protobuf::ShuffleLayout::try_from(fetch.layout)
+                        .map_err(|_| {
+                            BallistaError::General(format!(
+                                "unknown shuffle layout {} on FetchPartition",
+                                fetch.layout
+                            ))
+                        })?
+                        .into(),
+                    file_kind: protobuf::ShuffleFileKind::try_from(fetch.file_kind)
+                        .map_err(|_| {
+                            BallistaError::General(format!(
+                                "unknown shuffle file kind {} on FetchPartition",
+                                fetch.file_kind
+                            ))
+                        })?
+                        .into(),
+                    byte_ranges: fetch
+                        .byte_ranges
+                        .into_iter()
+                        .map(|range| ByteRange {
+                            offset: range.offset,
+                            length: range.length,
+                        })
+                        .collect(),
+                })
+            }
+            Some(protobuf::action::ActionType::FetchPipelinedPartition(fetch)) => {
+                Ok(Action::FetchPipelinedPartition {
+                    job_id: fetch.job_id.into(),
+                    stage_id: fetch.stage_id as usize,
+                    task_id: fetch.task_id as usize,
+                    partition_id: fetch.partition_id as usize,
+                    host: fetch.host,
+                    port: fetch.port as u16,
+                    registration_timeout_ms: fetch.registration_timeout_ms,
+                })
+            }
+            _ => Err(BallistaError::General(
+                "scheduler::from_proto(Action) invalid or missing action".to_owned(),
+            )),
+        }
+    }
+}
+
+impl TryInto<PipelinedPartitionLocation> for protobuf::PipelinedPartitionLocation {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<PipelinedPartitionLocation, Self::Error> {
+        Ok(PipelinedPartitionLocation {
+            partition_id: self
+                .partition_id
+                .ok_or_else(|| {
+                    BallistaError::General(
+                        "partition_id in PipelinedPartitionLocation is missing"
+                            .to_owned(),
+                    )
+                })?
+                .into(),
+            task_id: self.task_id as usize,
+            executor_meta: self
+                .executor_meta
+                .ok_or_else(|| {
+                    BallistaError::General(
+                        "executor_meta in PipelinedPartitionLocation is missing"
+                            .to_owned(),
+                    )
+                })?
+                .into(),
+        })
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<PartitionId> for protobuf::PartitionId {
+    fn into(self) -> PartitionId {
+        PartitionId::new(
+            &self.job_id.into(),
+            self.stage_id as usize,
+            self.partition_id as usize,
+        )
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<PartitionStats> for protobuf::PartitionStats {
+    fn into(self) -> PartitionStats {
+        PartitionStats::new(
+            foo(self.num_rows),
+            foo(self.num_batches),
+            foo(self.num_bytes),
+        )
+    }
+}
+
+fn foo(n: i64) -> Option<u64> {
+    if n < 0 { None } else { Some(n as u64) }
+}
+
+impl TryInto<PartitionLocation> for protobuf::PartitionLocation {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<PartitionLocation, Self::Error> {
+        Ok(PartitionLocation {
+            map_partition_id: self.map_partition_id as usize,
+            partition_id: self
+                .partition_id
+                .ok_or_else(|| {
+                    BallistaError::General(
+                        "partition_id in PartitionLocation is missing.".to_owned(),
+                    )
+                })?
+                .into(),
+            executor_meta: self
+                .executor_meta
+                .ok_or_else(|| {
+                    BallistaError::General(
+                        "executor_meta in PartitionLocation is missing".to_owned(),
+                    )
+                })?
+                .into(),
+            partition_stats: self
+                .partition_stats
+                .ok_or_else(|| {
+                    BallistaError::General(
+                        "partition_stats in PartitionLocation is missing".to_owned(),
+                    )
+                })?
+                .into(),
+            file_id: self.file_id,
+            is_sort_shuffle: self.is_sort_shuffle,
+        })
+    }
+}
+
+impl TryInto<MetricValue> for operator_metric::Metric {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<MetricValue, Self::Error> {
+        match self {
+            operator_metric::Metric::OutputRows(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::OutputRows(count))
+            }
+            operator_metric::Metric::ElapseTime(value) => {
+                let time = Time::new();
+                time.add_duration(Duration::from_nanos(value));
+                Ok(MetricValue::ElapsedCompute(time))
+            }
+            operator_metric::Metric::SpillCount(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::SpillCount(count))
+            }
+            operator_metric::Metric::SpilledBytes(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::SpilledBytes(count))
+            }
+            operator_metric::Metric::SpilledRows(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::SpilledRows(count))
+            }
+            operator_metric::Metric::CurrentMemoryUsage(value) => {
+                let gauge = Gauge::new();
+                gauge.add(value as usize);
+                Ok(MetricValue::CurrentMemoryUsage(gauge))
+            }
+            operator_metric::Metric::Count(NamedCount { name, value }) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::Count {
+                    name: name.into(),
+                    count,
+                })
+            }
+            operator_metric::Metric::Gauge(NamedGauge { name, value }) => {
+                let gauge = Gauge::new();
+                gauge.add(value as usize);
+                Ok(MetricValue::Gauge {
+                    name: name.into(),
+                    gauge,
+                })
+            }
+            operator_metric::Metric::Time(NamedTime { name, value }) => {
+                let time = Time::new();
+                time.add_duration(Duration::from_nanos(value));
+                Ok(MetricValue::Time {
+                    name: name.into(),
+                    time,
+                })
+            }
+            operator_metric::Metric::StartTimestamp(value) => {
+                let timestamp = Timestamp::new();
+                timestamp.set(Utc.timestamp_nanos(value));
+                Ok(MetricValue::StartTimestamp(timestamp))
+            }
+            operator_metric::Metric::EndTimestamp(value) => {
+                let timestamp = Timestamp::new();
+                timestamp.set(Utc.timestamp_nanos(value));
+                Ok(MetricValue::EndTimestamp(timestamp))
+            }
+            operator_metric::Metric::OutputBytes(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::OutputBytes(count))
+            }
+            operator_metric::Metric::PruningMetrics(NamedPruningMetrics {
+                name,
+                pruned,
+                matched,
+            }) => {
+                let pruning_metrics = PruningMetrics::new();
+                pruning_metrics.add_pruned(pruned as usize);
+                pruning_metrics.add_matched(matched as usize);
+                Ok(MetricValue::PruningMetrics {
+                    name: name.into(),
+                    pruning_metrics,
+                })
+            }
+            operator_metric::Metric::Ratio(NamedRatio { name, part, total }) => {
+                let ratio_metrics = RatioMetrics::new();
+                ratio_metrics.add_part(part as usize);
+                ratio_metrics.add_total(total as usize);
+                Ok(MetricValue::Ratio {
+                    name: name.into(),
+                    ratio_metrics,
+                })
+            }
+            operator_metric::Metric::OutputBatches(value) => {
+                let count = Count::new();
+                count.add(value as usize);
+                Ok(MetricValue::OutputBatches(count))
+            }
+        }
+    }
+}
+
+impl TryInto<MetricsSet> for protobuf::OperatorMetricsSet {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<MetricsSet, Self::Error> {
+        let mut ms = MetricsSet::new();
+        for proto_metric in self.metrics {
+            let partition = proto_metric.partition.map(|p| p as usize);
+            let inner = proto_metric.metric.ok_or_else(|| {
+                BallistaError::General(
+                    "scheduler::from_proto(OperatorMetric) metric is None.".to_owned(),
+                )
+            })?;
+            let value: MetricValue = inner.try_into()?;
+            ms.push(Arc::new(Metric::new(value, partition)));
+        }
+        Ok(ms)
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<ExecutorMetadata> for protobuf::ExecutorMetadata {
+    fn into(self) -> ExecutorMetadata {
+        ExecutorMetadata {
+            id: self.id,
+            host: self.host,
+            port: self.port as u16,
+            grpc_port: self.grpc_port as u16,
+            specification: self.specification.unwrap().into(),
+            os_info: self.os_info.unwrap().into(),
+        }
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<ExecutorSpecification> for protobuf::ExecutorSpecification {
+    fn into(self) -> ExecutorSpecification {
+        let mut ret = ExecutorSpecification { vcores: 0 };
+        for resource in self.resources {
+            if let Some(resource_spec) = resource.resource {
+                match resource_spec {
+                    protobuf::executor_resource::Resource::Vcores(vcores) => {
+                        ret.vcores = vcores
+                    }
+                }
+            }
+        }
+
+        ret
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<ExecutorOperatingSystemSpecification>
+    for protobuf::ExecutorOperatingSystemSpecification
+{
+    fn into(self) -> ExecutorOperatingSystemSpecification {
+        ExecutorOperatingSystemSpecification {
+            system_name: self.system_name,
+            kernel_ver: self.kernel_ver,
+            os_ver: self.os_ver,
+            os_ver_long: self.os_ver_long,
+            physical_cores: self.physical_cores,
+            num_disks: self.num_disks,
+            total_disk_space: self.total_disk_space,
+            total_available_disk_space: self.total_available_disk_space,
+            open_files_limit: self.open_files_limit,
+        }
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<ExecutorData> for protobuf::ExecutorData {
+    fn into(self) -> ExecutorData {
+        let mut ret = ExecutorData {
+            executor_id: self.executor_id,
+            total_vcores: 0,
+            available_vcores: 0,
+        };
+        for resource in self.resources {
+            if let Some(total) = resource.total
+                && let Some(protobuf::executor_resource::Resource::Vcores(vcores)) =
+                    total.resource
+            {
+                ret.total_vcores = vcores
+            };
+            if let Some(available) = resource.available
+                && let Some(protobuf::executor_resource::Resource::Vcores(vcores)) =
+                    available.resource
+            {
+                ret.available_vcores = vcores
+            };
+        }
+        ret
+    }
+}
+
+/// Converts a protobuf task definition to a native Ballista task definition.
+///
+/// This function deserializes the execution plan from the protobuf representation
+/// and constructs a complete task definition with the provided runtime configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
+    task: protobuf::TaskDefinition,
+    produce_runtime: RuntimeProducer,
+    session_config: SessionConfig,
+    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    window_functions: HashMap<String, Arc<WindowUDF>>,
+    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+    codec: BallistaCodec<T, U>,
+) -> Result<TaskDefinition, BallistaError> {
+    let session_config = session_config.update_from_key_value_pair(&task.props);
+    let runtime = produce_runtime(&session_config)?;
+
+    let function_registry = Arc::new(BallistaFunctionRegistry {
+        scalar_functions: scalar_functions.clone(),
+        aggregate_functions: aggregate_functions.clone(),
+        window_functions: window_functions.clone(),
+        higher_order_functions: higher_order_functions.clone(),
+    });
+
+    let ctx = TaskContext::new(
+        None,
+        task.session_id.clone(),
+        session_config.clone(),
+        scalar_functions,
+        higher_order_functions,
+        aggregate_functions,
+        window_functions,
+        runtime.clone(),
+    );
+
+    let encoded_plan = task.plan.as_slice();
+    let plan: Arc<dyn ExecutionPlan> = U::try_decode(encoded_plan).and_then(|proto| {
+        proto.try_into_physical_plan(&ctx, codec.physical_extension_codec())
+    })?;
+
+    let job_id = task.job_id.into();
+    let stage_id = task.stage_id as usize;
+    let task_attempt_num = task.task_attempt_num as usize;
+    let stage_attempt_num = task.stage_attempt_num as usize;
+    let launch_time = task.launch_time;
+    let task_id = task.task_id as usize;
+    let session_id = task.session_id;
+    let global_output_partition_ids = task
+        .global_output_partition_ids
+        .iter()
+        .map(|pid| *pid as usize)
+        .collect::<Vec<_>>();
+
+    Ok(TaskDefinition {
+        task_id,
+        task_attempt_num,
+        job_id,
+        stage_id,
+        stage_attempt_num,
+        global_output_partition_ids,
+        vcores_consumed: task.vcores_consumed,
+        plan,
+        launch_time,
+        session_id,
+        session_config,
+        function_registry,
+    })
+}
+
+/// Converts a protobuf multi-task definition to a vector of native Ballista task definitions.
+///
+/// This function handles batch task definitions where multiple partitions share
+/// the same execution plan, creating individual task definitions for each partition.
+#[allow(clippy::too_many_arguments)]
+pub fn get_task_definition_vec<
+    T: 'static + AsLogicalPlan,
+    U: 'static + AsExecutionPlan,
+>(
+    multi_task: protobuf::MultiTaskDefinition,
+    runtime_producer: RuntimeProducer,
+    session_config: SessionConfig,
+    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    window_functions: HashMap<String, Arc<WindowUDF>>,
+    higher_order_functions: HashMap<String, Arc<HigherOrderUDF>>,
+    codec: BallistaCodec<T, U>,
+) -> Result<Vec<TaskDefinition>, BallistaError> {
+    let session_config = session_config.update_from_key_value_pair(&multi_task.props);
+    let runtime = runtime_producer(&session_config)?;
+
+    let function_registry = Arc::new(BallistaFunctionRegistry {
+        scalar_functions: scalar_functions.clone(),
+        aggregate_functions: aggregate_functions.clone(),
+        window_functions: window_functions.clone(),
+        higher_order_functions: higher_order_functions.clone(),
+    });
+
+    let ctx = TaskContext::new(
+        None,
+        uuid::Uuid::new_v4().to_string(),
+        session_config.clone(),
+        scalar_functions,
+        higher_order_functions,
+        aggregate_functions,
+        window_functions,
+        runtime.clone(),
+    );
+
+    let encoded_plan = multi_task.plan.as_slice();
+    let plan: Arc<dyn ExecutionPlan> = U::try_decode(encoded_plan).and_then(|proto| {
+        proto.try_into_physical_plan(&ctx, codec.physical_extension_codec())
+    })?;
+
+    let job_id: JobId = multi_task.job_id.into();
+    let stage_id = multi_task.stage_id as usize;
+    let stage_attempt_num = multi_task.stage_attempt_num as usize;
+    let launch_time = multi_task.launch_time;
+    let task_ids = multi_task.task_ids;
+    let session_id = multi_task.session_id;
+
+    task_ids
+        .iter()
+        .map(|task_id| {
+            Ok(TaskDefinition {
+                task_id: task_id.task_id as usize,
+                task_attempt_num: task_id.task_attempt_num as usize,
+                job_id: job_id.clone(),
+                stage_id,
+                stage_attempt_num,
+                global_output_partition_ids: task_id
+                    .global_output_partition_ids
+                    .iter()
+                    .map(|pid| *pid as usize)
+                    .collect(),
+                vcores_consumed: task_id.vcores_consumed,
+                plan: reset_metrics_for_execution_plan(plan.clone())?,
+                launch_time,
+                session_id: session_id.clone(),
+                session_config: session_config.clone(),
+                function_registry: function_registry.clone(),
+            })
+        })
+        .collect()
+}
+
+fn reset_metrics_for_execution_plan(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>, BallistaError> {
+    // `reset_state` rebuilds each node around its existing children, which is
+    // what drops the decoded metrics sets. Its default implementation is
+    // `replace_children(.., Keep)` — the children are unchanged here, so there
+    // is nothing to recompute.
+    plan.transform(&|plan: Arc<dyn ExecutionPlan>| {
+        plan.reset_state().map(Transformed::yes)
+    })
+    .data()
+    .map_err(|e| BallistaError::DataFusionError(Box::new(e)))
+}

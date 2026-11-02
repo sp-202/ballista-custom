@@ -1,0 +1,795 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Implementation of the Apache Arrow Flight protocol that wraps an executor.
+
+use ballista_core::JobId;
+use ballista_core::execution_plans::create_shuffle_path;
+use ballista_core::execution_plans::pipelined::PipelinedRegistry;
+use ballista_core::execution_plans::range_shuffle::{
+    index_path as range_index_path, is_ipc_file, open_ipc_file,
+};
+use ballista_core::serde::scheduler::{
+    ByteRange, ShuffleFileKind, ShuffleLayout, TaskKey,
+};
+use datafusion::arrow::ipc::reader::StreamReader;
+use std::convert::TryFrom;
+use std::fs::File;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::io::ReaderStream;
+
+use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
+use arrow_flight::error::FlightError;
+use ballista_core::error::BallistaError;
+use ballista_core::execution_plans::sort_shuffle::{
+    ShuffleIndex, get_index_path, is_sort_shuffle_output, stream_sort_shuffle_partition,
+};
+use ballista_core::serde::decode_protobuf;
+use ballista_core::serde::scheduler::Action as BallistaAction;
+use ballista_core::serving::{
+    BoxedFlightStream, ResultBackend, from_ballista_err, serve_do_get,
+};
+use datafusion::arrow::ipc::CompressionType;
+
+use arrow_flight::{
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    flight_service_server::FlightService,
+};
+use datafusion::arrow::ipc::writer::IpcWriteOptions;
+use datafusion::arrow::{error::ArrowError, record_batch::RecordBatch};
+use futures::{Stream, StreamExt, TryStreamExt};
+use log::{debug, info};
+use std::io::BufReader;
+use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::error::SendError;
+use tokio::{sync::mpsc::Sender, task};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataValue;
+use tonic::{Request, Response, Status, Streaming};
+
+/// Arrow Flight service for transferring shuffle data between executors.
+///
+/// This service implements the Apache Arrow Flight protocol to enable efficient
+/// transfer of intermediate query results (shuffle data) between executor nodes.
+/// It supports both decoded streaming via `do_get` and optimized block transfer
+/// via the `IO_BLOCK_TRANSPORT` action.
+#[derive(Clone)]
+pub struct BallistaFlightService {
+    backend: LocalDiskBackend,
+}
+
+impl BallistaFlightService {
+    /// Creates a new BallistaFlightService instance.
+    pub fn new(work_dir: String) -> Self {
+        Self {
+            backend: LocalDiskBackend {
+                work_dir,
+                pipelined_registry: None,
+            },
+        }
+    }
+
+    /// Also serves the output partitions of the pipelined tasks running on
+    /// this executor. Without it, pipelined fetches are refused.
+    pub fn with_pipelined_registry(mut self, registry: Arc<PipelinedRegistry>) -> Self {
+        self.backend.pipelined_registry = Some(registry);
+        self
+    }
+}
+
+/// How long a pipelined fetch waits for its producer task when the request
+/// does not say.
+const DEFAULT_PIPELINED_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// shuffle file block transfer size
+const BLOCK_BUFFER_CAPACITY: usize = 8 * 1024 * 1024;
+
+/// A [`ResultBackend`] that serves shuffle partitions from the executor's
+/// work directory, and pipelined partitions from its registry.
+#[derive(Clone)]
+struct LocalDiskBackend {
+    work_dir: String,
+    pipelined_registry: Option<Arc<PipelinedRegistry>>,
+}
+
+#[tonic::async_trait]
+impl ResultBackend for LocalDiskBackend {
+    async fn fetch(
+        &self,
+        action: BallistaAction,
+        _ticket: Ticket,
+    ) -> Result<BoxedFlightStream<FlightData>, Status> {
+        match &action {
+            BallistaAction::FetchPipelinedPartition {
+                job_id,
+                stage_id,
+                task_id,
+                partition_id,
+                registration_timeout_ms,
+                ..
+            } => {
+                let registry = self.pipelined_registry.clone().ok_or_else(|| {
+                    Status::unimplemented(
+                        "this executor's Flight service does not serve pipelined partitions",
+                    )
+                })?;
+                let key = TaskKey {
+                    job_id: job_id.clone(),
+                    stage_id: *stage_id,
+                    task_id: *task_id,
+                };
+                let partition = *partition_id;
+                let timeout = if *registration_timeout_ms > 0 {
+                    Duration::from_millis(*registration_timeout_ms)
+                } else {
+                    DEFAULT_PIPELINED_REGISTRATION_TIMEOUT
+                };
+                debug!("FetchPipelinedPartition {key} partition {partition}");
+                // Respond at once and wait for the producer inside the body,
+                // so a consumer that arrives before its producer is not
+                // timed out by its client's request deadline.
+                let stream = futures::stream::once(async move {
+                    let opened = registry
+                        .open(&key, partition, timeout)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    let options = IpcWriteOptions::default()
+                        .try_with_compression(opened.compression)
+                        .map_err(|e| from_arrow_err(&e))?;
+                    let schema = opened.stream.schema();
+                    let batches = opened
+                        .stream
+                        .map_err(|e| FlightError::from(ArrowError::from(e)));
+                    Ok::<_, Status>(
+                        FlightDataEncoderBuilder::new()
+                            .with_schema(schema)
+                            .with_options(options)
+                            // Keep dictionary columns dictionary-encoded: the
+                            // reader declares the producer's schema, which a
+                            // hydrated stream would not match.
+                            .with_dictionary_handling(DictionaryHandling::Resend)
+                            .build(batches)
+                            .map_err(|err| Status::from_error(Box::new(err))),
+                    )
+                })
+                .try_flatten();
+                Ok(Box::pin(stream) as BoxedFlightStream<FlightData>)
+            }
+            BallistaAction::FetchPartition {
+                job_id,
+                stage_id,
+                partition_id,
+                file_id,
+                layout,
+                file_kind,
+                byte_ranges,
+                ..
+            } => {
+                if !byte_ranges.is_empty() {
+                    // Byte ranges come back as bytes, which `do_get` cannot
+                    // express — it returns decoded FlightData. Serving them
+                    // here would mean decoding on the executor, which is the
+                    // work a ranged read exists to avoid.
+                    return Err(Status::invalid_argument(
+                        "byte ranges are served by the IO_BLOCK_TRANSPORT action, \
+                         not do_get",
+                    ));
+                }
+                let path = resolve_fetch_path(
+                    &self.work_dir,
+                    job_id,
+                    *stage_id,
+                    *partition_id,
+                    *file_id,
+                    *layout,
+                    *file_kind,
+                )?;
+                debug!("FetchPartition reading partition {partition_id} from {path:?}");
+
+                // Check if this is a sort-based shuffle output
+                if is_sort_shuffle_output(&path) {
+                    debug!("Detected sort-based shuffle format for {path:?}");
+                    let index_path = get_index_path(path.as_path());
+                    let stream =
+                        stream_sort_shuffle_partition(&path, &index_path, *partition_id)
+                            .map_err(|e| from_ballista_err(&e))?;
+
+                    let schema = stream.schema();
+                    // Map DataFusionError to FlightError
+                    let stream =
+                        stream.map_err(|e| FlightError::from(ArrowError::from(e)));
+
+                    let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                        .map_err(|e| from_arrow_err(&e))?;
+                    let flight_data_stream = FlightDataEncoderBuilder::new()
+                        .with_schema(schema)
+                        .with_options(write_options)
+                        .build(stream)
+                        .map_err(|err| Status::from_error(Box::new(err)));
+
+                    return Ok(
+                        Box::pin(flight_data_stream) as BoxedFlightStream<FlightData>
+                    );
+                }
+
+                let (tx, rx) = channel(2);
+                // Range shuffle writes the IPC file format, whose leading
+                // magic an IPC stream decoder rejects. The file says which it
+                // is, so neither the wire protocol nor the caller has to.
+                let schema = if is_ipc_file(&path) {
+                    debug!("Detected range shuffle format for {path:?}");
+                    let reader =
+                        open_ipc_file(&path).map_err(|e| from_ballista_err(&e))?;
+                    let schema = reader.schema();
+                    task::spawn_blocking(move || {
+                        if let Err(e) = read_partition(reader, tx) {
+                            log::warn!("error streaming range shuffle partition: {e}");
+                        }
+                    });
+                    schema
+                } else {
+                    // Standard single-file shuffle output - read the entire file
+                    let file = File::open(&path)
+                        .map_err(|e| {
+                            BallistaError::General(format!(
+                                "Failed to open partition file at {path:?}: {e:?}"
+                            ))
+                        })
+                        .map_err(|e| from_ballista_err(&e))?;
+                    let file = BufReader::new(file);
+                    // Safety: setting `skip_validation` requires `unsafe`, user assures data is valid
+                    let reader = unsafe {
+                        StreamReader::try_new(file, None)
+                            .map_err(|e| from_arrow_err(&e))?
+                            .with_skip_validation(cfg!(
+                                feature = "arrow-ipc-optimizations"
+                            ))
+                    };
+                    let schema = reader.schema();
+                    task::spawn_blocking(move || {
+                        if let Err(e) = read_partition(reader, tx) {
+                            log::warn!("error streaming shuffle partition: {e}");
+                        }
+                    });
+                    schema
+                };
+
+                let write_options: IpcWriteOptions = IpcWriteOptions::default()
+                    .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                    .map_err(|e| from_arrow_err(&e))?;
+                let flight_data_stream = FlightDataEncoderBuilder::new()
+                    .with_schema(schema)
+                    .with_options(write_options)
+                    .build(ReceiverStream::new(rx))
+                    .map_err(|err| Status::from_error(Box::new(err)));
+
+                Ok(Box::pin(flight_data_stream) as BoxedFlightStream<FlightData>)
+            }
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl FlightService for BallistaFlightService {
+    type DoActionStream = BoxedFlightStream<arrow_flight::Result>;
+    type DoExchangeStream = BoxedFlightStream<FlightData>;
+    type DoGetStream = BoxedFlightStream<FlightData>;
+    type DoPutStream = BoxedFlightStream<PutResult>;
+    type HandshakeStream = BoxedFlightStream<HandshakeResponse>;
+    type ListActionsStream = BoxedFlightStream<ActionType>;
+    type ListFlightsStream = BoxedFlightStream<FlightInfo>;
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        serve_do_get(&self.backend, request).await
+    }
+
+    async fn get_schema(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        Err(Status::unimplemented("get_schema"))
+    }
+
+    async fn get_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        Err(Status::unimplemented("get_flight_info"))
+    }
+
+    async fn handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        let token = uuid::Uuid::new_v4();
+        info!("do_handshake token={}", token);
+
+        let result = HandshakeResponse {
+            protocol_version: 0,
+            payload: token.as_bytes().to_vec().into(),
+        };
+        let result = Ok(result);
+        let output = futures::stream::iter(vec![result]);
+        let str = format!("Bearer {token}");
+        let mut resp: Response<
+            Pin<Box<dyn Stream<Item = Result<_, Status>> + Send + 'static>>,
+        > = Response::new(Box::pin(output));
+        let md = MetadataValue::try_from(str)
+            .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
+        resp.metadata_mut().insert("authorization", md);
+        Ok(resp)
+    }
+
+    async fn list_flights(
+        &self,
+        _request: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        Err(Status::unimplemented("list_flights"))
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        let mut request = request.into_inner();
+
+        while let Some(data) = request.next().await {
+            let _data = data?;
+        }
+
+        Err(Status::unimplemented("do_put"))
+    }
+
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        let action = request.into_inner();
+
+        match action.r#type.as_str() {
+            // Block transfer will transfer arrow ipc file block by block
+            // without decoding or decompressing, this will provide less resource utilization
+            // as file are not decoded nor decompressed/compressed. Usually this would transfer less data across
+            // as files are better compressed due to its size.
+            //
+            // For further discussion regarding performance implications, refer to:
+            // https://github.com/apache/datafusion-ballista/issues/1315
+            "IO_BLOCK_TRANSPORT" => {
+                let action =
+                    decode_protobuf(&action.body).map_err(|e| from_ballista_err(&e))?;
+
+                match &action {
+                    BallistaAction::FetchPartition {
+                        job_id,
+                        stage_id,
+                        partition_id,
+                        file_id,
+                        layout,
+                        file_kind,
+                        byte_ranges,
+                        ..
+                    } => {
+                        let path = resolve_fetch_path(
+                            &self.backend.work_dir,
+                            job_id,
+                            *stage_id,
+                            *partition_id,
+                            *file_id,
+                            *layout,
+                            *file_kind,
+                        )?;
+
+                        debug!("FetchPartition reading {path:?}");
+
+                        let stream = if !byte_ranges.is_empty() {
+                            // The caller has read an index and knows which
+                            // bytes it wants. Hand them over and resolve
+                            // nothing — the same request an object store
+                            // serves with a Range header.
+                            stream_byte_ranges(&path, byte_ranges).await?
+                        } else if is_sort_shuffle_output(&path) {
+                            // Sort-shuffle asked for a partition and no ranges,
+                            // so the executor resolves it through the index
+                            // beside the data: one round trip, as ever. When
+                            // that read moves to the caller this arm goes with
+                            // it.
+                            stream_sort_shuffle_block(&path, *partition_id).await?
+                        } else {
+                            // One partition per file, so the file is the answer.
+                            stream_whole_file(&path).await?
+                        };
+
+                        Ok(Response::new(stream))
+                    }
+                    BallistaAction::FetchPipelinedPartition { .. } => {
+                        Err(Status::invalid_argument(
+                            "pipelined partitions are served by do_get, not IO_BLOCK_TRANSPORT",
+                        ))
+                    }
+                }
+            }
+            action_type => Err(Status::unimplemented(format!(
+                "do_action does not implement: {}",
+                action_type
+            ))),
+        }
+    }
+
+    async fn list_actions(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        let actions = vec![Ok(ActionType {
+            r#type: "IO_BLOCK_TRANSFER".to_owned(),
+            description: "optimized shuffle data transfer".to_owned(),
+        })];
+
+        Ok(Response::new(
+            Box::pin(futures::stream::iter(actions)) as Self::ListActionsStream
+        ))
+    }
+
+    async fn do_exchange(
+        &self,
+        _request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("do_exchange"))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("poll_flight_info"))
+    }
+}
+
+/// Resolve a fetch request's identifiers to the file it names.
+///
+/// The index's name follows from the layout, which is why the wire does not
+/// spell it: a sort-shuffle output's index is its offset table, a passthrough
+/// output's is the range shuffle's value index. A layout with no index beside
+/// it is a request for something that does not exist, and says so.
+fn resolve_fetch_path(
+    work_dir: &str,
+    job_id: &JobId,
+    stage_id: usize,
+    partition_id: usize,
+    file_id: Option<u64>,
+    layout: ShuffleLayout,
+    file_kind: ShuffleFileKind,
+) -> Result<std::path::PathBuf, Status> {
+    let data = create_shuffle_path(
+        work_dir,
+        job_id,
+        stage_id,
+        partition_id,
+        file_id,
+        matches!(layout, ShuffleLayout::Sort),
+    )
+    .map_err(|e| {
+        Status::internal(format!("I/O error, can't create shuffle path: {e}"))
+    })?;
+
+    Ok(match file_kind {
+        ShuffleFileKind::Data => data,
+        ShuffleFileKind::Index => match layout {
+            ShuffleLayout::Sort => get_index_path(data.as_path()),
+            ShuffleLayout::Passthrough => range_index_path(data.as_path()),
+        },
+    })
+}
+
+/// Stream the requested byte ranges of `path`, concatenated in request order.
+///
+/// The serving side resolves nothing here: a consumer that has read an index
+/// knows which bytes it wants, and this hands them over. Ranges are clamped to
+/// the file so a stale index cannot walk off the end.
+///
+/// Chunked at [`BLOCK_BUFFER_CAPACITY`] like a whole-file read, for two
+/// reasons: a range can be far larger than a gRPC message may be, and buffering
+/// it whole would hold a consumer's entire share of a partition in the serving
+/// executor's memory.
+async fn stream_byte_ranges(
+    path: &std::path::Path,
+    ranges: &[ByteRange],
+) -> Result<<BallistaFlightService as FlightService>::DoActionStream, Status> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let len = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to stat {path:?}: {e}")))?
+        .len();
+
+    for range in ranges {
+        if range.offset >= len {
+            return Err(Status::out_of_range(format!(
+                "range at {} is past the end of {path:?} ({len} bytes)",
+                range.offset
+            )));
+        }
+    }
+
+    debug!(
+        "serving {} byte ranges ({} bytes) from {path:?}",
+        ranges.len(),
+        ranges
+            .iter()
+            .map(|r| r.length.min(len - r.offset))
+            .sum::<u64>(),
+    );
+
+    let path = path.to_owned();
+    let ranges: Vec<ByteRange> = ranges.to_vec();
+    let stream = futures::stream::iter(ranges)
+        .then(move |range| {
+            let path = path.clone();
+            async move {
+                let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
+                    Status::internal(format!("Failed to open {path:?}: {e}"))
+                })?;
+                file.seek(std::io::SeekFrom::Start(range.offset))
+                    .await
+                    .map_err(|e| Status::internal(format!("seek {path:?}: {e}")))?;
+                let take = range.length.min(len - range.offset);
+                // Both levels carry `Status` so the flatten has one error type.
+                Ok::<_, Status>(
+                    ReaderStream::with_capacity(file.take(take), BLOCK_BUFFER_CAPACITY)
+                        .map(|chunk| {
+                            chunk
+                                .map(|bytes| arrow_flight::Result { body: bytes })
+                                .map_err(|e| Status::internal(format!("I/O error: {e}")))
+                        }),
+                )
+            }
+        })
+        .try_flatten();
+
+    Ok(Box::pin(stream))
+}
+
+async fn stream_whole_file(
+    path: &std::path::Path,
+) -> Result<<BallistaFlightService as FlightService>::DoActionStream, Status> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to open file: {e}")))?;
+    debug!(
+        "streaming file: {:?} with size: {}",
+        path,
+        file.metadata().await?.len()
+    );
+    let file_stream = ReaderStream::with_capacity(file, BLOCK_BUFFER_CAPACITY);
+    Ok(Box::pin(file_stream.map(|result| {
+        result
+            .map(|bytes| arrow_flight::Result { body: bytes })
+            .map_err(|e| Status::internal(format!("I/O error: {e}")))
+    })))
+}
+
+async fn stream_sort_shuffle_block(
+    data_path: &std::path::Path,
+    partition_id: usize,
+) -> Result<<BallistaFlightService as FlightService>::DoActionStream, Status> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let index_path = get_index_path(data_path);
+    let index =
+        ShuffleIndex::read_from_file(&index_path).map_err(|e| from_ballista_err(&e))?;
+
+    if partition_id >= index.partition_count() {
+        return Err(Status::out_of_range(format!(
+            "partition_id {partition_id} not found in index (max: {})",
+            index.partition_count()
+        )));
+    }
+
+    // The leading [0, header_end) bytes hold the schema-header IPC stream.
+    // We always prepend it to the partition's byte range so the receiver
+    // recovers the schema even when the partition is empty.
+    let header_end = index.header_end_offset() as u64;
+    let (start, end) = index.get_partition_range(partition_id);
+    let (start, end) = (start as u64, end as u64);
+
+    // One open + dup gives us two independent file cursors over the same
+    // inode: one reads the header from offset 0, the other seeks to the
+    // partition. `chain` and `take` consume their readers by value, so two
+    // cursors are unavoidable here.
+    let header_file = tokio::fs::File::open(data_path)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to open file: {e}")))?;
+    let mut partition_file = header_file
+        .try_clone()
+        .await
+        .map_err(|e| Status::internal(format!("dup file handle: {e}")))?;
+    partition_file
+        .seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| Status::internal(format!("seek partition: {e}")))?;
+
+    let combined = header_file
+        .take(header_end)
+        .chain(partition_file.take(end - start));
+    let file_stream = ReaderStream::with_capacity(combined, BLOCK_BUFFER_CAPACITY);
+    Ok(Box::pin(file_stream.map(|result| {
+        result
+            .map(|bytes| arrow_flight::Result { body: bytes })
+            .map_err(|e| Status::internal(format!("I/O error: {e}")))
+    })))
+}
+
+/// Pump every batch a shuffle-file decoder yields into `tx`.
+///
+/// Generic over the decoder: the two shuffle formats need different ones
+/// (`StreamReader` for IPC stream, `FileReader` for IPC file) and share no
+/// arrow trait past `Iterator`.
+fn read_partition<R>(
+    reader: R,
+    tx: Sender<Result<RecordBatch, FlightError>>,
+) -> Result<(), FlightError>
+where
+    R: Iterator<Item = Result<RecordBatch, ArrowError>>,
+{
+    if tx.is_closed() {
+        return Err(FlightError::Tonic(Box::new(Status::internal(
+            "Can't send a batch, channel is closed",
+        ))));
+    }
+
+    for batch in reader {
+        tx.blocking_send(batch.map_err(|err| err.into()))
+            .map_err(|err| {
+                if let SendError(Err(err)) = err {
+                    err
+                } else {
+                    FlightError::Tonic(Box::new(Status::internal(format!(
+                        "Can't send a batch, something went wrong: {err:?}"
+                    ))))
+                }
+            })?
+    }
+    Ok(())
+}
+
+fn from_arrow_err(e: &ArrowError) -> Status {
+    Status::internal(format!("ArrowError: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_flight::decode::FlightRecordBatchStream;
+    use ballista_core::execution_plans::{PipelinedRegistry, PipelinedShuffleWriterExec};
+    use ballista_core::serde::encode_protobuf;
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    fn fetch_ticket(partition_id: usize) -> Ticket {
+        let action = BallistaAction::FetchPipelinedPartition {
+            job_id: "job".into(),
+            stage_id: 1,
+            task_id: 0,
+            partition_id,
+            host: "localhost".to_owned(),
+            port: 0,
+            registration_timeout_ms: 5_000,
+        };
+        Ticket {
+            ticket: encode_protobuf(action).unwrap().into(),
+        }
+    }
+
+    /// Runs a pipelined writer over `batch` while fetching its partition 0
+    /// through the Flight service, and returns the batches the fetch read.
+    async fn fetch_while_writing(batch: RecordBatch) -> Vec<RecordBatch> {
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()]],
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        let registry = Arc::new(PipelinedRegistry::new("executor"));
+        let writer =
+            PipelinedShuffleWriterExec::try_new("job".into(), 1, input, None, false)
+                .unwrap();
+        let service = BallistaFlightService::new("/tmp".to_owned())
+            .with_pipelined_registry(registry.clone());
+
+        // The fetch arrives before the producer starts and waits for it.
+        let fetch = async {
+            let response = service
+                .do_get(Request::new(fetch_ticket(0)))
+                .await
+                .unwrap()
+                .into_inner();
+            FlightRecordBatchStream::new_from_flight_data(response.map_err(Into::into))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_extension(registry),
+        )
+        .task_ctx();
+        let (batches, write) = tokio::join!(fetch, writer.execute_pipelined(ctx));
+        write.unwrap();
+        batches
+    }
+
+    #[tokio::test]
+    async fn do_get_streams_a_running_pipelined_partition() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from((0..100).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        let batches = fetch_while_writing(batch).await;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 100);
+    }
+
+    /// Arrow Flight hydrates dictionary columns by default, which would hand a
+    /// remote reader a different type than the producer's schema declares.
+    #[tokio::test]
+    async fn do_get_keeps_pipelined_dictionary_columns_dictionary_encoded() {
+        use datafusion::arrow::array::{Array, DictionaryArray};
+        use datafusion::arrow::datatypes::UInt16Type;
+
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary.clone(),
+            false,
+        )]));
+        let values: DictionaryArray<UInt16Type> =
+            vec!["a", "b", "a", "c"].into_iter().collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let batches = fetch_while_writing(batch).await;
+        assert_eq!(batches.len(), 1);
+        let column = batches[0].column(0);
+        assert_eq!(column.data_type(), &dictionary);
+        let column = column
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap();
+        assert_eq!(column.len(), 4);
+        assert_eq!(column.values().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn do_get_refuses_pipelined_partitions_without_a_registry() {
+        let service = BallistaFlightService::new("/tmp".to_owned());
+        let status = service
+            .do_get(Request::new(fetch_ticket(0)))
+            .await
+            .err()
+            .expect("a pipelined fetch needs a registry");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
+}

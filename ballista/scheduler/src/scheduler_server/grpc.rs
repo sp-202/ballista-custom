@@ -1,0 +1,1805 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use axum::extract::ConnectInfo;
+use ballista_core::config::BALLISTA_JOB_NAME;
+use ballista_core::error::{BallistaError, Result as BResult};
+use ballista_core::extension::SessionConfigHelperExt;
+use ballista_core::serde::protobuf::execute_query_params::Query;
+use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
+use ballista_core::serde::protobuf::{
+    AvailableVcores, CancelJobParams, CancelJobResult, CleanJobDataParams,
+    CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
+    ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
+    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorRegistration,
+    ExecutorStoppedParams, ExecutorStoppedResult, GetJobMetricsParams,
+    GetJobMetricsResult, GetJobStatusParams, GetJobStatusResult, HeartBeatParams,
+    HeartBeatResult, JobStatus, KeyValuePair, PollWorkParams, PollWorkResult,
+    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
+    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    execute_query_failure_result, execute_query_result, executor_metric::Metric,
+};
+use ballista_core::serde::scheduler::ExecutorMetadata;
+use ballista_core::version;
+use ballista_core::{BALLISTA_PROTOCOL_VERSION, BALLISTA_VERSION};
+use datafusion_proto::logical_plan::AsLogicalPlan;
+use datafusion_proto::physical_plan::AsExecutionPlan;
+use futures::{Stream, StreamExt};
+use log::{debug, error, info, trace, warn};
+use std::net::SocketAddr;
+use std::pin::Pin;
+
+use tokio_stream::wrappers::ReceiverStream;
+
+#[cfg(feature = "substrait")]
+use {
+    datafusion_substrait::logical_plan::consumer::from_substrait_plan,
+    datafusion_substrait::serializer::deserialize_bytes,
+};
+
+use crate::cluster::{bind_task_bias, bind_task_round_robin};
+use crate::config::TaskDistributionPolicy;
+use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
+use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
+use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan};
+use datafusion::prelude::SessionContext;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tonic::metadata::MetadataMap;
+use tonic::{Request, Response, Status};
+
+use crate::metrics::record_protocol_mismatch;
+use crate::scheduler_server::SchedulerServer;
+
+/// Rejects an executor RPC whose `ballista_protocol_version` does not match
+/// the scheduler's compiled-in `BALLISTA_PROTOCOL_VERSION`. See the constant
+/// in `ballista_core` for the upgrade semantics.
+fn check_protocol_version(metadata: &ExecutorRegistration) -> Result<(), Status> {
+    if metadata.ballista_protocol_version == BALLISTA_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    record_protocol_mismatch();
+    info!(
+        "Rejecting executor {}: protocol version mismatch (scheduler={}, executor={})",
+        metadata.id, BALLISTA_PROTOCOL_VERSION, metadata.ballista_protocol_version,
+    );
+    Err(Status::failed_precondition(format!(
+        "protocol version mismatch: scheduler={}, executor={}",
+        BALLISTA_PROTOCOL_VERSION, metadata.ballista_protocol_version,
+    )))
+}
+
+/// Rejects a job submission from a client whose major version differs from
+/// the scheduler's. See [`ballista_core::version`].
+fn check_client_version(metadata: &MetadataMap) -> Result<(), Status> {
+    let client_version = version::version_from_metadata(metadata);
+    version::check_compatibility(client_version, Some(BALLISTA_VERSION)).map_err(|msg| {
+        info!("Rejecting job submission: {msg}");
+        Status::failed_precondition(msg)
+    })
+}
+
+/// Wraps a response to a job submission, adding the scheduler's version so
+/// the client can check it.
+fn versioned_response<R>(message: R) -> Response<R> {
+    let mut response = Response::new(message);
+    version::insert_version_header(response.metadata_mut());
+    response
+}
+
+fn executor_registration_error(e: BallistaError) -> Status {
+    let msg = format!("Fail to do executor registration due to: {e}");
+    error!("{msg}");
+    match e {
+        BallistaError::Configuration(message)
+            if message.contains("already registered") =>
+        {
+            Status::already_exists(msg)
+        }
+        _ => Status::internal(msg),
+    }
+}
+
+#[tonic::async_trait]
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
+    for SchedulerServer<T, U>
+{
+    type ExecuteQueryPushStream =
+        Pin<Box<dyn Stream<Item = Result<GetJobStatusResult, Status>> + Send>>;
+
+    async fn poll_work(
+        &self,
+        request: Request<PollWorkParams>,
+    ) -> Result<Response<PollWorkResult>, Status> {
+        if self.state.config.is_push_staged_scheduling() {
+            error!("Poll work interface is not supported for push-based task scheduling");
+            return Err(tonic::Status::failed_precondition(
+                "Bad request because poll work is not supported for push-based task scheduling",
+            ));
+        }
+        let remote_addr = extract_connect_info(&request);
+        if let PollWorkParams {
+            metadata: Some(metadata),
+            num_free_vcores,
+            task_status,
+        } = request.into_inner()
+        {
+            trace!("Received poll_work request for {metadata:?}");
+            check_protocol_version(&metadata)?;
+            let executor_id = metadata.id.clone();
+
+            // It's not necessary.
+            // It's only for the scheduler to have a picture of the whole executor cluster.
+            {
+                let metadata = ExecutorMetadata {
+                    id: metadata.id,
+                    host: metadata
+                        .host
+                        .unwrap_or_else(|| remote_addr.unwrap().ip().to_string()),
+                    port: metadata.port as u16,
+                    grpc_port: metadata.grpc_port as u16,
+                    specification: metadata.specification.unwrap().into(),
+                    os_info: metadata.os_info.unwrap().into(),
+                };
+                self.state
+                    .executor_manager
+                    .save_executor_metadata(metadata)
+                    .await
+                    .map_err(executor_registration_error)?;
+            }
+
+            self.update_task_status(&executor_id, task_status)
+                .await
+                .map_err(|e| {
+                    let msg = format!(
+                        "Fail to update tasks status from executor {:?} due to {:?}",
+                        executor_id, e
+                    );
+                    error!("{msg}");
+                    Status::internal(msg)
+                })?;
+
+            let mut budgets = [AvailableVcores {
+                executor_id: executor_id.clone(),
+                vcores: num_free_vcores,
+            }];
+            let budgets = budgets.iter_mut().collect();
+            let running_jobs = self.state.task_manager.get_running_job_cache();
+            let schedulable_tasks = match self.state.config.task_distribution {
+                TaskDistributionPolicy::Bias => {
+                    bind_task_bias(budgets, running_jobs, |_| false).await
+                }
+                TaskDistributionPolicy::RoundRobin => {
+                    bind_task_round_robin(budgets, running_jobs, |_| false).await
+                }
+
+                TaskDistributionPolicy::Custom(ref policy) => policy
+                    .bind_tasks(budgets, running_jobs)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?,
+            };
+
+            let mut tasks = vec![];
+            for (_, task) in schedulable_tasks {
+                let job_id = task.key.job_id.clone();
+                match self.state.task_manager.prepare_task_definition(task) {
+                    Ok(task_definition) => tasks.push(task_definition),
+                    Err(e) => {
+                        error!("Error preparing task definition: {e:?}");
+                        if let Err(e) = self.fail_job(job_id, e.to_string()).await {
+                            error!("Error when failing job: {e:?}")
+                        }
+                    }
+                }
+            }
+            let jobs_to_clean = self
+                .state
+                .executor_manager
+                .drain_pending_cleanup_jobs(&executor_id)
+                .into_iter()
+                .map(|(job_id, remove_stage_ids)| CleanJobDataParams {
+                    job_id: job_id.into_inner(),
+                    remove_stage_ids,
+                })
+                .collect();
+            Ok(Response::new(PollWorkResult {
+                tasks,
+                jobs_to_clean,
+            }))
+        } else {
+            warn!("Received invalid executor poll_work request");
+            Err(Status::invalid_argument("Missing metadata in request"))
+        }
+    }
+
+    async fn register_executor(
+        &self,
+        request: Request<RegisterExecutorParams>,
+    ) -> Result<Response<RegisterExecutorResult>, Status> {
+        let remote_addr = extract_connect_info(&request);
+        if let RegisterExecutorParams {
+            metadata: Some(metadata),
+        } = request.into_inner()
+        {
+            info!("Received register executor request for {metadata:?}");
+            check_protocol_version(&metadata)?;
+            let metadata = ExecutorMetadata {
+                id: metadata.id,
+                host: metadata
+                    .host
+                    .unwrap_or_else(|| remote_addr.unwrap().ip().to_string()),
+                port: metadata.port as u16,
+                grpc_port: metadata.grpc_port as u16,
+                specification: metadata.specification.unwrap().into(),
+                os_info: metadata.os_info.unwrap().into(),
+            };
+
+            self.do_register_executor(metadata)
+                .await
+                .map_err(executor_registration_error)?;
+
+            Ok(Response::new(RegisterExecutorResult { success: true }))
+        } else {
+            warn!("Received invalid register executor request");
+            Err(Status::invalid_argument("Missing metadata in request"))
+        }
+    }
+
+    async fn heart_beat_from_executor(
+        &self,
+        request: Request<HeartBeatParams>,
+    ) -> Result<Response<HeartBeatResult>, Status> {
+        let remote_addr = extract_connect_info(&request);
+        let HeartBeatParams {
+            executor_id,
+            metrics,
+            status,
+            metadata,
+        } = request.into_inner();
+        trace!("Received heart beat request for {:?}", executor_id);
+
+        let Some(metadata_ref) = metadata.as_ref() else {
+            info!(
+                "Rejecting heartbeat from {executor_id}: missing registration metadata"
+            );
+            record_protocol_mismatch();
+            return Err(Status::failed_precondition(
+                "heartbeat missing registration metadata; \
+                 executors must include ExecutorRegistration \
+                 (see BALLISTA_PROTOCOL_VERSION)",
+            ));
+        };
+        check_protocol_version(metadata_ref)?;
+
+        // If not registered, do registration first before saving heart beat
+        if let Err(e) = self
+            .state
+            .executor_manager
+            .get_executor_metadata(&executor_id)
+            .await
+        {
+            warn!("Fail to get executor metadata: {e}");
+            if let Some(metadata) = metadata {
+                let metadata = ExecutorMetadata {
+                    id: metadata.id,
+                    host: metadata
+                        .host
+                        .unwrap_or_else(|| remote_addr.unwrap().ip().to_string()),
+                    port: metadata.port as u16,
+                    grpc_port: metadata.grpc_port as u16,
+                    specification: metadata.specification.unwrap().into(),
+                    os_info: metadata.os_info.unwrap().into(),
+                };
+
+                // A pull-based executor can heartbeat before its first poll.
+                // Register it the way a poll would, without the vcore
+                // inventory that only push-based scheduling uses.
+                if self.state.config.is_push_staged_scheduling() {
+                    self.do_register_executor(metadata)
+                        .await
+                        .map_err(executor_registration_error)?;
+                } else {
+                    self.state
+                        .executor_manager
+                        .save_executor_metadata(metadata)
+                        .await
+                        .map_err(executor_registration_error)?;
+                }
+            } else {
+                return Err(Status::invalid_argument(format!(
+                    "The registration spec for executor {executor_id} is not included"
+                )));
+            }
+        }
+        // Extract current process memory from incoming metrics
+        let current_proc_physical = metrics
+            .iter()
+            .find_map(|m| match m.metric {
+                Some(Metric::ProcPhysicalMemory(v)) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let current_proc_virtual = metrics
+            .iter()
+            .find_map(|m| match m.metric {
+                Some(Metric::ProcVirtualMemory(v)) => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        // Compare against previous peaks
+        let (peak_proc_physical_memory, peak_proc_virtual_memory) = self
+            .state
+            .executor_manager
+            .get_executor_hearbeat(&executor_id)
+            .map(|hb| {
+                (
+                    hb.peak_proc_physical_memory.max(current_proc_physical),
+                    hb.peak_proc_virtual_memory.max(current_proc_virtual),
+                )
+            })
+            .unwrap_or((current_proc_physical, current_proc_virtual));
+
+        let executor_heartbeat = ExecutorHeartbeat {
+            executor_id,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs(),
+            metrics,
+            status,
+            peak_proc_physical_memory,
+            peak_proc_virtual_memory,
+        };
+
+        self.state
+            .executor_manager
+            .save_executor_heartbeat(executor_heartbeat)
+            .await
+            .map_err(|e| {
+                let msg = format!("Could not save executor heartbeat: {e}");
+                error!("{msg}");
+                Status::internal(msg)
+            })?;
+        Ok(Response::new(HeartBeatResult { reregister: false }))
+    }
+
+    async fn update_task_status(
+        &self,
+        request: Request<UpdateTaskStatusParams>,
+    ) -> Result<Response<UpdateTaskStatusResult>, Status> {
+        let UpdateTaskStatusParams {
+            executor_id,
+            task_status,
+        } = request.into_inner();
+
+        debug!(
+            "Received task status update request for executor {:?}",
+            executor_id
+        );
+
+        self.update_task_status(&executor_id, task_status)
+            .await
+            .map_err(|e| {
+                let msg = format!(
+                    "Fail to update tasks status from executor {:?} due to {:?}",
+                    executor_id, e
+                );
+                error!("{msg}");
+                Status::internal(msg)
+            })?;
+
+        Ok(Response::new(UpdateTaskStatusResult { success: true }))
+    }
+
+    async fn create_update_session(
+        &self,
+        request: Request<CreateUpdateSessionParams>,
+    ) -> Result<Response<CreateUpdateSessionResult>, Status> {
+        let session_params = request.into_inner();
+
+        let session_config = self.state.session_manager.produce_config();
+        // TODO(c2): compute total cluster vcores (sum of vcores across
+        // registered executors from ClusterState.registered_executor_metadata())
+        // and inject it here so downstream rules like ParallelWindowDetectRule
+        // can size their output partition counts to actual cluster shape
+        // instead of hardcoding.
+        let session_config =
+            session_config.update_from_key_value_pair(&session_params.settings);
+
+        let _ = self
+            .state
+            .session_manager
+            .create_or_update_session(&session_params.session_id, &session_config)
+            .await;
+
+        Ok(Response::new(CreateUpdateSessionResult {
+            session_id: session_params.session_id,
+        }))
+    }
+
+    async fn remove_session(
+        &self,
+        request: Request<RemoveSessionParams>,
+    ) -> Result<Response<RemoveSessionResult>, Status> {
+        let session_params = request.into_inner();
+        self.state
+            .session_manager
+            .remove_session(&session_params.session_id)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to remove SessionContext: {e:?} for session {}",
+                    session_params.session_id
+                ))
+            })?;
+
+        Ok(Response::new(RemoveSessionResult { success: true }))
+    }
+
+    async fn execute_query_push(
+        &self,
+        request: tonic::Request<ExecuteQueryParams>,
+    ) -> std::result::Result<tonic::Response<Self::ExecuteQueryPushStream>, tonic::Status>
+    {
+        check_client_version(request.metadata())?;
+        let query_params = request.into_inner();
+        if let ExecuteQueryParams {
+            query: Some(query),
+            session_id,
+            operation_id,
+            settings,
+        } = query_params
+        {
+            let job_name = settings
+                .iter()
+                .find(|s| s.key == BALLISTA_JOB_NAME)
+                .and_then(|s| s.value.clone())
+                .unwrap_or_default();
+
+            debug!(
+                "execution query (PUSH) job received - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}"
+            );
+
+            let (session_id, session_ctx) = self
+                .create_context(&settings, session_id)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to create SessionContext: {e:?}"))
+                })?;
+
+            let plan = self.parse_plan(query, &session_ctx).await.map_err(|e| {
+                let msg = format!("Could not parse plan: {e}");
+                error!("{}", msg);
+
+                Status::invalid_argument(msg)
+            })?;
+
+            debug!(
+                "Decoded plan for execution:\n{}",
+                Self::describe_submitted_plan(&plan)
+            );
+            log::trace!("setting job name: {job_name}");
+
+            let flight_proxy = self.flight_proxy_config();
+
+            let (subscriber, rx) = tokio::sync::mpsc::channel::<JobStatus>(16);
+            let stream = ReceiverStream::new(rx).map(move |status| {
+                Ok::<_, tonic::Status>(GetJobStatusResult {
+                    status: Some(status),
+                    flight_proxy: flight_proxy.clone(),
+                })
+            });
+
+            let job_id = self
+                .submit_plan(&job_name, session_ctx, &plan, Some(subscriber))
+                .await
+                .map_err(|e| self.submit_error(&job_name, e))?;
+
+            debug!(
+                "execution query (PUSH) job submitted - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}, job_id: {job_id}"
+            );
+
+            Ok(versioned_response(Box::pin(stream)))
+        } else {
+            Err(Status::internal(
+                "Error processing request, invalid message",
+            ))
+        }
+    }
+
+    async fn execute_query(
+        &self,
+        request: Request<ExecuteQueryParams>,
+    ) -> Result<Response<ExecuteQueryResult>, Status> {
+        check_client_version(request.metadata())?;
+        let query_params = request.into_inner();
+        if let ExecuteQueryParams {
+            query: Some(query),
+            session_id,
+            operation_id,
+            settings,
+        } = query_params
+        {
+            let job_name = settings
+                .iter()
+                .find(|s| s.key == BALLISTA_JOB_NAME)
+                .and_then(|s| s.value.clone())
+                .unwrap_or_default();
+
+            info!(
+                "execution query job received - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}"
+            );
+
+            let (session_id, session_ctx) = self
+                .create_context(&settings, session_id)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to create SessionContext: {e:?}"))
+                })?;
+
+            let plan = match self.parse_plan(query, &session_ctx).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let msg = format!("Could not parse plan: {e}");
+                    error!("{msg}");
+                    return Ok(versioned_response(ExecuteQueryResult {
+                                operation_id,
+                                result: Some(execute_query_result::Result::Failure(
+                                    ExecuteQueryFailureResult {
+                                        failure: Some(execute_query_failure_result::Failure::PlanParsingFailure(msg)),
+                                    },
+                                )),
+                            }));
+                }
+            };
+
+            debug!(
+                "Decoded plan for execution:\n{}",
+                Self::describe_submitted_plan(&plan)
+            );
+
+            log::trace!("setting job name: {job_name}");
+            let job_id = self
+                .submit_plan(&job_name, session_ctx, &plan, None)
+                .await
+                .map_err(|e| self.submit_error(&job_name, e))?;
+
+            info!(
+                "execution query, job submitted - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}"
+            );
+
+            Ok(versioned_response(ExecuteQueryResult {
+                operation_id,
+                result: Some(execute_query_result::Result::Success(
+                    ExecuteQuerySuccessResult {
+                        job_id: job_id.into(),
+                        session_id,
+                    },
+                )),
+            }))
+        } else {
+            Err(Status::internal("Error parsing request"))
+        }
+    }
+
+    async fn get_job_status(
+        &self,
+        request: Request<GetJobStatusParams>,
+    ) -> Result<Response<GetJobStatusResult>, Status> {
+        let job_id = request.into_inner().job_id.into();
+        trace!("Received get_job_status request for job {}", job_id);
+
+        let flight_proxy = self.flight_proxy_config();
+
+        match self.state.task_manager.get_job_status(&job_id).await {
+            Ok(status) => Ok(Response::new(GetJobStatusResult {
+                status,
+                flight_proxy,
+            })),
+
+            Err(e) => {
+                let msg = format!("Error getting status for job {job_id}: {e:?}");
+                error!("{msg}");
+                Err(Status::internal(msg))
+            }
+        }
+    }
+
+    async fn get_job_metrics(
+        &self,
+        request: Request<GetJobMetricsParams>,
+    ) -> Result<Response<GetJobMetricsResult>, Status> {
+        let job_id = request.into_inner().job_id.into();
+        trace!("Received get_job_metrics request for job {}", job_id);
+
+        let graph = self
+            .state
+            .task_manager
+            .get_job_execution_graph(&job_id)
+            .await
+            .map_err(|e| {
+                let msg =
+                    format!("Error fetching execution graph for job {job_id}: {e:?}");
+                error!("{msg}");
+                Status::internal(msg)
+            })?
+            .ok_or_else(|| {
+                Status::not_found(format!("Execution graph not found for job {job_id}"))
+            })?;
+
+        let mut stage_metrics_list = graph
+            .stages()
+            .iter()
+            .filter_map(|(stage_id, stage)| {
+                let successful = match stage {
+                    crate::state::execution_graph::ExecutionStage::Successful(stage) => {
+                        stage
+                    }
+                    _ => return None,
+                };
+
+                let raw_metrics = &successful.stage_metrics;
+                let mut operators = Vec::with_capacity(raw_metrics.len());
+                let mut metric_index = 0;
+                let operators = (|| -> Result<
+                    Vec<ballista_core::serde::protobuf::OperatorWithMetrics>,
+                    BallistaError,
+                > {
+                    let mut stack = vec![(successful.plan.as_ref(), 0_u32)];
+
+                    while let Some((plan, depth)) = stack.pop() {
+                        let operator_desc = {
+                            struct DisplayableOperator<'a> {
+                                plan: &'a dyn ExecutionPlan,
+                            }
+
+                            impl std::fmt::Display for DisplayableOperator<'_> {
+                                fn fmt(
+                                    &self,
+                                    f: &mut std::fmt::Formatter<'_>,
+                                ) -> std::fmt::Result {
+                                    self.plan.fmt_as(DisplayFormatType::Default, f)
+                                }
+                            }
+
+                            DisplayableOperator { plan }.to_string()
+                        };
+                        let metrics = if plan.metrics().is_some() {
+                            let metrics: ballista_core::serde::protobuf::OperatorMetricsSet =
+                                raw_metrics
+                                    .get(metric_index)
+                                    .ok_or_else(|| {
+                                        BallistaError::Internal(format!(
+                                            "Missing metrics for operator {} at depth {}",
+                                            plan.name(),
+                                            depth
+                                        ))
+                                    })?
+                                    .clone()
+                                    .try_into()?;
+                            metric_index += 1;
+                            metrics.metrics
+                        } else {
+                            vec![]
+                        };
+
+                        operators.push(
+                            ballista_core::serde::protobuf::OperatorWithMetrics {
+                                depth,
+                                operator_type: plan.name().to_string(),
+                                operator_desc,
+                                metrics,
+                            },
+                        );
+
+                        for child in plan.children().into_iter().rev() {
+                            stack.push((child.as_ref(), depth + 1));
+                        }
+                    }
+
+                    Ok(operators)
+                })()
+                .and_then(|operators| {
+                    if metric_index == raw_metrics.len() {
+                        Ok(operators)
+                    } else {
+                        Err(BallistaError::Internal(format!(
+                            "Stage metrics size mismatch for job {job_id} stage {stage_id}: operators {} != stage metrics {}",
+                            metric_index,
+                            raw_metrics.len()
+                        )))
+                    }
+                })
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "Error serializing job metrics for job {job_id} stage {stage_id}: {e:?}"
+                    ))
+                });
+
+                Some(operators.map(|operators| {
+                    ballista_core::serde::protobuf::JobStageMetrics {
+                        stage_id: *stage_id as u32,
+                        partitions: successful.partitions as u32,
+                        operators,
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+
+        stage_metrics_list.sort_by_key(|stage| stage.stage_id);
+
+        Ok(Response::new(GetJobMetricsResult {
+            stages: stage_metrics_list,
+        }))
+    }
+
+    async fn executor_stopped(
+        &self,
+        request: Request<ExecutorStoppedParams>,
+    ) -> Result<Response<ExecutorStoppedResult>, Status> {
+        let ExecutorStoppedParams {
+            executor_id,
+            reason,
+        } = request.into_inner();
+        info!(
+            "Received executor stopped request from Executor {} with reason '{}'",
+            executor_id, reason
+        );
+
+        let event_sender = self.query_stage_event_loop.get_sender().map_err(|e| {
+            let msg = format!("Get query stage event loop error due to {e:?}");
+            error!("{msg}");
+            Status::internal(msg)
+        })?;
+
+        Self::remove_executor(
+            self.state.clone(),
+            event_sender,
+            &executor_id,
+            Some(reason),
+            self.config.executor_termination_grace_period,
+        );
+
+        Ok(Response::new(ExecutorStoppedResult {}))
+    }
+
+    async fn cancel_job(
+        &self,
+        request: Request<CancelJobParams>,
+    ) -> Result<Response<CancelJobResult>, Status> {
+        let job_id = request.into_inner().job_id.into();
+        info!("Received cancellation request for job {}", job_id);
+
+        self.cancel_job(job_id).await.map_err(|e| {
+            let msg = format!("Post to query stage event loop error due to {e:?}");
+            error!("{msg}");
+            Status::internal(msg)
+        })?;
+
+        Ok(Response::new(CancelJobResult { cancelled: true }))
+    }
+
+    async fn clean_job_data(
+        &self,
+        request: Request<CleanJobDataParams>,
+    ) -> Result<Response<CleanJobDataResult>, Status> {
+        let job_id = request.into_inner().job_id.into();
+        info!("Received clean data request for job {}", job_id);
+
+        self.query_stage_event_loop
+            .get_sender()
+            .map_err(|e| {
+                let msg = format!("Get query stage event loop error due to {e:?}");
+                error!("{msg}");
+                Status::internal(msg)
+            })?
+            .post_event(QueryStageSchedulerEvent::JobDataClean(job_id))
+            .await
+            .map_err(|e| {
+                let msg = format!("Post to query stage event loop error due to {e:?}");
+                error!("{msg}");
+                Status::internal(msg)
+            })?;
+        Ok(Response::new(CleanJobDataResult {}))
+    }
+}
+
+fn extract_connect_info<T>(request: &Request<T>) -> Option<ConnectInfo<SocketAddr>> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .cloned()
+}
+
+impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T, U> {
+    /// The status for a job that couldn't be submitted. A refusal that already
+    /// is a status, such as `Unavailable` while the scheduler is shutting down,
+    /// keeps its code, so a client knows to submit elsewhere.
+    fn submit_error(&self, job_name: &str, e: BallistaError) -> Status {
+        match e {
+            BallistaError::GrpcError(status) => *status,
+            e => {
+                let msg = format!("Failed to send JobQueued event for {job_name}: {e:?}");
+                error!("{msg}");
+                Status::internal(msg)
+            }
+        }
+    }
+
+    async fn create_context(
+        &self,
+        settings: &[KeyValuePair],
+        session_id: String,
+    ) -> BResult<(String, Arc<SessionContext>)> {
+        let session_config = self.state.session_manager.produce_config();
+        let session_config = session_config.update_from_key_value_pair(settings);
+
+        let ctx = self
+            .state
+            .session_manager
+            .create_or_update_session(&session_id, &session_config)
+            .await?;
+
+        Ok((session_id, ctx))
+    }
+
+    async fn parse_plan(
+        &self,
+        query: Query,
+        session_ctx: &SessionContext,
+    ) -> BResult<SubmitPlan> {
+        match query {
+            Query::LogicalPlan(message) => T::try_decode(message.as_slice())
+                .and_then(|m| {
+                    m.try_into_logical_plan(
+                        session_ctx.task_ctx().deref(),
+                        self.state.codec.logical_extension_codec(),
+                    )
+                })
+                .map(SubmitPlan::Logical)
+                .map_err(|e| e.into()),
+
+            Query::PhysicalPlan(message) => {
+                let task_ctx = session_ctx.task_ctx();
+                U::try_decode(message.as_slice())
+                    .and_then(|m| {
+                        m.try_into_physical_plan(
+                            task_ctx.as_ref(),
+                            self.state.codec.physical_extension_codec(),
+                        )
+                    })
+                    .map(SubmitPlan::Physical)
+                    .map_err(|e| e.into())
+            }
+
+            #[cfg(not(feature = "substrait"))]
+            Query::SubstraitPlan(_) => {
+                Err(BallistaError::NotImplemented("Received query type \"Substrait\", enable \"substrait\" feature to support Substrait plans.".to_string()))
+            }
+            #[cfg(feature = "substrait")]
+            Query::SubstraitPlan(bytes) => {
+                let plan = deserialize_bytes(&bytes).map_err(|e| BallistaError::DataFusionError(e.into()))?;
+
+                let ctx = session_ctx.clone();
+                from_substrait_plan(&ctx.state(), &plan)
+                    .await
+                    .map(SubmitPlan::Logical)
+                    .map_err(|e| e.into())
+            }
+        }
+    }
+
+    /// Returns a human-readable representation of a submitted plan, for logging.
+    fn describe_submitted_plan(plan: &SubmitPlan) -> String {
+        match plan {
+            SubmitPlan::Logical(plan) => plan.display_indent().to_string(),
+            SubmitPlan::Physical(plan) => {
+                datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(false)
+                    .to_string()
+            }
+        }
+    }
+
+    /// Where clients should fetch result partitions from over Arrow Flight,
+    /// advertised in job-status responses. An explicitly advertised endpoint
+    /// wins over the embedded proxy, so a load balancer can front it.
+    #[allow(deprecated)]
+    fn flight_proxy_config(&self) -> Option<FlightProxy> {
+        let config = &self.state.config;
+        match config
+            .advertise_flight_endpoint
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            Some(endpoint) => Some(FlightProxy::External(endpoint.to_string())),
+            None if config.enable_embedded_flight_proxy => Some(FlightProxy::Local(true)),
+            None => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use datafusion::prelude::SessionContext;
+    use datafusion_proto::logical_plan::{AsLogicalPlan, DefaultLogicalExtensionCodec};
+    use datafusion_proto::protobuf::LogicalPlanNode;
+    use datafusion_proto::protobuf::PhysicalPlanNode;
+    use tonic::{Code, Request, Response};
+
+    #[cfg(feature = "substrait")]
+    use {
+        ballista_core::version::insert_version_header,
+        datafusion::prelude::SessionConfig,
+        datafusion_substrait::serializer::serialize_bytes,
+    };
+
+    use crate::config::SchedulerConfig;
+    use crate::metrics::default_metrics_collector;
+    use ballista_core::error::BallistaError;
+    use ballista_core::serde::BallistaCodec;
+    use ballista_core::serde::protobuf::execute_query_params::Query;
+    use ballista_core::serde::protobuf::{
+        ExecuteQueryParams, ExecutorMetric, ExecutorRegistration, ExecutorStatus,
+        ExecutorStoppedParams, HeartBeatParams, PollWorkParams, RegisterExecutorParams,
+        execute_query_result, executor_metric, executor_status,
+    };
+    use ballista_core::serde::scheduler::{
+        ExecutorOperatingSystemSpecification, ExecutorSpecification,
+    };
+    use ballista_core::{BALLISTA_PROTOCOL_VERSION, BALLISTA_VERSION};
+
+    use crate::state::SchedulerState;
+    use crate::test_utils::await_condition;
+    use crate::test_utils::test_cluster_context;
+
+    use super::{SchedulerGrpc, SchedulerServer, executor_registration_error};
+
+    #[test]
+    fn duplicate_executor_registration_maps_to_already_exists() {
+        let status = executor_registration_error(BallistaError::Configuration(
+            "executor_id id123 is already registered".to_string(),
+        ));
+
+        assert_eq!(status.code(), Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn test_pull_work() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default().with_scheduler_policy(
+            ballista_core::config::TaskSchedulingPolicy::PullStaged,
+        );
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster.clone(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+        };
+        let request: Request<PollWorkParams> = Request::new(PollWorkParams {
+            metadata: Some(exec_meta.clone()),
+            num_free_vcores: 0,
+            task_status: vec![],
+        });
+        let response = scheduler
+            .poll_work(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+        // no response task since we told the scheduler we didn't want to accept one
+        assert!(response.tasks.is_empty());
+        let state: SchedulerState<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerState::new_with_default_scheduler_endpoint(
+                cluster.clone(),
+                BallistaCodec::default(),
+            );
+        state.init().await?;
+
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        let request: Request<PollWorkParams> = Request::new(PollWorkParams {
+            metadata: Some(exec_meta.clone()),
+            num_free_vcores: 1,
+            task_status: vec![],
+        });
+        let response = scheduler
+            .poll_work(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // still no response task since there are no tasks in the scheduler
+        assert!(response.tasks.is_empty());
+        let state: SchedulerState<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerState::new_with_default_scheduler_endpoint(
+                cluster.clone(),
+                BallistaCodec::default(),
+            );
+        state.init().await?;
+
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        let mut conflicting_exec_meta = exec_meta.clone();
+        conflicting_exec_meta.host = Some("http://localhost:8081".to_owned());
+        let request: Request<PollWorkParams> = Request::new(PollWorkParams {
+            metadata: Some(conflicting_exec_meta),
+            num_free_vcores: 1,
+            task_status: vec![],
+        });
+        let err = match scheduler.poll_work(request).await {
+            Ok(_) => panic!("duplicate executor id should fail poll_work"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), Code::AlreadyExists);
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_executor() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default().with_remove_executor_wait_secs(0);
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster.clone(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+        };
+
+        let request: Request<RegisterExecutorParams> =
+            Request::new(RegisterExecutorParams {
+                metadata: Some(exec_meta.clone()),
+            });
+        let response = scheduler
+            .register_executor(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // registration should success
+        assert!(response.success);
+
+        let state = scheduler.state.clone();
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        let request: Request<ExecutorStoppedParams> =
+            Request::new(ExecutorStoppedParams {
+                executor_id: "abc".to_owned(),
+                reason: "test_stop".to_owned(),
+            });
+
+        let _response = scheduler
+            .executor_stopped(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // executor should be registered
+        let _stopped_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        let is_stopped = await_condition(Duration::from_millis(10), 5, || {
+            futures::future::ready(Ok(state.executor_manager.is_dead_executor("abc")))
+        })
+        .await?;
+
+        // executor should be marked to dead
+        assert!(is_stopped, "Executor not marked dead after 50ms");
+
+        let active_executors = state.executor_manager.get_alive_executors();
+        assert!(active_executors.is_empty());
+
+        let expired_executors = state.executor_manager.get_expired_executors();
+        assert!(expired_executors.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_executor_in_heartbeat_service() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster,
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+        };
+
+        let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
+            executor_id: exec_meta.id.clone(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: Some(exec_meta.clone()),
+        });
+        scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect("Received error response");
+
+        let state = scheduler.state.clone();
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        Ok(())
+    }
+
+    /// A pull-based executor reports its status and metrics through
+    /// heartbeats while it polls for work; its polls must not erase them.
+    #[tokio::test]
+    async fn test_pull_executor_heartbeats_survive_polls() -> Result<(), BallistaError> {
+        let config = SchedulerConfig::default().with_scheduler_policy(
+            ballista_core::config::TaskSchedulingPolicy::PullStaged,
+        );
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+        let exec_meta = exec_meta_with_version(BALLISTA_PROTOCOL_VERSION);
+        let memory = |bytes| ExecutorMetric {
+            metric: Some(executor_metric::Metric::ProcPhysicalMemory(bytes)),
+        };
+
+        let active = executor_status::Status::Active("".to_string());
+        let terminating = executor_status::Status::Terminating("".to_string());
+
+        // The heartbeater can reach the scheduler before the first poll.
+        for (bytes, status) in [(3000, active), (1000, terminating.clone())] {
+            scheduler
+                .heart_beat_from_executor(Request::new(HeartBeatParams {
+                    executor_id: exec_meta.id.clone(),
+                    metrics: vec![memory(bytes)],
+                    status: Some(ExecutorStatus {
+                        status: Some(status),
+                    }),
+                    metadata: Some(exec_meta.clone()),
+                }))
+                .await
+                .expect("Received error response");
+        }
+        scheduler
+            .poll_work(Request::new(PollWorkParams {
+                metadata: Some(exec_meta.clone()),
+                num_free_vcores: 0,
+                task_status: vec![],
+            }))
+            .await
+            .expect("Received error response");
+
+        let heartbeat = scheduler
+            .state
+            .executor_manager
+            .get_executor_hearbeat(&exec_meta.id)
+            .expect("heartbeat");
+        assert_eq!(
+            heartbeat.status,
+            Some(ExecutorStatus {
+                status: Some(terminating)
+            })
+        );
+        assert_eq!(heartbeat.metrics, vec![memory(1000)]);
+        assert_eq!(heartbeat.peak_proc_physical_memory, 3000);
+        Ok(())
+    }
+
+    async fn scheduler_for_protocol_test()
+    -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>, BallistaError> {
+        let cluster = test_cluster_context();
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster,
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+        Ok(scheduler)
+    }
+
+    fn exec_meta_with_version(version: u32) -> ExecutorRegistration {
+        ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: version,
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        // Version 0 is what an old executor without the field defaults to;
+        // the scheduler must reject it.
+        let request = Request::new(RegisterExecutorParams {
+            metadata: Some(exec_meta_with_version(0)),
+        });
+
+        let status = scheduler
+            .register_executor(request)
+            .await
+            .expect_err("register with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("protocol version mismatch"),
+            "unexpected message: {}",
+            status.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        let meta = exec_meta_with_version(BALLISTA_PROTOCOL_VERSION + 1);
+        let request = Request::new(HeartBeatParams {
+            executor_id: meta.id.clone(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: Some(meta),
+        });
+        let status = scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect_err("heartbeat with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("protocol version mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_missing_metadata() -> Result<(), BallistaError> {
+        let scheduler = scheduler_for_protocol_test().await?;
+        let request = Request::new(HeartBeatParams {
+            executor_id: "abc".to_owned(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: None,
+        });
+        let status = scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect_err("heartbeat with no metadata should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("missing registration metadata"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_work_rejects_protocol_mismatch() -> Result<(), BallistaError> {
+        let config = SchedulerConfig {
+            scheduling_policy: ballista_core::config::TaskSchedulingPolicy::PullStaged,
+            ..Default::default()
+        };
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let request = Request::new(PollWorkParams {
+            metadata: Some(exec_meta_with_version(0)),
+            num_free_vcores: 0,
+            task_status: vec![],
+        });
+        let status = scheduler
+            .poll_work(request)
+            .await
+            .expect_err("poll_work with mismatched version should be rejected");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_expired_executor() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster.clone(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+        };
+
+        let request: Request<RegisterExecutorParams> =
+            Request::new(RegisterExecutorParams {
+                metadata: Some(exec_meta.clone()),
+            });
+        let response = scheduler
+            .register_executor(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // registration should success
+        assert!(response.success);
+
+        let state = scheduler.state.clone();
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        // heartbeat from the executor
+        let request: Request<HeartBeatParams> = Request::new(HeartBeatParams {
+            executor_id: "abc".to_owned(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active("".to_string())),
+            }),
+            metadata: Some(exec_meta.clone()),
+        });
+
+        let _response = scheduler
+            .heart_beat_from_executor(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        let active_executors = state.executor_manager.get_alive_executors();
+        assert_eq!(active_executors.len(), 1);
+
+        let expired_executors = state.executor_manager.get_expired_executors();
+        assert!(expired_executors.is_empty());
+
+        // simulate the heartbeat timeout
+        tokio::time::sleep(Duration::from_secs(
+            scheduler.config.executor_timeout_seconds,
+        ))
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // executor should be marked to dead
+        assert!(state.executor_manager.is_dead_executor("abc"));
+
+        let active_executors = state.executor_manager.get_alive_executors();
+        assert!(active_executors.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    // Still covers the deprecated embedded-proxy flag until it is removed.
+    #[allow(deprecated)]
+    async fn flight_proxy_config_reflects_explicit_flag_and_endpoint() {
+        use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
+
+        let server = |config: SchedulerConfig| {
+            SchedulerServer::<LogicalPlanNode, PhysicalPlanNode>::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            )
+        };
+
+        // Neither set: nothing advertised.
+        assert_eq!(
+            server(SchedulerConfig::default()).flight_proxy_config(),
+            None
+        );
+
+        // Embedded proxy: advertise the scheduler itself.
+        let cfg = SchedulerConfig::default().with_enable_embedded_flight_proxy(true);
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::Local(true))
+        );
+
+        // An advertised endpoint alone points clients elsewhere without starting
+        // anything locally.
+        let cfg = SchedulerConfig::default()
+            .with_advertise_flight_endpoint(Some("lb.example.com:50055".into()));
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::External("lb.example.com:50055".into()))
+        );
+
+        // External endpoint wins, even alongside the embedded proxy.
+        let cfg = SchedulerConfig::default()
+            .with_enable_embedded_flight_proxy(true)
+            .with_advertise_flight_endpoint(Some("lb.example.com:50055".into()));
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::External("lb.example.com:50055".into()))
+        );
+
+        // An empty endpoint is not advertised, and does not suppress the proxy.
+        let cfg = SchedulerConfig {
+            advertise_flight_endpoint: Some(String::new()),
+            enable_embedded_flight_proxy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            server(cfg).flight_proxy_config(),
+            Some(FlightProxy::Local(true))
+        );
+    }
+
+    /// Bytes that don't decode as a plan. A submission carrying them fails in
+    /// plan parsing, unless the version check rejects it first.
+    const UNPARSEABLE_PLAN: [u8; 4] = [0xFF; 4];
+
+    async fn test_scheduler()
+    -> Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>, BallistaError> {
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                test_cluster_context(),
+                BallistaCodec::default(),
+                Arc::new(SchedulerConfig::default()),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+        Ok(scheduler)
+    }
+
+    /// `SELECT 1`, encoded the way a client submits a logical plan.
+    async fn select_one() -> Vec<u8> {
+        let plan = SessionContext::new()
+            .sql("SELECT 1")
+            .await
+            .unwrap()
+            .into_unoptimized_plan();
+        let mut buf = vec![];
+        LogicalPlanNode::try_from_logical_plan(&plan, &DefaultLogicalExtensionCodec {})
+            .unwrap()
+            .try_encode(&mut buf)
+            .unwrap();
+        buf
+    }
+
+    /// A job submission for `plan` from a client reporting `client_version`.
+    fn job_submission(
+        plan: Vec<u8>,
+        client_version: &str,
+    ) -> Request<ExecuteQueryParams> {
+        let mut request = Request::new(ExecuteQueryParams {
+            query: Some(Query::LogicalPlan(plan)),
+            settings: vec![],
+            session_id: uuid::Uuid::new_v4().to_string(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert("ballista-version", client_version.parse().unwrap());
+        request
+    }
+
+    fn reported_version<T>(response: &Response<T>) -> Option<&str> {
+        response
+            .metadata()
+            .get("ballista-version")
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn execute_query_is_unavailable_while_the_scheduler_drains()
+    -> Result<(), BallistaError> {
+        let scheduler = test_scheduler().await?;
+        scheduler.start_draining();
+
+        let request = job_submission(select_one().await, BALLISTA_VERSION);
+        let status = scheduler.execute_query(request).await.unwrap_err();
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(
+            status.message().contains("shutting down"),
+            "{}",
+            status.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_query_rejects_client_with_different_major_version()
+    -> Result<(), BallistaError> {
+        let scheduler = test_scheduler().await?;
+
+        let request = job_submission(UNPARSEABLE_PLAN.to_vec(), "1.0.0");
+        let status = scheduler.execute_query(request).await.unwrap_err();
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(
+            status.message().contains("client 1.0.0"),
+            "{}",
+            status.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_query_push_rejects_client_with_different_major_version()
+    -> Result<(), BallistaError> {
+        let scheduler = test_scheduler().await?;
+
+        let request = job_submission(UNPARSEABLE_PLAN.to_vec(), "1.0.0");
+        let Err(status) = scheduler.execute_query_push(request).await else {
+            panic!("a client with a different major version should be rejected");
+        };
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(
+            status.message().contains("client 1.0.0"),
+            "{}",
+            status.message()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_query_reports_scheduler_version() -> Result<(), BallistaError> {
+        let scheduler = test_scheduler().await?;
+
+        let request = job_submission(select_one().await, BALLISTA_VERSION);
+        let response = scheduler.execute_query(request).await?;
+
+        assert_eq!(reported_version(&response), Some(BALLISTA_VERSION));
+        assert!(matches!(
+            response.into_inner().result,
+            Some(execute_query_result::Result::Success(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_query_reports_scheduler_version_when_plan_fails_to_parse()
+    -> Result<(), BallistaError> {
+        // The client checks the version before it looks at the result.
+        let scheduler = test_scheduler().await?;
+
+        let request = job_submission(UNPARSEABLE_PLAN.to_vec(), BALLISTA_VERSION);
+        let response = scheduler.execute_query(request).await?;
+
+        assert_eq!(reported_version(&response), Some(BALLISTA_VERSION));
+        assert!(matches!(
+            response.into_inner().result,
+            Some(execute_query_result::Result::Failure(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_query_push_reports_scheduler_version() -> Result<(), BallistaError> {
+        let scheduler = test_scheduler().await?;
+
+        let request = job_submission(select_one().await, BALLISTA_VERSION);
+        let Ok(response) = scheduler.execute_query_push(request).await else {
+            panic!("a client with the same version should be accepted");
+        };
+
+        assert_eq!(reported_version(&response), Some(BALLISTA_VERSION));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "substrait")]
+    async fn test_substrait_compatibility() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster.clone(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification::default().with_vcores(2).into()),
+            os_info: Some(ExecutorOperatingSystemSpecification::default().into()),
+            ballista_protocol_version: BALLISTA_PROTOCOL_VERSION,
+        };
+
+        let request: Request<RegisterExecutorParams> =
+            Request::new(RegisterExecutorParams {
+                metadata: Some(exec_meta.clone()),
+            });
+        let response = scheduler
+            .register_executor(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // registration should success
+        assert!(response.success);
+
+        let state = scheduler.state.clone();
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.vcores, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        // Context strictly used for values-based query serialization to avoid
+        // needing to register tables and keep them in sync with the scheduler instance.
+        // We only truly desire to test proper reception of a Substrait plan, not explicit
+        // SubstraitPlan -> LogicalPlan conversions.
+        let config = SessionConfig::new();
+        let ctx = SessionContext::new_with_config(config);
+        let serialized_substrait_plan = serialize_bytes(
+            "SELECT a, b, ABS(a) + ABS(b) FROM (VALUES (1, 2), (3, 4)) AS t(a, b)",
+            &ctx,
+        )
+        .await?;
+
+        let mut execute_query_request = Request::new(ExecuteQueryParams {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            settings: vec![],
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            query: Some(Query::SubstraitPlan(serialized_substrait_plan)),
+        });
+        insert_version_header(execute_query_request.metadata_mut());
+        let response = scheduler.execute_query(execute_query_request).await?;
+        response
+            .into_inner()
+            .result
+            .expect("Received error response");
+
+        Ok(())
+    }
+}

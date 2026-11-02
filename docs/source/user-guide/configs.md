@@ -1,0 +1,223 @@
+<!---
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+# Configuration
+
+**The configuration tables on this page are generated** from the `ConfigEntry`
+definitions in `ballista/core/src/config.rs`. Anything between a pair of
+generated config reference markers is overwritten the next time the docs are
+regenerated, so do not hand-edit it. To change a setting's description, type, or
+default, edit its `ConfigEntry` in `ballista/core/src/config.rs`, then run
+`./dev/update_config_docs.sh` and commit the regenerated file. Prose outside the
+generated sections is hand-written and safe to edit normally.
+
+## Ballista Configuration Settings
+
+Configuring Ballista is quite similar to configuring DataFusion. Most settings are identical, with only a few configurations specific to Ballista.
+
+_Example: Specifying configuration options when creating a context_
+
+```rust
+use ballista::extension::{SessionConfigExt, SessionContextExt};
+
+let session_config = SessionConfig::new_with_ballista()
+    .with_information_schema(true)
+    .with_ballista_job_name("Super Cool Ballista App");
+
+let state = SessionStateBuilder::new()
+    .with_default_features()
+    .with_config(session_config)
+    .build();
+
+let ctx: SessionContext = SessionContext::remote_with_state(&url,state).await?;
+```
+
+`SessionConfig::new_with_ballista()` will setup `SessionConfig` for use with ballista. This is not required, `SessionConfig::new` could be used, but it's advised as it will set up some sensible configuration defaults .
+
+`SessionConfigExt` expose set of `SessionConfigExt::with_ballista_` and `SessionConfigExt::ballista_` methods which can tune retrieve ballista specific options.
+
+Notable `SessionConfigExt` configuration methods would be:
+
+```rust
+/// Overrides ballista's [LogicalExtensionCodec]
+fn with_ballista_logical_extension_codec(
+    self,
+    codec: Arc<dyn LogicalExtensionCodec>,
+) -> SessionConfig;
+
+/// Overrides ballista's [PhysicalExtensionCodec]
+fn with_ballista_physical_extension_codec(
+    self,
+    codec: Arc<dyn PhysicalExtensionCodec>,
+) -> SessionConfig;
+
+/// Overrides ballista's [QueryPlanner]
+fn with_ballista_query_planner(
+    self,
+    planner: Arc<dyn QueryPlanner + Send + Sync + 'static>,
+) -> SessionConfig;
+```
+
+which could be used to change default ballista behavior.
+
+If information schema is enabled all configuration parameters could be retrieved or set using SQL;
+
+```rust
+let ctx: SessionContext = SessionContext::remote_with_state(&url, state).await?;
+
+let result = ctx
+    .sql("select name, value from information_schema.df_settings where name like 'ballista'")
+    .await?
+    .collect()
+    .await?;
+
+let expected = [
+    "+-------------------+-------------------------+",
+    "| name              | value                   |",
+    "+-------------------+-------------------------+",
+    "| ballista.job.name | Super Cool Ballista App |",
+    "+-------------------+-------------------------+",
+];
+```
+
+### Session Settings
+
+The following keys can be set on a `SessionConfig`. Ballista also accepts all
+standard DataFusion settings.
+
+<!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.job.,ballista.standalone.,ballista.cache.,ballista.client.,ballista.optimizer.,ballista.planner.,ballista.scheduler. -->
+
+<!-- prettier-ignore -->
+| key                                                       | type    | default                       | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --------------------------------------------------------- | ------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ballista.cache.noop                                       | Boolean | true                          | When true (the default), DataFrame::cache() does nothing. When false, the first action on a cached DataFrame materializes it in the cluster, and later actions read it back instead of recomputing it                                                                                                                                                                                                                                                                                  |
+| ballista.client.grpc_connect_timeout_seconds              | UInt64  | 20                            | Connection timeout for gRPC client in seconds                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ballista.client.grpc_http2_keepalive_interval_seconds     | UInt64  | 300                           | HTTP/2 keep-alive interval for gRPC client in seconds                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ballista.client.grpc_max_message_size                     | UInt64  | 16777216                      | Configuration for max message size in gRPC clients                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ballista.client.grpc_tcp_keepalive_seconds                | UInt64  | 3600                          | TCP keep-alive interval for gRPC client in seconds                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ballista.client.grpc_timeout_seconds                      | UInt64  | 20                            | Request timeout for gRPC client in seconds                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ballista.client.initial_connection_window_size            | UInt64  | 67108864                      | HTTP/2 initial connection-level flow-control window for gRPC data-plane clients, in bytes. Should be >= the shuffle governor byte budget so the governor, not the transport window, is the binding backpressure. 0 leaves the tonic default.                                                                                                                                                                                                                                           |
+| ballista.client.initial_stream_window_size                | UInt64  | 16777216                      | HTTP/2 initial stream-level flow-control window for gRPC data-plane clients, in bytes. 0 leaves the tonic default.                                                                                                                                                                                                                                                                                                                                                                     |
+| ballista.client.io_retries_times                          | UInt16  | 3                             | Number of retries for IO operations in the Ballista client.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ballista.client.io_retry_wait_time_ms                     | UInt64  | 3000                          | Wait time in milliseconds between IO retries in the Ballista client.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ballista.client.pull                                      | Boolean | false                         | Should client employ pull or push job tracking. In pull mode client will make a request to server in the loop, until job finishes. Pull mode is kept for legacy clients.                                                                                                                                                                                                                                                                                                               |
+| ballista.client.use_tls                                   | Boolean | false                         | Should connection between client, scheduler, and executors use TLS.                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ballista.job.name                                         | Utf8    | (none)                        | Sets the job name that will appear in the web user interface for any submitted jobs                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ballista.optimizer.balance_scan_file_groups               | Boolean | true                          | Prunes scan files using their Parquet statistics while planning and deals the remaining files round-robin over the scan's file groups. DataFusion builds file groups before any predicate is applied, so when files are clustered by the filtered column (for example a date range over date-partitioned files) the files that survive pruning land in a few neighbouring groups and only those tasks have work to do. Set to false to keep the file groups as DataFusion built them.  |
+| ballista.optimizer.broadcast_join_threshold_bytes         | UInt64  | 134217728                     | Byte-size threshold below which a hash join's smaller side is promoted to CollectLeft and lowered via the broadcast pattern. Governs broadcast selection under both the static distributed planner and adaptive query planning (AQE). It also caps null-aware anti joins with a known build size because they require single-task CollectLeft execution. Set to 0 to disable promotion and reject null-aware anti joins.                                                               |
+| ballista.optimizer.broadcast_join_threshold_rows          | UInt64  | 1000000                       | Row-count threshold below which a hash join's smaller side is promoted to CollectLeft and lowered via the broadcast pattern, used as a fallback when byte-size statistics are unavailable. Applies to adaptive query planning (AQE). Set to 0 to disable promotion via the row-count path.                                                                                                                                                                                             |
+| ballista.optimizer.hash_join_max_build_partition_bytes    | UInt64  | 67108864                      | Maximum per-partition hash-join build-side bytes for a Partitioned hash join under AQE. A build partition larger than this falls back to SortMergeJoin (spillable). Defaults to 64 MiB; 0 disables the check, which makes AQE use a hash join regardless of build size.                                                                                                                                                                                                                |
+| ballista.optimizer.not_in_subquery_rewrite                | Boolean | true                          | Rewrites uncorrelated NOT IN (subquery) filter predicates into a plain anti join plus a one-row count aggregate during logical optimization. The rewrite avoids DataFusion's null-aware hash join, which Ballista must otherwise execute in a single task. Set to false to keep the null-aware join and its single-task lowering.                                                                                                                                                      |
+| ballista.optimizer.stage_build_side                       | Boolean | true                          | Stages a join's prospective build side as its own shuffle before choosing the join strategy. Applies only when that side's size is an estimate rather than a measurement, and the probe side is far larger: an exact size over the broadcast budget is a fact that no further measurement can change. Lets AQE measure the build side and pick a broadcast join instead of committing to a full shuffle of the probe side up front. Set to false to always shuffle both sides at once. |
+| ballista.optimizer.stage_build_side_max_estimate_multiple | UInt64  | 32                            | How far over broadcast_join_threshold_bytes an estimated build side may sit and still be worth measuring. Past this multiple the side is large on any reading and no measurement brings it back under budget, so it is shuffled without the extra round trip. Only consulted when stage_build_side is enabled, and only for build sides whose size is an estimate rather than a measurement.                                                                                           |
+| ballista.optimizer.stage_build_side_min_probe_ratio       | UInt64  | 10                            | How many times larger the probe side must be before AQE stages a join's build side on its own. Staging serialises two shuffles that would otherwise run concurrently, so the deferral costs at most the smaller side's runtime; this ratio bounds the cost of being wrong. Only consulted when stage_build_side is enabled, and only for build sides whose size is an estimate rather than a measurement.                                                                              |
+| ballista.planner.adaptive.enabled                         | Boolean | true                          | Enables Adaptive Query Planning: joins and partition counts are chosen from measured runtime statistics instead of planning-time estimates. Set to false to use the static distributed planner.                                                                                                                                                                                                                                                                                        |
+| ballista.planner.adaptive_join.enabled                    | Boolean | true                          | Enables the AQE dynamic join-selection rule (SelectJoinRule). When true (default), DynamicJoinSelectionExec nodes are resolved to concrete HashJoin or CollectLeft join implementations at runtime. Disable only for debugging.                                                                                                                                                                                                                                                        |
+| ballista.planner.coalesce.enabled                         | Boolean | false                         | Enables the AQE coalesce-shuffle-partitions rule. Disabled by default — opt in when fewer/larger downstream tasks matter more than parallelism.                                                                                                                                                                                                                                                                                                                                        |
+| ballista.planner.coalesce.merged_partition_factor         | Float64 | 1.2                           | Two adjacent partitions are merged when their combined size is below target_partition_bytes times this factor. Mirrors Spark's legacy coalesce semantics.                                                                                                                                                                                                                                                                                                                              |
+| ballista.planner.coalesce.small_partition_factor          | Float64 | 0.2                           | A coalesced partition smaller than target_partition_bytes times this factor counts as small and is merged into its neighbour. Mirrors Spark's legacy coalesce semantics.                                                                                                                                                                                                                                                                                                               |
+| ballista.planner.coalesce.target_partition_bytes          | UInt64  | 67108864                      | Target post-coalesce partition size in bytes. Mirrors Spark's advisoryPartitionSizeInBytes.                                                                                                                                                                                                                                                                                                                                                                                            |
+| ballista.planner.parallel_window.enabled                  | Boolean | false                         | Enables the AQE parallel-window rule (ParallelWindowRule), which rewrites bounded-RANGE-frame windows into a distributed range-shuffle so BoundedWindowAggExec's single-partition constraint is not a serial bottleneck. Disabled by default — opt in when the workload contains matching window shapes.                                                                                                                                                                               |
+| ballista.planner.propagate_empty.enabled                  | Boolean | true                          | Enables the AQE propagate-empty-relation rule. Injects EmptyExec into the plan where an input is known to be empty, such as one side of a join, allowing downstream work to be skipped.                                                                                                                                                                                                                                                                                                |
+| ballista.scheduler.max_partitions_per_task                | UInt64  | 0                             | Upper bound on the number of input partitions packed into a single task's `partition_slice`. `0` (default) means unbounded — the scheduler fills each task up to the executor's free vcore count. `1` means one task per input partition. Does not apply to collapse stages, which must pack their full pending queue into a single task for correctness.                                                                                                                              |
+| ballista.scheduler.share_file_statistics_cache            | Boolean | true                          | Shares one file statistics cache across all jobs the scheduler plans, so a job reuses the statistics earlier jobs read from Parquet footers instead of reading every footer again. A cached entry is only used while the file's size and modification time still match, which misses a file rewritten in place without changing either. Set to false to keep this session's jobs off the shared cache.                                                                                 |
+| ballista.standalone.parallelism                           | UInt16  | number of available CPU cores | Number of vcores advertised by the standalone in-process executor.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ballista.standalone.task_scheduling_policy                | Utf8    | pull-staged                   | Task scheduling policy of a standalone in-process cluster: `pull-staged`, where the executor polls the scheduler for work, or `push-staged`, where the scheduler pushes tasks to the executor.                                                                                                                                                                                                                                                                                         |
+
+<!-- END GENERATED CONFIG REFERENCE -->
+
+## Shuffle Settings
+
+The following session-level keys control Ballista's shuffle behavior. See
+the [tuning guide](tuning-guide.md#shuffle-implementation) for an
+explanation of the sort-based shuffle writer.
+
+<!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.shuffle. -->
+
+<!-- prettier-ignore -->
+| key                                                      | type    | default   | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------------------------------- | ------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ballista.shuffle.compression.codec                       | Utf8    | lz4       | Compression codec specification used in the shuffle process. Possible values: none, lz4, zstd. Defaults to lz4 to preserve current behaviour                                                                                                                                                                                                                                                                                                                                                                                  |
+| ballista.shuffle.force_remote_read                       | Boolean | false     | Forces the shuffle reader to always read partitions via the Arrow Flight client, even when partitions are local to the node.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ballista.shuffle.max_concurrent_read_requests            | UInt64  | 64        | Maximum concurrent requests shuffle reader can process                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ballista.shuffle.reader.default_block_size_bytes         | UInt64  | 1048576   | Assumed per-partition byte size charged to the shuffle governor when partition stats carry no byte count.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ballista.shuffle.reader.max_blocks_in_flight_per_address | UInt64  | 128       | Reduce-side shuffle governor: maximum concurrent in-flight partition fetches to a single executor address.                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ballista.shuffle.reader.max_bytes_in_flight              | UInt64  | 50331648  | Reduce-side shuffle governor: maximum total in-flight bytes across concurrent remote partition fetches. Mirrors Spark's spark.reducer.maxSizeInFlight. Values above 4 GiB are clamped to 4 GiB (u32 semaphore limit).                                                                                                                                                                                                                                                                                                         |
+| ballista.shuffle.remote_read_prefer_flight               | Boolean | false     | Forces the shuffle reader to use flight reader instead of block reader for remote read. Block reader usually has better performance and resource utilization                                                                                                                                                                                                                                                                                                                                                                  |
+| ballista.shuffle.sort_based.batch_size                   | UInt64  | 8192      | Target batch size in rows for coalescing small batches in sort shuffle                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ballista.shuffle.sort_based.memory_limit_per_task_bytes  | UInt64  | 268435456 | Per-task buffered-bytes budget at which the sort shuffle writer spills its in-memory batches to disk. Counted independently of the runtime memory pool, so spilling kicks in even when the pool is unbounded. Total worst-case sort shuffle memory per executor is approximately vcores * this value. Set to 0 to disable the per-task budget and rely solely on runtime memory-pool pressure to trigger spilling; this is safe only with a bounded memory pool, otherwise the writer never spills and may run out of memory. |
+| ballista.shuffle.writer_channel_capacity                 | UInt32  | 8         | Bounded channel capacity for async-to-blocking I/O bridge in shuffle writer                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+
+<!-- END GENERATED CONFIG REFERENCE -->
+
+## Pipelined Execution Settings
+
+These session-level keys select and tune the experimental pipelined execution
+mode, in which every task of a job is placed up front and stages stream data
+to each other instead of exchanging shuffle files. The scheduler does not run
+pipelined jobs yet.
+
+<!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.execution.,ballista.pipelined. -->
+
+<!-- prettier-ignore -->
+| key                                             | type   | default  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ballista.execution.mode                         | Utf8   | blocking | How a job's stages exchange data. `blocking` runs stages one after another and passes data between them through shuffle files. `pipelined` (experimental) places every task of the job up front and streams record batches between stages over Arrow Flight. It has lower latency, but a failed task fails the job instead of being retried, and a job waits until it can reserve the vcores of its widest stage all at once. `pipelined` requires push-staged scheduling, and the scheduler does not run it yet.                                            |
+| ballista.pipelined.queue_capacity               | UInt64 | 2        | Number of batches each output partition of a pipelined stage buffers before its producer waits for the consumer to read. Higher values smooth out bursty consumers at the cost of memory. At least 1.                                                                                                                                                                                                                                                                                                                                                        |
+| ballista.pipelined.registration_timeout_seconds | UInt64 | 60       | How long either side of a pipelined exchange waits for the other before failing the query: a consumer for its producer task to start, and a producer whose output queue is full for a consumer to open it. All tasks of a pipelined job are launched together, so either can be first. At least 1.                                                                                                                                                                                                                                                           |
+| ballista.pipelined.stream_window_bytes          | UInt64 | 524288   | HTTP/2 flow-control window, in bytes, of each stream a pipelined reader opens to another executor. The streams of every task on an executor share one connection to each producer executor, whose connection window is the largest HTTP/2 allows, so this bounds the data a stalled stream can hold, and a connection can carry 2147483647 divided by this many streams before stalled streams could starve the rest. It also caps a stream's throughput at this many bytes per round trip, so raise it on high-latency links. Between 65535 and 2147483647. |
+
+<!-- END GENERATED CONFIG REFERENCE -->
+
+## Testing and Fault Injection
+
+These settings drive chaos-monkey fault injection and exist for robustness
+testing. They are not intended for production use.
+
+<!-- BEGIN GENERATED CONFIG REFERENCE prefix=ballista.testing. -->
+
+<!-- prettier-ignore -->
+| key                                          | type    | default   | description                                                                                                                                                                                                                          |
+| -------------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ballista.testing.chaos_execution.enabled     | Boolean | false     | Enables chaos-monkey execution injection for robustness testing. When true, ChaosExec is inserted at a random point in the plan once per optimize call.                                                                              |
+| ballista.testing.chaos_execution.fault_type  | Utf8    | transient | Fault type injected by chaos-monkey execution. "transient": IoError (retryable); "fatal": Execution error (non-retryable); "panic": panics the task thread; "delay" or "delay:N": sleeps N ms per batch with no error (default N=1). |
+| ballista.testing.chaos_execution.probability | Float64 | 0.25      | Failure probability (0.0–1.0) passed to ChaosExec when chaos execution is enabled.                                                                                                                                                   |
+| ballista.testing.chaos_execution.seed        | Utf8    | (empty)   | Optional u64 seed for the chaos RNG. Empty string (default) means non-deterministic; set to a numeric value to get reproducible fault injection across runs.                                                                         |
+
+<!-- END GENERATED CONFIG REFERENCE -->
+
+## Ballista Scheduler Configuration Settings
+
+Besides the BallistaContext configuration settings, a few configuration settings for the Ballista scheduler to better
+manage the whole cluster are also needed to be taken care of.
+
+_Example: Specifying configuration options when starting the scheduler_
+
+```shell
+./ballista-scheduler --scheduler-policy push-staged --event-loop-buffer-size 1000000 --task-distribution round-robin
+```
+
+| key                                          | type   | default        | description                                                                                                                                                                          |
+| -------------------------------------------- | ------ | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| id                                           | Utf8   | generated UUID | Sets the scheduler identity exposed in scheduler state and history event logs. The default matches executor UUID-backed instance ids. Executor callbacks use the scheduler endpoint. |
+| scheduler-policy                             | Utf8   | push-staged    | Sets the task scheduling policy for the scheduler, possible values: pull-staged, push-staged.                                                                                        |
+| event-loop-buffer-size                       | UInt32 | 1000           | Sets the event loop buffer size. for a system of high throughput, a larger value like 1000000 is recommended.                                                                        |
+| task-distribution                            | Utf8   | bias           | Sets the task distribution policy for the scheduler, possible values: bias, round-robin                                                                                              |
+| finished-job-data-clean-up-interval-seconds  | UInt64 | 300            | Sets the delayed interval for cleaning up finished job data, mainly the shuffle data, 0 means the cleaning up is disabled.                                                           |
+| finished-job-state-clean-up-interval-seconds | UInt64 | 3600           | Sets the delayed interval for cleaning up finished job state stored in the backend, 0 means the cleaning up is disabled.                                                             |

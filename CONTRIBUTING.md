@@ -1,0 +1,129 @@
+<!---
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+# Introduction
+
+We welcome and encourage contributions of all kinds, such as:
+
+1. Tickets with issue reports of feature requests
+2. Documentation improvements
+3. Code (PR or PR Review)
+
+In addition to submitting new PRs, we have a healthy tradition of community members helping review each other's PRs.
+Doing so is a great way to help the community as well as get more familiar with Rust and the relevant codebases.
+
+You can find a curated
+[good-first-issue](https://github.com/apache/datafusion-ballista/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+list to help you get started.
+
+## Claiming an issue
+
+If you want to work on an issue, comment `take` on it and the
+[`take` workflow](.github/workflows/take.yml) will assign it to you. Comment
+`untake` to unassign yourself again if you no longer plan to work on it. The
+comment has to be exactly `take` or `untake` with nothing else in it.
+
+Assigning an issue to yourself is not required to open a PR, but it lets others
+know that the issue is being worked on. If an issue is already assigned and has
+seen no activity for a while, feel free to ask on the issue whether it is still
+being worked on before picking it up.
+
+# Developer's Guide
+
+This section describes how you can get started with Ballista development.
+
+## Bootstrap Environment
+
+Ballista contains components implemented in the following programming languages:
+
+- Rust (Scheduler and Executor processes, Client library)
+
+### Rust Environment
+
+We use the standard Rust development tools.
+
+- `cargo build`
+- `cargo fmt` to format the code
+- `cargo test` to test
+- etc.
+
+Testing setup:
+
+- `rustup update stable` DataFusion uses the latest stable release of rust
+
+Formatting instructions:
+
+- [ci/scripts/rust_fmt.sh](ci/scripts/rust_fmt.sh)
+- [ci/scripts/rust_clippy.sh](ci/scripts/rust_clippy.sh)
+- [ci/scripts/rust_toml_fmt.sh](ci/scripts/rust_toml_fmt.sh)
+
+or run them all at once:
+
+- [dev/rust_lint.sh](dev/rust_lint.sh)
+
+### Configuration Documentation
+
+The configuration tables in
+[docs/source/user-guide/configs.md](docs/source/user-guide/configs.md) are
+generated from the `CONFIG_ENTRIES` registry in `ballista/core/src/config.rs`.
+After adding or changing a configuration key, regenerate them with:
+
+```bash
+./dev/update_config_docs.sh
+```
+
+and commit the result. Every registered key must be covered by one of the
+generated regions in that page, so a new key whose prefix matches none of them
+will fail the check until it is given a home. CI enforces this with
+[ci/scripts/rust_config_docs_check.sh](ci/scripts/rust_config_docs_check.sh).
+
+### Python Environment
+
+Refer to the instructions in the Python Bindings [README](./python/README.md)
+
+## Integration Tests
+
+The integration tests can be executed by running the following command from the root of the repository.
+
+```bash
+./dev/integration-tests.sh
+```
+
+The script generates partitioned TPC-H Parquet via `tpchgen-cli`, builds the
+binaries on the host, builds the docker images, brings up the docker-compose
+stack, and runs all 22 queries. Defaults to SF=10, 16 partitions, 3
+iterations per query; override with `SCALE_FACTOR`, `PARTITIONS`, and
+`ITERATIONS` env vars. See `benchmarks/README.md` for details.
+
+## How to format `.md` document
+
+We are using `prettier` to format `.md` files.
+
+CI runs a pinned version through `npx`, so run the same command locally rather than a globally
+installed `prettier`, which may format differently:
+
+```bash
+npx prettier@2.7.1 --write \
+  '{ballista,docs}/**/*.md' \
+  README.md \
+  CONTRIBUTING.md
+```
+
+This is exactly what the `prettier` job in `.github/workflows/dev.yml` checks, so keep the two in
+sync if the set of formatted files changes.

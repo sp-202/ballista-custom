@@ -1,0 +1,150 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "ballista-cli"
+description = "Command Line Client for Ballista distributed query engine."
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+keywords = ["ballista", "cli"]
+license = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.cargo-machete]
+ignored = [
+    # not imported directly; provides the `critical-section` implementation that
+    # ratatui-core needs at link time in the wasm32 `web` build
+    "critical-section",
+]
+
+[dependencies]
+# CLI-only deps (DataFusion/Ballista) — gated by `cli` feature
+ballista = { workspace = true, features = ["standalone"], optional = true }
+ballista-core = { workspace = true, optional = true }
+datafusion = { workspace = true, optional = true }
+datafusion-cli = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+rustyline = { version = "18.0.0", optional = true }
+
+# TUI/web shared deps
+ballista-api-types = { workspace = true, optional = true }
+chrono = { workspace = true, features = ["std", "clock"], optional = true }
+clap = { workspace = true, features = ["derive", "cargo"] }
+config = { version = "0.15.23", default-features = false, features = ["yaml"], optional = true }
+dirs = "7.0"
+dotparser = { version = "0.3.0", optional = true }
+futures = { workspace = true, optional = true }
+prometheus-parse = { version = "0.2", optional = true }
+ratatui = { version = "0.30.1", default-features = false, optional = true }
+reqwest = { version = "0.13.4", features = ["json"], optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "local-time"] }
+tui-shimmer = { version = "0.1", optional = true }
+url-escape = { workspace = true, optional = true }
+
+# Native-only TUI deps
+crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
+
+# Web-only deps (WASM)
+console_error_panic_hook = { version = "0.1", optional = true }
+critical-section = { version = "1.2.0", features = ["std"], optional = true }
+gloo-timers = { version = "0.4", features = ["futures"], optional = true }
+js-sys = { version = "0.3.95", optional = true }
+ratzilla = { version = "0.3.1", optional = true }
+tracing-web = { version = "0.1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, default-features = false, features = ["Window", "Document", "Location"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "parking_lot", "signal"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+
+[features]
+default = ["cli", "tui"]
+
+cli = [
+    "dep:ballista",
+    "dep:ballista-core",
+    "dep:datafusion",
+    "dep:datafusion-cli",
+    "dep:mimalloc",
+    "dep:rustyline",
+]
+
+tui = [
+    "dep:ballista-api-types",
+    "dep:chrono",
+    "dep:config",
+    "dep:crossterm",
+    "dep:dotparser",
+    "dep:futures",
+    "dep:url-escape",
+    "dep:prometheus-parse",
+    "dep:ratatui",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tui-shimmer",
+    "ratatui/crossterm",
+    "ratatui/all-widgets",
+    "ratatui/macros",
+    "ratatui/layout-cache",
+    "ratatui/underline-color",
+    "ratatui/serde",
+]
+
+web = [
+    "dep:ballista-api-types",
+    "dep:chrono",
+    "dep:config",
+    "dep:critical-section",
+    "dep:dotparser",
+    "dep:futures",
+    "dep:url-escape",
+    "dep:prometheus-parse",
+    "dep:ratatui",
+    "ratatui/serde",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tui-shimmer",
+    "dep:ratzilla",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:gloo-timers",
+    "dep:console_error_panic_hook",
+    "dep:tracing-web",
+    "dep:web-sys",
+    "dep:js-sys",
+]
+
+[[bin]]
+name = "ballista-cli"
+test = false
+required-features = ["cli"]

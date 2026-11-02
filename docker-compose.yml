@@ -1,0 +1,85 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+services:
+  ballista-scheduler:
+    image: apache/datafusion-ballista-scheduler:latest
+    build:
+      dockerfile: dev/docker/ballista-scheduler.Dockerfile
+      context: .
+    command: "--bind-host 0.0.0.0 --external-host ballista-scheduler"
+    ports:
+      - "50050:50050"
+    environment:
+      - RUST_LOG=ballista=info
+    volumes:
+      - ./benchmarks/data:/data:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/50050"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Longer than the scheduler's --graceful-shutdown-timeout-seconds (25 by
+    # default), so a drain isn't cut short by SIGKILL.
+    stop_grace_period: 30s
+    restart: "no"
+
+  ballista-executor:
+    image: apache/datafusion-ballista-executor:latest
+    build:
+      dockerfile: dev/docker/ballista-executor.Dockerfile
+      context: .
+    command: "--bind-host 0.0.0.0 --scheduler-host ballista-scheduler --vcores 4 --memory-pool-size 8GB --work-dir /work"
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '8'
+          memory: 12G
+    environment:
+      - RUST_LOG=ballista=info
+    volumes:
+      - ./benchmarks/data:/data:ro
+    depends_on:
+      ballista-scheduler:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/50051"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: "no"
+
+  ballista-client:
+    image: apache/datafusion-ballista-benchmarks:latest
+    build:
+      dockerfile: dev/docker/ballista-benchmarks.Dockerfile
+      context: .
+    command: ["/bin/bash", "-c", "sleep infinity"]
+    # An init process, so `sleep` stops on SIGTERM instead of waiting for SIGKILL.
+    init: true
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./benchmarks/data:/data:ro
+      - ./benchmarks/queries:/root/benchmarks/queries:ro
+      - ./benchmarks/run.sh:/root/run.sh:ro
+    depends_on:
+      ballista-scheduler:
+        condition: service_healthy
+      ballista-executor:
+        condition: service_healthy
+    restart: "no"

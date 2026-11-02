@@ -1,0 +1,104 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[build-system]
+requires = ["maturin>=1.8.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ballista"
+description = "Python client for Apache DataFusion Ballista Distributed SQL Query Engine"
+readme = "README.md"
+license = {file = "LICENSE.txt"}
+requires-python = ">=3.10"
+keywords = ["ballista", "sql", "rust", "distributed"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python",
+    "Programming Language :: Rust",
+]
+dependencies = [
+    "datafusion==55",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+jupyter = [
+    "ipython>=8.0.0",
+]
+test = [
+    "pyarrow>=16.0.0;python_version<'3.14'",
+    "pyarrow>=22.0.0;python_version>='3.14'",
+    "pytest",
+]
+
+[project.urls]
+homepage = "https://datafusion.apache.org/ballista"
+documentation = "https://datafusion.apache.org/ballista"
+repository = "https://github.com/apache/datafusion-ballista"
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff.format]
+# Jupyter notebooks are committed with the JSON indentation that the Jupyter
+# UI writes; ruff format would rewrite that on every run, producing large
+# whitespace-only diffs. Lint (ruff check) still applies to notebook cells.
+exclude = ["*.ipynb"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "ballista._internal_ballista"
+include = [
+    { path = "Cargo.lock", format = "sdist" }
+]
+exclude = [".github/**", "ci/**", ".asf.yaml"]
+# Require Cargo.lock is up to date
+locked = true
+
+# datafusion 55.0.0 is not on PyPI yet, and its release candidate wheels are
+# only on TestPyPI. Take datafusion, and nothing else, from TestPyPI until
+# 55.0.0 is published, then remove this index and the source below.
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+explicit = true
+
+[tool.uv.sources]
+datafusion = { index = "testpypi" }
+
+[dependency-groups]
+dev = [
+    "maturin>=1.8.1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.1.0",
+    "ruff>=0.9.1",
+    "toml>=0.10.2",
+    "pygithub==2.5.0",
+    "pyarrow>=16.0.0;python_version<'3.14'",
+    "pyarrow>=22.0.0;python_version>='3.14'",
+]
+docs = [
+]

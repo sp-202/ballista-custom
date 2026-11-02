@@ -1,0 +1,274 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+mod logging;
+#[cfg(feature = "tui")]
+mod tui;
+
+use ballista::{extension::SessionConfigExt, prelude::SessionContextExt};
+use ballista_cli::{
+    BALLISTA_CLI_VERSION, exec, print_format::PrintFormat, print_options::PrintOptions,
+};
+use clap::Parser;
+#[cfg(feature = "cli")]
+use datafusion::{
+    execution::SessionStateBuilder,
+    prelude::{SessionConfig, SessionContext},
+};
+#[cfg(feature = "cli")]
+use datafusion_cli::{
+    object_storage::instrumented::InstrumentedObjectStoreRegistry, print_options::MaxRows,
+};
+use mimalloc::MiMalloc;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::{env, sync::Arc};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+#[derive(Debug, Parser, PartialEq)]
+#[clap(author, version, about, long_about= None)]
+struct Args {
+    #[clap(
+        short = 'p',
+        long,
+        help = "Path to your data, default to current directory",
+        value_parser(parse_valid_data_dir)
+    )]
+    data_path: Option<String>,
+
+    #[clap(
+        short = 'c',
+        long,
+        help = "The batch size of each query, or use Ballista default",
+        value_parser(parse_batch_size)
+    )]
+    batch_size: Option<usize>,
+
+    #[clap(
+        long,
+        help = "Virtual cores for the local Ballista executor. Default: all available physical cores.",
+        value_parser(parse_valid_vcores)
+    )]
+    vcores: Option<usize>,
+
+    #[clap(
+        long = "concurrent-tasks",
+        hide = true,
+        conflicts_with = "vcores",
+        help = "[deprecated] renamed to --vcores",
+        value_parser(parse_valid_vcores)
+    )]
+    concurrent_tasks: Option<usize>,
+
+    #[clap(
+        short,
+        long,
+        num_args = 0..,
+        help = "Execute commands from file(s), then exit",
+        value_parser(parse_valid_file)
+    )]
+    file: Vec<String>,
+
+    #[clap(
+        short = 'r',
+        long,
+        num_args = 0..,
+        help = "Run the provided files on startup instead of ~/.ballistarc",
+        value_parser(parse_valid_file),
+        conflicts_with = "file"
+    )]
+    rc: Option<Vec<String>>,
+
+    #[clap(long, value_enum, default_value_t = PrintFormat::Table)]
+    format: PrintFormat,
+
+    #[clap(long, help = "Ballista scheduler host")]
+    host: Option<String>,
+
+    #[clap(long, help = "Ballista scheduler port")]
+    port: Option<u16>,
+
+    #[clap(
+        short,
+        long,
+        help = "Reduce printing other than the results and work quietly"
+    )]
+    quiet: bool,
+
+    #[clap(long, help = "Enables console syntax highlighting")]
+    color: bool,
+
+    #[cfg(feature = "tui")]
+    #[clap(long, help = "Enables terminal user interface")]
+    tui: bool,
+}
+
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let tui_mode = Arc::new(AtomicBool::new(false));
+
+    logging::init_logging(tui_mode.clone())?;
+
+    // Exit when asked to terminate, as the signal's default action would. That
+    // action doesn't apply to PID 1, which the CLI is in a container.
+    {
+        #[cfg(all(feature = "tui", not(feature = "web")))]
+        let tui_mode = tui_mode.clone();
+        tokio::spawn(async move {
+            if ballista_core::utils::terminate_signal().await.is_ok() {
+                // Leave the TUI's raw mode and alternate screen, as the TUI does
+                // when it exits.
+                #[cfg(all(feature = "tui", not(feature = "web")))]
+                if tui_mode.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::LeaveAlternateScreen
+                    );
+                }
+                // 128 + 15 (SIGTERM), the status shells report for a process
+                // SIGTERM killed.
+                std::process::exit(143);
+            }
+        });
+    }
+
+    let args = Args::parse();
+
+    #[cfg(feature = "tui")]
+    if args.tui {
+        return tui::main(tui_mode.clone())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
+    }
+
+    if !args.quiet {
+        println!("Ballista CLI v{BALLISTA_CLI_VERSION}");
+    }
+
+    if let Some(ref path) = args.data_path {
+        let p = Path::new(path);
+        env::set_current_dir(p)?;
+    };
+
+    let mut ballista_config =
+        SessionConfig::new_with_ballista().with_information_schema(true);
+
+    if let Some(batch_size) = args.batch_size {
+        ballista_config = ballista_config.with_batch_size(batch_size);
+    };
+
+    let ctx = match (args.host, args.port) {
+        (Some(ref host), Some(port)) => {
+            let address = format!("df://{host}:{port}");
+            let state = SessionStateBuilder::new()
+                .with_config(ballista_config)
+                .with_default_features()
+                .build();
+
+            // Distributed execution with Ballista Remote
+            SessionContext::remote_with_state(&address, state).await?
+        }
+        _ => {
+            let vcores = match args.concurrent_tasks {
+                Some(value) => {
+                    eprintln!(
+                        "warning: --concurrent-tasks is deprecated; use --vcores instead"
+                    );
+                    Some(value)
+                }
+                None => args.vcores,
+            };
+            if let Some(vcores) = vcores {
+                ballista_config = ballista_config.with_target_partitions(vcores);
+            };
+            let state = SessionStateBuilder::new()
+                .with_config(ballista_config)
+                .with_default_features()
+                .build();
+
+            // In-process execution with Ballista Standalone
+            SessionContext::standalone_with_state(state).await?
+        }
+    };
+
+    let mut print_options = PrintOptions {
+        format: args.format,
+        quiet: args.quiet,
+        maxrows: MaxRows::Unlimited,
+        color: args.color,
+        instrumented_registry: Arc::new(InstrumentedObjectStoreRegistry::new()),
+    };
+
+    let files = args.file;
+    let rc = match args.rc {
+        Some(file) => file,
+        None => {
+            let mut files = Vec::new();
+            let home = dirs::home_dir();
+            if let Some(p) = home {
+                let home_rc = p.join(".ballistarc");
+                if home_rc.exists() {
+                    files.push(home_rc.into_os_string().into_string().unwrap());
+                }
+            }
+            files
+        }
+    };
+    if !files.is_empty() {
+        exec::exec_from_files(files, &ctx, &print_options).await
+    } else {
+        if !rc.is_empty() {
+            exec::exec_from_files(rc, &ctx, &print_options).await
+        }
+        exec::exec_from_repl(&ctx, &mut print_options, tui_mode.clone()).await;
+    }
+
+    Ok(())
+}
+
+fn parse_valid_file(dir: &str) -> std::result::Result<String, String> {
+    if Path::new(dir).is_file() {
+        Ok(dir.to_string())
+    } else {
+        Err(format!("Invalid file '{dir}'"))
+    }
+}
+
+fn parse_valid_data_dir(dir: &str) -> std::result::Result<String, String> {
+    if Path::new(dir).is_dir() {
+        Ok(dir.to_string())
+    } else {
+        Err(format!("Invalid data directory '{dir}'"))
+    }
+}
+
+fn parse_batch_size(size: &str) -> std::result::Result<usize, String> {
+    match size.parse::<usize>() {
+        Ok(size) if size > 0 => Ok(size),
+        _ => Err(format!("Invalid batch size '{size}'")),
+    }
+}
+
+fn parse_valid_vcores(size: &str) -> std::result::Result<usize, String> {
+    match size.parse::<usize>() {
+        Ok(size) if size > 0 => Ok(size),
+        _ => Err(format!("Invalid vcores value '{size}'")),
+    }
+}

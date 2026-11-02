@@ -1,0 +1,1121 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::cluster::{
+    BoundTask, CacheState, ClusterState, ExecutorSlot, JobState, JobStateEvent,
+    JobStateEventStream, JobStatus, TaskDistributionPolicy, bind_task_bias,
+    bind_task_round_robin,
+};
+use crate::state::cache_registry::{
+    BeginOutcome, CacheKey, CacheRegistry, CompleteOutcome, MaterializedCache,
+};
+use crate::state::execution_graph::ExecutionGraphBox;
+use ballista_core::error::{BallistaError, Result};
+use ballista_core::serde::protobuf::{
+    AvailableVcores, ExecutorHeartbeat, ExecutorStatus, FailedJob, QueuedJob,
+    executor_status,
+};
+use ballista_core::serde::scheduler::PartitionLocation;
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata};
+use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
+use dashmap::DashMap;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use tokio::sync::mpsc::error::TrySendError;
+
+use crate::cluster::event::ClusterEventSender;
+use crate::scheduler_server::{SessionBuilder, timestamp_millis, timestamp_secs};
+use crate::state::session_manager::create_datafusion_context;
+use crate::state::task_manager::JobInfoCache;
+use ballista_core::serde::protobuf::job_status::Status;
+use log::{error, warn};
+use std::collections::{HashMap, HashSet};
+use std::ops::DerefMut;
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use super::{ClusterStateEvent, ClusterStateEventStream};
+
+/// In-memory implementation of cluster state.
+///
+/// This stores all cluster state (executor registration, free vcores, heartbeats)
+/// in memory without persistence. Suitable for single-scheduler deployments
+/// or testing scenarios.
+#[derive(Default)]
+pub struct InMemoryClusterState {
+    /// Current free vcores for each executor.
+    available_vcores: Mutex<HashMap<String, AvailableVcores>>,
+    /// Current executors and their metadata.
+    executors: DashMap<String, ExecutorMetadata>,
+    /// Last heartbeat received for each executor.
+    heartbeats: DashMap<String, ExecutorHeartbeat>,
+    /// Broadcast sender for cluster state change events.
+    cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
+}
+
+#[async_trait::async_trait]
+impl ClusterState for InMemoryClusterState {
+    async fn bind_schedulable_tasks(
+        &self,
+        distribution: TaskDistributionPolicy,
+        active_jobs: Arc<HashMap<JobId, JobInfoCache>>,
+        executors: Option<HashSet<String>>,
+    ) -> Result<Vec<BoundTask>> {
+        let mut guard = self.available_vcores.lock().await;
+
+        let budgets: Vec<&mut AvailableVcores> = guard
+            .values_mut()
+            .filter_map(|data| {
+                (data.vcores > 0
+                    && executors
+                        .as_ref()
+                        .map(|executors| executors.contains(&data.executor_id))
+                        .unwrap_or(true))
+                .then_some(data)
+            })
+            .collect();
+
+        let bound_tasks = match distribution {
+            TaskDistributionPolicy::Bias => {
+                bind_task_bias(budgets, active_jobs, |_| false).await
+            }
+            TaskDistributionPolicy::RoundRobin => {
+                bind_task_round_robin(budgets, active_jobs, |_| false).await
+            }
+            TaskDistributionPolicy::Custom(ref policy) => {
+                policy.bind_tasks(budgets, active_jobs).await?
+            }
+        };
+
+        Ok(bound_tasks)
+    }
+
+    async fn unbind_tasks(&self, executor_slots: Vec<ExecutorSlot>) -> Result<()> {
+        let mut increments = HashMap::new();
+        for (executor_id, num_vcores) in executor_slots {
+            let v = increments.entry(executor_id).or_insert_with(|| 0);
+            *v += num_vcores;
+        }
+
+        let mut guard = self.available_vcores.lock().await;
+
+        for (executor_id, num_vcores) in increments {
+            if let Some(data) = guard.get_mut(&executor_id) {
+                data.vcores += num_vcores;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn register_executor(
+        &self,
+        metadata: ExecutorMetadata,
+        spec: ExecutorData,
+    ) -> Result<()> {
+        let executor_id = metadata.id.clone();
+        log::debug!("registering executor: {}", executor_id);
+
+        if spec.executor_id != executor_id {
+            return Err(BallistaError::Configuration(format!(
+                "executor data id {} does not match metadata id {executor_id}",
+                spec.executor_id
+            )));
+        }
+
+        match self.executors.entry(executor_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(BallistaError::Configuration(format!(
+                    "executor_id {executor_id} is already registered"
+                )));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(metadata);
+                self.cluster_event_sender
+                    .send(&ClusterStateEvent::RegisteredExecutor {
+                        executor_id: executor_id.to_string(),
+                    });
+            }
+        };
+
+        self.save_executor_heartbeat(ExecutorHeartbeat {
+            executor_id: executor_id.clone(),
+            timestamp: timestamp_secs(),
+            metrics: vec![],
+            status: Some(ExecutorStatus {
+                status: Some(executor_status::Status::Active(String::default())),
+            }),
+            peak_proc_physical_memory: 0,
+            peak_proc_virtual_memory: 0,
+        })
+        .await?;
+
+        let mut guard = self.available_vcores.lock().await;
+
+        guard.insert(
+            executor_id.clone(),
+            AvailableVcores {
+                executor_id: executor_id.clone(),
+                vcores: spec.available_vcores,
+            },
+        );
+
+        Ok(())
+    }
+
+    async fn save_executor_metadata(&self, metadata: ExecutorMetadata) -> Result<()> {
+        log::trace!("save executor metadata: {}", metadata.id);
+        // TODO: MM it would make sense to add time when ExecutorMetadata is persisted
+        //       we can do that adding additional field in ExecutorMetadata representing
+        //       insert time. This information may be useful when reporting executor
+        //       status and heartbeat is not available (in case of `TaskSchedulingPolicy::PullStaged`)
+        let executor_id = metadata.id.clone();
+        match self.executors.entry(executor_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                if entry.get() != &metadata {
+                    return Err(BallistaError::Configuration(format!(
+                        "executor_id {executor_id} is already registered"
+                    )));
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(metadata);
+                self.cluster_event_sender
+                    .send(&ClusterStateEvent::RegisteredExecutor {
+                        executor_id: executor_id.to_string(),
+                    });
+            }
+        }
+
+        // A poll refreshes the heartbeat timestamp and keeps the last status,
+        // metrics and peaks; see the `ClusterState::save_executor_metadata`
+        // docs. The entry is updated in place so a heartbeat saved
+        // concurrently isn't overwritten.
+        let timestamp = timestamp_secs();
+        self.heartbeats
+            .entry(executor_id.clone())
+            .and_modify(|heartbeat| heartbeat.timestamp = timestamp)
+            .or_insert_with(|| ExecutorHeartbeat {
+                executor_id,
+                timestamp,
+                metrics: vec![],
+                status: None,
+                peak_proc_physical_memory: 0,
+                peak_proc_virtual_memory: 0,
+            });
+        Ok(())
+    }
+
+    async fn get_executor_metadata(&self, executor_id: &str) -> Result<ExecutorMetadata> {
+        self.executors
+            .get(executor_id)
+            .map(|pair| pair.value().clone())
+            .ok_or_else(|| {
+                BallistaError::Internal(format!(
+                    "Not executor with ID {executor_id} found"
+                ))
+            })
+    }
+
+    async fn save_executor_heartbeat(&self, heartbeat: ExecutorHeartbeat) -> Result<()> {
+        log::trace!("saving executor heartbeat: {}", heartbeat.executor_id);
+        let executor_id = heartbeat.executor_id.clone();
+        if let Some(mut last) = self.heartbeats.get_mut(&executor_id) {
+            let _ = std::mem::replace(last.deref_mut(), heartbeat);
+        } else {
+            self.heartbeats.insert(executor_id, heartbeat);
+        }
+
+        Ok(())
+    }
+
+    async fn remove_executor(&self, executor_id: &str) -> Result<()> {
+        log::debug!("removing executor: {}", executor_id);
+        {
+            let mut guard = self.available_vcores.lock().await;
+
+            guard.remove(executor_id);
+        }
+        self.executors.remove(executor_id);
+        self.heartbeats.remove(executor_id);
+
+        self.cluster_event_sender
+            .send(&ClusterStateEvent::RemovedExecutor {
+                executor_id: executor_id.to_string(),
+            });
+
+        Ok(())
+    }
+
+    fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat> {
+        self.heartbeats
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    fn get_executor_heartbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
+        self.heartbeats.get(executor_id).map(|r| r.value().clone())
+    }
+
+    async fn registered_executor_metadata(&self) -> Vec<ExecutorMetadata> {
+        self.executors.iter().map(|v| v.clone()).collect()
+    }
+
+    async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
+        Ok(Box::pin(self.cluster_event_sender.subscribe()))
+    }
+}
+
+#[cfg(test)]
+impl InMemoryClusterState {
+    /// Drop metadata for `executor_id` while leaving its available vcores.
+    ///
+    /// Simulates a transient miss from a non-memory [`ClusterState`] backend
+    /// after tasks have already been bound (see #2686).
+    pub(crate) fn drop_executor_metadata(&self, executor_id: &str) {
+        self.executors.remove(executor_id);
+    }
+}
+
+/// Implementation of `JobState` which keeps all state in memory. If using `InMemoryJobState`
+/// no job state will be shared between schedulers
+pub struct InMemoryJobState {
+    scheduler: String,
+    /// Jobs which have either completed successfully or failed
+    completed_jobs: DashMap<JobId, (JobStatus, Option<ExecutionGraphBox>)>,
+    /// In-memory store of queued jobs. Map from Job ID -> (Job Name, queued_at timestamp)
+    queued_jobs: DashMap<JobId, (String, u64)>,
+    /// In-memory store of running job statuses. Map from Job ID -> JobStatus
+    running_jobs: DashMap<JobId, ExtendedJobStatus>,
+    /// `SessionBuilder` for building DataFusion `SessionContext` from `BallistaConfig`
+    session_builder: SessionBuilder,
+    /// Sender of job events
+    job_event_sender: ClusterEventSender<JobStateEvent>,
+    /// Config producer
+    config_producer: ConfigProducer,
+}
+
+impl InMemoryJobState {
+    /// Creates a new in-memory job state with the given scheduler ID and session builder.
+    pub fn new(
+        scheduler: impl Into<String>,
+        session_builder: SessionBuilder,
+        config_producer: ConfigProducer,
+    ) -> Self {
+        Self {
+            scheduler: scheduler.into(),
+            completed_jobs: Default::default(),
+            queued_jobs: Default::default(),
+            running_jobs: Default::default(),
+            //sessions: Default::default(),
+            session_builder,
+            job_event_sender: ClusterEventSender::new(100),
+            config_producer,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ExtendedJobStatus {
+    status: JobStatus,
+    subscriber: Option<JobStatusSubscriber>,
+}
+
+impl ExtendedJobStatus {
+    fn update_subscribers(&self, status: JobStatus) {
+        let job_id = status.job_id.clone();
+        if let Some(subscriber) = &self.subscriber
+            && matches!(subscriber.try_send(status), Err(TrySendError::Full(_)))
+        {
+            // to be considered if we need another task to try to push this notification
+            // at the moment, it does not look as necessary as, buffer should be big enough for all cases
+            error!(
+                "jobs notification subscriber for job {} is blocked, can't deliver status update, job notification will be missed",
+                job_id
+            )
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl JobState for InMemoryJobState {
+    async fn submit_job(
+        &self,
+        job_id: JobId,
+        graph: &ExecutionGraphBox,
+        subscriber: Option<JobStatusSubscriber>,
+    ) -> Result<()> {
+        if self.queued_jobs.get(&job_id).is_some() {
+            let status = ExtendedJobStatus {
+                status: graph.status().clone(),
+                subscriber,
+            };
+            self.running_jobs.insert(job_id.clone(), status);
+            self.queued_jobs.remove(&job_id);
+
+            self.job_event_sender.send(&JobStateEvent::JobAcquired {
+                job_id,
+                owner: self.scheduler.clone(),
+            });
+
+            Ok(())
+        } else {
+            Err(BallistaError::Internal(format!(
+                "Failed to submit job {job_id}, not found in queued jobs"
+            )))
+        }
+    }
+
+    async fn get_job_status(&self, job_id: &JobId) -> Result<Option<JobStatus>> {
+        if let Some((job_name, queued_at)) = self.queued_jobs.get(job_id).as_deref() {
+            return Ok(Some(JobStatus {
+                job_id: job_id.to_owned().into(),
+                job_name: job_name.to_owned(),
+                status: Some(Status::Queued(QueuedJob {
+                    queued_at: *queued_at,
+                })),
+            }));
+        }
+
+        if let Some(status) = self.running_jobs.get(job_id).as_deref().cloned() {
+            return Ok(Some(status.status));
+        }
+
+        if let Some((status, _)) = self.completed_jobs.get(job_id).as_deref() {
+            return Ok(Some(status.clone()));
+        }
+
+        Ok(None)
+    }
+
+    async fn get_execution_graph(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<ExecutionGraphBox>> {
+        Ok(self
+            .completed_jobs
+            .get(job_id)
+            .as_deref()
+            .and_then(|(_, graph)| graph.as_ref().map(|e| e.cloned())))
+    }
+
+    async fn try_acquire_job(
+        &self,
+        _job_id: &JobId,
+    ) -> Result<Option<ExecutionGraphBox>> {
+        // Always return None. The only state stored here are for completed jobs
+        // which cannot be acquired
+        Ok(None)
+    }
+
+    async fn save_job(&self, job_id: &JobId, graph: &ExecutionGraphBox) -> Result<()> {
+        let status = graph.status().clone();
+        // If job is either successful or failed, save to completed jobs
+        if matches!(
+            status.status,
+            Some(Status::Successful(_)) | Some(Status::Failed(_))
+        ) {
+            if let Some((_, job_info)) = self.running_jobs.remove(job_id) {
+                job_info.update_subscribers(status.clone());
+            }
+
+            self.completed_jobs
+                .insert(job_id.to_owned(), (status.clone(), Some(graph.cloned())));
+        } else {
+            // otherwise update running job
+            if let Some(mut job_info) = self.running_jobs.get_mut(job_id) {
+                job_info.status = status.clone();
+                // we're cloning subscriber not to await in lock
+                job_info.update_subscribers(status.clone());
+            } else {
+                Err(BallistaError::Internal(format!(
+                    "scheduler state can't find job: {}",
+                    job_id
+                )))?
+            };
+        }
+
+        // job change event emitted
+        // it is emitting current job status
+        self.job_event_sender.send(&JobStateEvent::JobUpdated {
+            job_id: job_id.to_owned(),
+            status,
+        });
+
+        Ok(())
+    }
+
+    async fn create_or_update_session(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+    ) -> Result<Arc<SessionContext>> {
+        self.job_event_sender.send(&JobStateEvent::SessionAccessed {
+            session_id: session_id.to_string(),
+        });
+
+        Ok(create_datafusion_context(
+            config,
+            self.session_builder.clone(),
+        )?)
+    }
+
+    async fn remove_session(&self, session_id: &str) -> Result<()> {
+        self.job_event_sender.send(&JobStateEvent::SessionRemoved {
+            session_id: session_id.to_string(),
+        });
+
+        Ok(())
+    }
+
+    async fn job_state_events(&self) -> Result<JobStateEventStream> {
+        Ok(Box::pin(self.job_event_sender.subscribe()))
+    }
+
+    async fn remove_job(&self, job_id: &JobId) -> Result<()> {
+        if self.completed_jobs.remove(job_id).is_none() {
+            warn!("Tried to delete non-existent job {job_id} from state");
+        }
+        Ok(())
+    }
+
+    async fn get_jobs(&self) -> Result<HashSet<JobId>> {
+        Ok(self
+            .completed_jobs
+            .iter()
+            .map(|pair| pair.key().clone())
+            .collect())
+    }
+
+    async fn get_all_jobs(&self) -> Result<HashSet<JobId>> {
+        let mut all_jobs: HashSet<JobId> = self
+            .queued_jobs
+            .iter()
+            .map(|pair| pair.key().clone())
+            .collect();
+        all_jobs.extend(self.running_jobs.iter().map(|pair| pair.key().clone()));
+        all_jobs.extend(self.completed_jobs.iter().map(|pair| pair.key().clone()));
+        Ok(all_jobs)
+    }
+
+    fn accept_job(&self, job_id: &JobId, job_name: &str, queued_at: u64) -> Result<()> {
+        self.queued_jobs
+            .insert(job_id.to_owned(), (job_name.to_owned(), queued_at));
+
+        Ok(())
+    }
+
+    fn pending_job_number(&self) -> usize {
+        self.queued_jobs.len()
+    }
+
+    async fn fail_unscheduled_job(&self, job_id: &JobId, reason: String) -> Result<()> {
+        if let Some((job_id, (job_name, queued_at))) = self.queued_jobs.remove(job_id) {
+            let status = JobStatus {
+                job_id: job_id.clone().into(),
+                job_name,
+                status: Some(Status::Failed(FailedJob {
+                    error: reason,
+                    queued_at,
+                    started_at: 0,
+                    ended_at: timestamp_millis(),
+                })),
+            };
+            self.completed_jobs
+                .insert(job_id.clone(), (status.clone(), None));
+            self.job_event_sender
+                .send(&JobStateEvent::JobUpdated { job_id, status });
+
+            Ok(())
+        } else {
+            Err(BallistaError::Internal(format!(
+                "Could not fail unscheduler job {job_id}, job not found in queued jobs"
+            )))
+        }
+    }
+
+    fn produce_config(&self) -> SessionConfig {
+        (self.config_producer)()
+    }
+}
+
+/// In-memory [`CacheState`] backend — the only implementation today.
+///
+/// A thin async wrapper over the synchronous, unit-tested `CacheRegistry`,
+/// mirroring how [`InMemoryJobState`] wraps its maps. A durable backend would be
+/// a sibling type implementing [`CacheState`] whose `init` loads persisted
+/// entries; no caller changes needed.
+#[derive(Debug, Default)]
+pub struct InMemoryCacheState {
+    registry: CacheRegistry,
+}
+
+#[async_trait::async_trait]
+impl CacheState for InMemoryCacheState {
+    async fn lookup(&self, key: &CacheKey) -> Result<Option<MaterializedCache>> {
+        Ok(self.registry.lookup(key))
+    }
+
+    async fn begin_materialization(
+        &self,
+        key: CacheKey,
+        job_id: JobId,
+    ) -> Result<BeginOutcome> {
+        Ok(self.registry.begin_materialization(key, job_id))
+    }
+
+    async fn complete_materialization(
+        &self,
+        key: CacheKey,
+        job_id: JobId,
+        schema: SchemaRef,
+        locations: Vec<Vec<PartitionLocation>>,
+    ) -> Result<CompleteOutcome> {
+        Ok(self
+            .registry
+            .complete_materialization(key, job_id, schema, locations))
+    }
+
+    async fn pending_job(&self, key: &CacheKey) -> Result<Option<JobId>> {
+        Ok(self.registry.pending_job(key))
+    }
+
+    async fn invalidate_if(
+        &self,
+        key: &CacheKey,
+        materializing_job: &JobId,
+    ) -> Result<Option<MaterializedCache>> {
+        Ok(self.registry.invalidate_if(key, materializing_job))
+    }
+
+    async fn abort_materialization(
+        &self,
+        key: &CacheKey,
+        job_id: &JobId,
+    ) -> Result<bool> {
+        Ok(self.registry.abort_materialization(key, job_id))
+    }
+
+    async fn invalidate(&self, key: &CacheKey) -> Result<Option<MaterializedCache>> {
+        Ok(self.registry.invalidate(key))
+    }
+
+    async fn invalidate_executor(
+        &self,
+        executor_id: &str,
+    ) -> Result<Vec<(CacheKey, MaterializedCache)>> {
+        Ok(self.registry.invalidate_executor(executor_id))
+    }
+
+    async fn remove_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(CacheKey, MaterializedCache)>> {
+        Ok(self.registry.remove_session(session_id))
+    }
+
+    async fn pinned_stages(&self) -> Result<HashSet<(JobId, usize)>> {
+        Ok(self.registry.pinned_stages())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use crate::cluster::memory::{
+        InMemoryCacheState, InMemoryClusterState, InMemoryJobState,
+    };
+    use crate::cluster::test_util::{test_job_lifecycle, test_job_planning_failure};
+    use crate::cluster::{
+        BallistaCluster, CacheState, ClusterState, ClusterStateEvent, JobState,
+        JobStateEvent,
+    };
+    use crate::state::cache_registry::{BeginOutcome, CacheKey};
+    use crate::test_utils::{
+        test_aggregation_plan, test_join_plan, test_two_aggregations_plan,
+    };
+    use ballista_core::JobId;
+    use ballista_core::config::BALLISTA_SCHEDULER_SHARE_FILE_STATISTICS_CACHE;
+    use ballista_core::error::Result;
+    use ballista_core::serde::protobuf::JobStatus;
+    use ballista_core::serde::scheduler::{
+        ExecutorData, ExecutorMetadata, ExecutorOperatingSystemSpecification,
+        ExecutorSpecification,
+    };
+    use ballista_core::utils::{default_config_producer, default_session_builder};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::dataframe::DataFrameWriteOptions;
+    use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+    use futures::StreamExt;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn test_in_memory_job_lifecycle() -> Result<()> {
+        test_job_lifecycle(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_aggregation_plan(4).await),
+        )
+        .await?;
+        test_job_lifecycle(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_two_aggregations_plan(4).await),
+        )
+        .await?;
+        test_job_lifecycle(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_join_plan(4).await),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_job_planning_failure() -> Result<()> {
+        test_job_planning_failure(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_aggregation_plan(4).await),
+        )
+        .await?;
+        test_job_planning_failure(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_two_aggregations_plan(4).await),
+        )
+        .await?;
+        test_job_planning_failure(
+            InMemoryJobState::new(
+                "",
+                Arc::new(default_session_builder),
+                Arc::new(default_config_producer),
+            ),
+            Box::new(test_join_plan(4).await),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_job_planning_failure_notification() -> Result<()> {
+        let state = InMemoryJobState::new(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        );
+        let mut events = state.job_state_events().await?;
+        let job_id = JobId::from("job-1");
+
+        state.accept_job(&job_id, "", 0)?;
+        state
+            .fail_unscheduled_job(&job_id, "failed planning".to_owned())
+            .await?;
+
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.next())
+                .await
+                .expect("job state event should arrive")
+                .expect("job state event stream should remain open");
+
+        assert!(matches!(
+            event,
+            JobStateEvent::JobUpdated {
+                job_id: event_job_id,
+                status: JobStatus {
+                    status: Some(ballista_core::serde::protobuf::job_status::Status::Failed(_)),
+                    ..
+                },
+            } if event_job_id == job_id
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_job_notification() -> Result<()> {
+        let state = InMemoryJobState::new(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        );
+
+        let event_stream = state.job_state_events().await?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let events = tokio::spawn({
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                event_stream.collect::<Vec<JobStateEvent>>().await
+            }
+        });
+
+        barrier.wait().await;
+        test_job_lifecycle(state, Box::new(test_aggregation_plan(4).await)).await?;
+        let result = events.await?;
+        assert_eq!(2, result.len());
+        match result.last().unwrap() {
+            JobStateEvent::JobUpdated {
+                status:
+                    JobStatus {
+                        status: Some(ballista_core::serde::protobuf::job_status::Status::Successful(_)),
+                        ..
+                    },
+                ..
+            } => (), // assert!(true, "Last status should be successful job notification"),
+            _ => panic!("JobUpdated status expected"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_cluster_notification() -> Result<()> {
+        let cluster_state = InMemoryClusterState::default();
+
+        let mut event_stream = cluster_state.cluster_state_events().await?;
+
+        let metadata = ExecutorMetadata {
+            id: "id123".to_string(),
+            host: "".to_string(),
+            port: 50055,
+            grpc_port: 50050,
+            specification: ExecutorSpecification::default().with_vcores(2),
+            os_info: ExecutorOperatingSystemSpecification::default(),
+        };
+
+        cluster_state
+            .save_executor_metadata(metadata.clone())
+            .await?;
+        let event = event_stream.next().await;
+
+        assert!(matches!(
+            event,
+            Some(
+                ClusterStateEvent::RegisteredExecutor {
+                executor_id
+            }) if executor_id == *"id123",
+
+        ));
+
+        // event should not be emitted as executor is already registered
+        cluster_state
+            .save_executor_metadata(metadata.clone())
+            .await?;
+
+        cluster_state.remove_executor("id123").await?;
+        let event = event_stream.next().await;
+
+        assert!(matches!(
+            event,
+            Some(
+                ClusterStateEvent::RemovedExecutor {
+                executor_id
+            }) if executor_id == *"id123",
+
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_executor_rejects_duplicate_id() -> Result<()> {
+        let cluster_state = InMemoryClusterState::default();
+
+        let metadata = ExecutorMetadata {
+            id: "id123".to_string(),
+            host: "executor-a".to_string(),
+            port: 50055,
+            grpc_port: 50050,
+            specification: ExecutorSpecification::default().with_vcores(2),
+            os_info: ExecutorOperatingSystemSpecification::default(),
+        };
+        let executor_data = ExecutorData {
+            executor_id: metadata.id.clone(),
+            total_vcores: 2,
+            available_vcores: 2,
+        };
+
+        cluster_state
+            .register_executor(metadata.clone(), executor_data.clone())
+            .await?;
+
+        let err = cluster_state
+            .register_executor(metadata.clone(), executor_data)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("id123 is already registered"));
+        assert_eq!(
+            cluster_state.get_executor_metadata("id123").await?,
+            metadata
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_executor_metadata_rejects_duplicate_id() -> Result<()> {
+        let cluster_state = InMemoryClusterState::default();
+
+        let metadata = ExecutorMetadata {
+            id: "id123".to_string(),
+            host: "executor-a".to_string(),
+            port: 50055,
+            grpc_port: 50050,
+            specification: ExecutorSpecification::default().with_vcores(2),
+            os_info: ExecutorOperatingSystemSpecification::default(),
+        };
+
+        cluster_state
+            .save_executor_metadata(metadata.clone())
+            .await?;
+        cluster_state
+            .save_executor_metadata(metadata.clone())
+            .await?;
+
+        let mut duplicate = metadata.clone();
+        duplicate.host = "executor-b".to_string();
+
+        let err = cluster_state
+            .save_executor_metadata(duplicate)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("id123 is already registered"));
+        assert_eq!(
+            cluster_state.get_executor_metadata("id123").await?,
+            metadata
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_session_notification() -> Result<()> {
+        let state = InMemoryJobState::new(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        );
+
+        let event_stream = state.job_state_events().await?;
+
+        state
+            .create_or_update_session("session_id_0", &SessionConfig::new())
+            .await?;
+
+        state.remove_session("session_id_0").await?;
+
+        state
+            .create_or_update_session("session_id_1", &SessionConfig::new())
+            .await?;
+
+        let result = event_stream.take(3).collect::<Vec<JobStateEvent>>().await;
+        assert_eq!(3, result.len());
+        let expected = vec![
+            JobStateEvent::SessionAccessed {
+                session_id: "session_id_0".to_string(),
+            },
+            JobStateEvent::SessionRemoved {
+                session_id: "session_id_0".to_string(),
+            },
+            JobStateEvent::SessionAccessed {
+                session_id: "session_id_1".to_string(),
+            },
+        ];
+
+        assert_eq!(expected, result);
+
+        Ok(())
+    }
+
+    /// Every query gets a new session, so planning a scan only avoids
+    /// re-reading file footers if statistics outlive the session that
+    /// collected them.
+    #[tokio::test]
+    async fn test_in_memory_sessions_share_file_statistics() -> Result<()> {
+        let state = BallistaCluster::new_memory(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )
+        .job_state();
+        let config = SessionConfig::new();
+
+        let caches = |ctx: &SessionContext| {
+            let cache_manager = &ctx.runtime_env().cache_manager;
+            (
+                cache_manager.get_file_statistic_cache().unwrap(),
+                cache_manager.get_list_files_cache().unwrap(),
+            )
+        };
+        let first = state.create_or_update_session("session_0", &config).await?;
+        let second = state.create_or_update_session("session_1", &config).await?;
+        let (stats_0, list_0) = caches(&first);
+        let (stats_1, list_1) = caches(&second);
+
+        assert!(Arc::ptr_eq(&stats_0, &stats_1));
+        // Each job lists the files itself, so that cached statistics are
+        // checked against the files as they are now.
+        assert!(!Arc::ptr_eq(&list_0, &list_1));
+
+        Ok(())
+    }
+
+    /// A session that turns sharing off keeps a statistics cache of its own,
+    /// and the sessions that share do not get it.
+    #[tokio::test]
+    async fn test_in_memory_sessions_opt_out_of_shared_file_statistics() -> Result<()> {
+        let state = BallistaCluster::new_memory(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )
+        .job_state();
+        let opted_out = default_config_producer()
+            .set_bool(BALLISTA_SCHEDULER_SHARE_FILE_STATISTICS_CACHE, false);
+        let shared = default_config_producer();
+
+        let stats = |ctx: &SessionContext| {
+            ctx.runtime_env()
+                .cache_manager
+                .get_file_statistic_cache()
+                .unwrap()
+        };
+        // Built first, so its cache would become the shared one if it took part.
+        let own = state
+            .create_or_update_session("session_0", &opted_out)
+            .await?;
+        let first = state.create_or_update_session("session_1", &shared).await?;
+        let second = state.create_or_update_session("session_2", &shared).await?;
+
+        assert!(!Arc::ptr_eq(&stats(&own), &stats(&first)));
+        assert!(Arc::ptr_eq(&stats(&first), &stats(&second)));
+
+        Ok(())
+    }
+
+    /// Shared statistics must not outlive the file they describe: `COUNT(*)`
+    /// is answered from exact statistics, so stale ones give a wrong result.
+    #[tokio::test]
+    async fn test_in_memory_sessions_reread_changed_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("part-0.parquet");
+        // Given up front, as it is in a plan the scheduler decodes, so no file
+        // is read to infer it.
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+
+        let state = BallistaCluster::new_memory(
+            "",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        )
+        .job_state();
+        let config = default_config_producer().with_collect_statistics(true);
+
+        for (session_id, rows) in [("session_0", 1), ("session_1", 2)] {
+            SessionContext::new()
+                .sql(&format!(
+                    "SELECT value AS a FROM generate_series(1, {rows})"
+                ))
+                .await?
+                .write_parquet(file.to_str().unwrap(), DataFrameWriteOptions::new(), None)
+                .await?;
+
+            let ctx = state.create_or_update_session(session_id, &config).await?;
+            ctx.register_parquet(
+                "t",
+                dir.path().to_str().unwrap(),
+                ParquetReadOptions::default().schema(&schema),
+            )
+            .await?;
+            assert_eq!(rows, ctx.table("t").await?.count().await?);
+        }
+
+        Ok(())
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    // The registry logic is covered in state::cache_registry; these just prove
+    // the async backend delegates and that the cluster wires it up.
+
+    #[tokio::test]
+    async fn backend_delegates_miss_hit_invalidate() {
+        let state = InMemoryCacheState::default();
+        let key = CacheKey::new("s1", "c1");
+
+        assert!(state.lookup(&key).await.unwrap().is_none());
+        let claimed = state.begin_materialization(key.clone(), "j".into()).await;
+        assert_eq!(claimed.unwrap(), BeginOutcome::Claimed);
+        assert!(state.lookup(&key).await.unwrap().is_none()); // still pending
+
+        state
+            .complete_materialization(key.clone(), "j".into(), schema(), vec![])
+            .await
+            .unwrap();
+        assert!(state.lookup(&key).await.unwrap().is_some());
+
+        state.invalidate(&key).await.unwrap();
+        assert!(state.lookup(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cluster_exposes_cache_state() {
+        let cluster = BallistaCluster::new_memory(
+            "localhost:50050",
+            Arc::new(default_session_builder),
+            Arc::new(default_config_producer),
+        );
+        let key = CacheKey::new("s1", "c1");
+        let cache = cluster.cache_state();
+        cache
+            .begin_materialization(key.clone(), "j".into())
+            .await
+            .unwrap();
+        cache
+            .complete_materialization(key.clone(), "j".into(), schema(), vec![])
+            .await
+            .unwrap();
+        assert!(cache.lookup(&key).await.unwrap().is_some());
+    }
+}

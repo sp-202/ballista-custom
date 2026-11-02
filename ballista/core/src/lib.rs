@@ -1,0 +1,135 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+
+use std::sync::Arc;
+
+use datafusion::{execution::runtime_env::RuntimeEnv, prelude::SessionConfig};
+
+use crate::serde::protobuf::JobStatus;
+
+pub use crate::ids::JobId;
+
+/// The current version of Ballista, derived from the Cargo package version.
+pub const BALLISTA_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Wire-protocol version negotiated between scheduler and executor.
+///
+/// The scheduler compares this against `ExecutorRegistration.ballista_protocol_version`
+/// on every registration and heartbeat; mismatched executors are rejected with
+/// `Status::failed_precondition` and never receive work. Bump this on any release
+/// that changes the executor↔scheduler wire format (proto shape, task/plan
+/// encoding, launch/heartbeat semantics). Most releases will not bump it.
+///
+/// Zero is reserved as the proto-default "unset" value, produced by executors
+/// that predate this field — it never matches a real scheduler version.
+///
+/// Clients are not covered by this check. They are checked by major version
+/// instead (see [`crate::version`]), so a change that also reaches clients,
+/// such as the shuffle fetch they use to read results, must keep working for
+/// older clients of the same major version.
+pub const BALLISTA_PROTOCOL_VERSION: u32 = 3;
+
+/// Prints the current Ballista version to stdout.
+pub fn print_version() {
+    println!("Ballista version: {BALLISTA_VERSION}")
+}
+
+/// Asserts an indented physical plan against an inline snapshot.
+///
+/// Keeping plan assertions behind one macro makes plan changes easier to
+/// review and update consistently across Ballista crates.
+#[macro_export]
+macro_rules! assert_plan {
+    ($plan:expr, @ $expected_lines:literal $(,)?) => {{
+        let plan = datafusion::physical_plan::displayable($plan)
+            .indent(true)
+            .to_string();
+        let actual_lines = plan.trim();
+
+        insta::assert_snapshot!(actual_lines, @ $expected_lines);
+    }};
+}
+
+/// Client utilities for connecting to Ballista schedulers.
+pub mod client;
+/// Connection pool for reusing `BallistaClient` instances across requests.
+pub mod client_pool;
+/// Configuration options and settings for Ballista components.
+pub mod config;
+/// Error types and result definitions for Ballista operations.
+pub mod error;
+/// Event loop infrastructure for asynchronous message processing.
+pub mod event_loop;
+/// Physical execution plans for distributed query processing.
+pub mod execution_plans;
+/// Extension traits and utilities for DataFusion integration.
+pub mod extension;
+/// Arrow Flight service which proxies partition fetches to executors.
+pub mod flight_proxy_service;
+/// Strongly-typed string identifiers (job ids, job names, ...).
+pub mod ids;
+/// KLL quantile sketch (Karnin-Lang-Liberty), generic over `Ord` items.
+pub mod kll;
+#[cfg(feature = "build-binary")]
+/// Object store configuration and utilities for distributed file access.
+pub mod object_store;
+/// Ballista-specific logical optimizer rules.
+pub mod optimizer;
+/// Query planning utilities for distributed execution.
+pub mod planner;
+/// Runtime registry for codec and function registration.
+pub mod registry;
+/// Serialization and deserialization for Ballista messages and plans.
+pub mod serde;
+/// Serves partition fetches over Arrow Flight.
+pub mod serving;
+/// Graceful shutdown coordination for long-running server components.
+pub mod shutdown;
+/// Quantile sketching of a fixed-width `ORDER BY` key, NULLs included.
+pub mod sort_key;
+/// Shared test and benchmark fixtures, such as the TPC-H table schemas.
+pub mod test_utils;
+/// General utility functions for Ballista operations.
+pub mod utils;
+/// Version checks between Ballista clients and schedulers.
+pub mod version;
+
+///
+/// [RuntimeProducer] is a factory which creates runtime [RuntimeEnv]
+/// from [SessionConfig]. As [SessionConfig] will be propagated
+/// from client to executors, this provides possibility to
+/// create [RuntimeEnv] components and configure them according to
+/// [SessionConfig] or some of its config extension
+///
+/// It is intended to be used with executor configuration
+///
+pub type RuntimeProducer = Arc<
+    dyn Fn(&SessionConfig) -> datafusion::error::Result<Arc<RuntimeEnv>> + Send + Sync,
+>;
+///
+/// [ConfigProducer] is a factory which can create [SessionConfig], with
+/// additional extension or configuration codecs
+///
+/// It is intended to be used with executor configuration
+///
+pub type ConfigProducer = Arc<dyn Fn() -> SessionConfig + Send + Sync>;
+
+/// Job Notification Subscriber
+pub type JobStatusSubscriber = tokio::sync::mpsc::Sender<JobStatus>;
