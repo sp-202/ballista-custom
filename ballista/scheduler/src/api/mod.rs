@@ -29,6 +29,14 @@ pub use openapi::{ApiDoc, openapi_spec};
 #[cfg(feature = "rest-api")]
 pub use routes::{get_routes, get_web_ui_routes};
 
+/// The built-in web UI's page and static assets, served at `/`.
+///
+/// For a server that already serves the `/api` routes the UI reads and has no use for the
+/// scheduler's state, such as the history server.
+pub fn web_ui_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    ui::routes("/")
+}
+
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use http::StatusCode;

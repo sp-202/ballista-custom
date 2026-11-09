@@ -1,5 +1,6 @@
 mod config;
 mod debug;
+pub mod engine_conf;
 pub mod entrypoint;
 mod error;
 mod executor;

@@ -184,6 +184,10 @@ mod tests {
             num_stages: 1,
             completed_stages: 1,
             percent_complete: 100,
+            session_id: String::new(),
+            user: String::new(),
+            app_id: String::new(),
+            app_name: String::new(),
         }
     }
 

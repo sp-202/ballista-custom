@@ -114,6 +114,8 @@ pub struct HistoryStore {
     /// The event-log directory this store indexes.
     dir: PathBuf,
     index: RwLock<Index>,
+    /// When the directory was last scanned, in milliseconds since the epoch.
+    last_refresh_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Why reading one job's stored payload back produced nothing.
@@ -157,6 +159,7 @@ impl HistoryStore {
         let store = HistoryStore {
             dir: dir.to_path_buf(),
             index: RwLock::new(Index::default()),
+            last_refresh_ms: std::sync::atomic::AtomicU64::new(0),
         };
         store.refresh()?;
         Ok(store)
@@ -174,6 +177,13 @@ impl HistoryStore {
     /// worker.
     pub fn refresh(&self) -> std::io::Result<RefreshStats> {
         let found = self.scan_dir()?;
+        self.last_refresh_ms.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // Work out what needs reading under a read lock, then do the reading
         // with the lock released: parsing a log is orders of magnitude slower
@@ -331,6 +341,22 @@ impl HistoryStore {
     }
 
     /// Every indexed job's summary, in no particular order.
+    /// The event logs of the jobs of one application, oldest job first. Logs written before
+    /// applications existed belong to the application named after their session id.
+    fn app_log_paths(&self, app_id: &str) -> Vec<PathBuf> {
+        let index = self.read_index();
+        let mut jobs: Vec<&JobEntry> = index
+            .jobs
+            .values()
+            .filter(|e| {
+                e.index.app_id == app_id
+                    || (e.index.app_id.is_empty() && e.index.session_id == app_id)
+            })
+            .collect();
+        jobs.sort_by_key(|e| e.index.start_time);
+        jobs.into_iter().map(|e| e.path.clone()).collect()
+    }
+
     fn summaries(&self) -> Vec<JobIndex> {
         self.read_index()
             .jobs
@@ -438,6 +464,8 @@ pub fn history_router(store: Arc<HistoryStore>) -> Router {
         .route("/api/job/{job_id}/dot", get(get_dot))
         .route("/api/executors", get(get_executors_empty))
         .route("/api/state", get(get_state))
+        .route("/api/history", get(get_history_info))
+        .route("/api/history/app/{app_id}/log", get(get_app_log))
         .with_state(store)
 }
 
@@ -458,6 +486,10 @@ fn list_entry(index: &JobIndex) -> JobResponse {
         percent_complete: index.percent_complete,
         start_time: index.start_time,
         end_time: index.end_time,
+        session_id: index.session_id.clone(),
+        user: index.user.clone(),
+        app_id: if index.app_id.is_empty() { index.session_id.clone() } else { index.app_id.clone() },
+        app_name: index.app_name.clone(),
         logical_plan: None,
         physical_plan: None,
         stage_plan: None,
@@ -533,6 +565,52 @@ async fn get_executors_empty() -> Json<Vec<()>> {
     Json(vec![])
 }
 
+/// `GET /api/history/app/{app_id}/log`: the application's event logs, one job after another, as
+/// a download named `<app_id>.eventlog` (Spark's "Event Log" column).
+async fn get_app_log(
+    State(store): State<Arc<HistoryStore>>,
+    axum::extract::Path(app_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let paths = store.app_log_paths(&app_id);
+    if paths.is_empty() {
+        return (axum::http::StatusCode::NOT_FOUND, "no such application").into_response();
+    }
+    let mut body = Vec::new();
+    for path in paths {
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                body.extend_from_slice(&bytes);
+                if !bytes.ends_with(b"\n") {
+                    body.push(b'\n');
+                }
+            }
+            Err(e) => log::warn!("could not read {}: {e}", path.display()),
+        }
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{app_id}.eventlog\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `GET /api/history`: where the logs are read from and when the directory was last scanned.
+/// The history UI shows it on its application list, like Spark's "Event log directory" line.
+async fn get_history_info(State(store): State<Arc<HistoryStore>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "event_log_dir": store.dir.display().to_string(),
+        "jobs": store.len(),
+        "last_updated": store.last_refresh_ms.load(std::sync::atomic::Ordering::Relaxed),
+    }))
+}
+
 /// Static `/api/state` payload. The history server has no live scheduler
 /// process behind it, so every field that would normally reflect runtime
 /// state (uptime, feature flags, scheduling policy) is a fixed placeholder.
@@ -581,6 +659,10 @@ mod tests {
             num_stages: 1,
             completed_stages: 1,
             percent_complete: 100,
+            session_id: String::new(),
+            user: String::new(),
+            app_id: String::new(),
+            app_name: String::new(),
             start_time,
             end_time: start_time + 1,
             logical_plan: Some("Projection".into()),
@@ -611,6 +693,10 @@ mod tests {
                 num_stages: 1,
                 completed_stages: 1,
                 percent_complete: 100,
+                session_id: String::new(),
+                user: String::new(),
+                app_id: String::new(),
+                app_name: String::new(),
             },
             job: serde_json::value::to_raw_value(&job).unwrap(),
             stages: serde_json::value::to_raw_value(&stages).unwrap(),

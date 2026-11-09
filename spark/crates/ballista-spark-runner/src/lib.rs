@@ -26,7 +26,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning, displayable, execute_stream};
 use datafusion::prelude::SessionContext;
 use sail_common::actor::ActorSystem;
-use sail_common_datafusion::session::job::JobRunner;
+use sail_common_datafusion::session::job::{JobRunner, current_job_meta};
 use sail_physical_plan::coalesce::CoalesceExec;
 use sail_physical_plan::repartition::ExplicitRepartitionExec;
 use sail_session::error::SessionResult;
@@ -57,7 +57,23 @@ impl JobRunner for BallistaJobRunner {
         ctx: &SessionContext,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Result<SendableRecordBatchStream> {
-        let session_config = ctx.copied_config();
+        let mut session_config = ctx.copied_config();
+        // Name the job after the query and record who ran it, so the scheduler's UI and
+        // history server can show them.
+        if let Some(meta) = current_job_meta() {
+            let options = session_config.options_mut();
+            for (key, value) in [
+                ("ballista.job.name", &meta.description),
+                ("ballista.client.user", &meta.user),
+                ("ballista.client.app_name", &meta.app_name),
+            ] {
+                if !value.is_empty()
+                    && let Err(e) = options.set(key, value)
+                {
+                    log::debug!("could not set {key}: {e}");
+                }
+            }
+        }
         let plan = round_robin_as_repartition(plan)?;
         if placement::has_driver_stage(&plan) {
             let local = placement::place(plan, &self.submitter, &session_config)?;

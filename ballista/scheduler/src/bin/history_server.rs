@@ -17,7 +17,7 @@
 
 //! Standalone Ballista history server binary: loads completed event logs from
 //! a directory and serves the same `/api/*` responses the live scheduler does,
-//! so the existing TUI can connect to it unchanged.
+//! so the existing TUI can connect to it unchanged. It also serves the web UI at `/`.
 
 use ballista_core::error::{BallistaError, Result};
 use ballista_scheduler::history::{HistoryStore, history_router, spawn_refresh_task};
@@ -95,7 +95,8 @@ async fn serve(args: Args, store: Arc<HistoryStore>) -> Result<()> {
         );
     }
 
-    let app = history_router(store);
+    // The same web UI as the scheduler's, over the replayed `/api` responses.
+    let app = history_router(store).merge(ballista_scheduler::api::web_ui_assets());
 
     let addr: SocketAddr = format!("{}:{}", args.bind_host, args.bind_port)
         .parse()

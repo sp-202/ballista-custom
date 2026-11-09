@@ -772,6 +772,13 @@ impl AdaptiveExecutionGraph {
 }
 
 impl ExecutionGraph for AdaptiveExecutionGraph {
+    fn release_shuffle_locations(&mut self) {
+        self.stages
+            .values_mut()
+            .for_each(ExecutionStage::release_shuffle_locations);
+        self.planner.release_shuffle_locations();
+    }
+
     fn cloned(&self) -> ExecutionGraphBox {
         Box::new(self.clone())
     }

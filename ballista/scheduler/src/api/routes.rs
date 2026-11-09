@@ -28,6 +28,10 @@ fn api_router<
     let router = Router::new()
         .route("/api/openapi.json", get(openapi::get_openapi_spec))
         .route("/api/state", get(handlers::get_scheduler_state::<T, U>))
+        .route(
+            "/api/scheduler/config",
+            get(handlers::get_scheduler_config::<T, U>),
+        )
         .route("/api/version", get(handlers::get_scheduler_version))
         .route("/api/executors", get(handlers::get_executors::<T, U>))
         .route(

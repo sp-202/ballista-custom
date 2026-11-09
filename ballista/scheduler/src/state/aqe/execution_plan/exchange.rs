@@ -246,6 +246,18 @@ impl ExchangeExec {
         self.shuffle_partitions.lock().replace(partitions);
     }
 
+    /// Drops the partition locations kept for a finished job.
+    ///
+    /// Each location names a shuffle file on an executor. A shuffle of `N` map by `N`
+    /// reduce partitions has `N * N` of them, so a job's exchanges hold hundreds of MB
+    /// at 200 partitions. The partition count and the resolved state stay, so the plan
+    /// still prints and counts as before.
+    pub(crate) fn release_shuffle_partitions(&self) {
+        if let Some(partitions) = self.shuffle_partitions.lock().as_mut() {
+            partitions.iter_mut().for_each(|locations| *locations = Vec::new());
+        }
+    }
+
     /// Checks whether the shuffle partitions have been resolved.
     ///
     /// Returns `true` if partitions have been resolved, indicating that the current stage

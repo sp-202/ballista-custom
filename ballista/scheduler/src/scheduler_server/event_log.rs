@@ -159,7 +159,10 @@ fn job_end_event_inner(
     // Rendered as of `completed_at` rather than the wall clock, so the stored
     // record is a snapshot of the job at the moment it ended and replaying it
     // is deterministic.
-    let stages = graph_to_query_stages(graph, PlanFormat::Default, completed_at as u128);
+    // Stages are stored with `PlanFormat::Metrics`: each stage plan carries the
+    // DataFusion operator metrics (rows, spills, bytes scanned, pruning, ...), which
+    // are gone once the scheduler forgets the job and are what the history UI shows.
+    let stages = graph_to_query_stages(graph, PlanFormat::Metrics, completed_at as u128);
     let dot = build_job_dot(graph).unwrap_or_default();
     let config = session_config_to_job_config(graph.session_config().as_ref());
 
@@ -175,6 +178,10 @@ fn job_end_event_inner(
         num_stages: job.num_stages,
         completed_stages: job.completed_stages,
         percent_complete: job.percent_complete,
+        session_id: job.session_id.clone(),
+        user: job.user.clone(),
+        app_id: job.app_id.clone(),
+        app_name: job.app_name.clone(),
     };
 
     // Stored as raw JSON rather than typed, so the record stays readable when
@@ -437,7 +444,7 @@ mod tests {
         const COMPLETED_AT: u64 = 2;
         let live_job = graph_to_job_response(&graph, PlanFormat::Default);
         let live_stages =
-            graph_to_query_stages(&graph, PlanFormat::Default, COMPLETED_AT as u128);
+            graph_to_query_stages(&graph, PlanFormat::Metrics, COMPLETED_AT as u128);
 
         // Emit the same JobEnd the scheduler writes on completion, through the
         // real async writer, then load it back through the history server's own

@@ -30,6 +30,18 @@ use std::{collections::HashMap, fmt::Display};
 
 /// Configuration key for setting the job name displayed in the web UI.
 pub const BALLISTA_JOB_NAME: &str = "ballista.job.name";
+/// The id of the client session that submitted a job (a Spark Connect or Flight SQL session).
+/// The scheduler sets it on the job's session, and the UI groups jobs by it. It is not the
+/// scheduler's own per-query session id, which executors key their runtimes by.
+pub const BALLISTA_CLIENT_SESSION_ID: &str = "ballista.client.session_id";
+/// The user that submitted a job (for Spark Connect, the session's user id). Shown in the web UI
+/// and the history server.
+pub const BALLISTA_CLIENT_USER: &str = "ballista.client.user";
+/// The application a job belongs to: one client session, named like Spark's application ids
+/// (`app-20261109202025-0001`). Assigned by the scheduler when it first sees the session.
+pub const BALLISTA_APP_ID: &str = "ballista.app.id";
+/// The client's name for its application (for Spark Connect, `spark.app.name`).
+pub const BALLISTA_CLIENT_APP_NAME: &str = "ballista.client.app_name";
 /// Configuration key for standalone processing parallelism.
 pub const BALLISTA_STANDALONE_PARALLELISM: &str = "ballista.standalone.parallelism";
 /// Configuration key for the task scheduling policy of a standalone cluster.
@@ -286,6 +298,18 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
     let entries = vec![
         ConfigEntry::new(BALLISTA_JOB_NAME.to_string(),
                          "Sets the job name that will appear in the web user interface for any submitted jobs".to_string(),
+                         DataType::Utf8, None),
+        ConfigEntry::new(BALLISTA_CLIENT_SESSION_ID.to_string(),
+                         "The client session that submitted the job. Set by the scheduler; shown in the web user interface.".to_string(),
+                         DataType::Utf8, None),
+        ConfigEntry::new(BALLISTA_CLIENT_USER.to_string(),
+                         "The user that submitted the job; shown in the web user interface and the history server.".to_string(),
+                         DataType::Utf8, None),
+        ConfigEntry::new(BALLISTA_APP_ID.to_string(),
+                         "The application (client session) the job belongs to. Set by the scheduler.".to_string(),
+                         DataType::Utf8, None),
+        ConfigEntry::new(BALLISTA_CLIENT_APP_NAME.to_string(),
+                         "The client's name for its application, shown in the history server.".to_string(),
                          DataType::Utf8, None),
         ConfigEntry::new(BALLISTA_STANDALONE_PARALLELISM.to_string(),
                          "Number of vcores advertised by the standalone in-process executor.".to_string(),

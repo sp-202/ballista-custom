@@ -496,6 +496,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     status: job_status,
                     start_time,
                     end_time,
+                    session_id: String::new(),
+                    user: String::new(),
+                    app_id: String::new(),
+                    app_name: String::new(),
                     num_stages: 0,
                     completed_stages: 0,
                 });
@@ -704,7 +708,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         debug!("Moving job {job_id} from Active to Success");
 
         if let Some(graph) = self.get_active_execution_graph(job_id) {
-            let (snapshot, intermediate_stage_ids) = {
+            let (mut snapshot, intermediate_stage_ids) = {
                 let graph = graph.read().await;
                 if !graph.is_successful() {
                     error!("Job {job_id} has not finished and cannot be completed");
@@ -713,6 +717,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
                 (graph.cloned(), graph.intermediate_stage_ids())
             };
+            // The stored snapshot outlives the job for display; its shuffle file
+            // locations (N * N per shuffle) are only needed while the job runs.
+            snapshot.release_shuffle_locations();
 
             self.persist_terminal_and_evict(job_id, &snapshot).await?;
             Ok(intermediate_stage_ids)
@@ -1115,10 +1122,61 @@ pub struct JobOverview {
     pub start_time: u64,
     /// Timestamp when the job ended (0 if still running).
     pub end_time: u64,
+    /// Client session that submitted the job; empty if unknown.
+    pub session_id: String,
+    /// User that submitted the job; empty if unknown.
+    pub user: String,
+    /// Application (client session) the job belongs to, like Spark's application id.
+    pub app_id: String,
+    /// The client's name for its application; empty if it gave none.
+    pub app_name: String,
     /// Total number of stages in the job.
     pub num_stages: usize,
     /// Number of stages that have completed successfully.
     pub completed_stages: usize,
+}
+
+/// The client session that submitted a job, as recorded by the scheduler when it created the
+/// job's session; the scheduler's own per-query session id if none was recorded.
+pub(crate) fn client_session_id(graph: &ExecutionGraphBox) -> String {
+    graph
+        .session_config()
+        .to_props()
+        .get(ballista_core::config::BALLISTA_CLIENT_SESSION_ID)
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| graph.session_id().to_owned())
+}
+
+/// The user that submitted a job, as reported by the client; empty if none was.
+pub(crate) fn client_user(graph: &ExecutionGraphBox) -> String {
+    graph
+        .session_config()
+        .to_props()
+        .get(ballista_core::config::BALLISTA_CLIENT_USER)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The application a job belongs to; the client session id if the scheduler recorded none.
+pub(crate) fn client_app_id(graph: &ExecutionGraphBox) -> String {
+    graph
+        .session_config()
+        .to_props()
+        .get(ballista_core::config::BALLISTA_APP_ID)
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| client_session_id(graph))
+}
+
+/// The client's name for its application; empty if it gave none.
+pub(crate) fn client_app_name(graph: &ExecutionGraphBox) -> String {
+    graph
+        .session_config()
+        .to_props()
+        .get(ballista_core::config::BALLISTA_CLIENT_APP_NAME)
+        .cloned()
+        .unwrap_or_default()
 }
 
 impl From<&ExecutionGraphBox> for JobOverview {
@@ -1131,6 +1189,10 @@ impl From<&ExecutionGraphBox> for JobOverview {
             status: value.status().clone(),
             start_time: value.start_time(),
             end_time: value.end_time(),
+            session_id: client_session_id(value),
+            user: client_user(value),
+            app_id: client_app_id(value),
+            app_name: client_app_name(value),
             num_stages: value.stage_count(),
             completed_stages,
         }

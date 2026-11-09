@@ -301,6 +301,14 @@ pub trait ExecutionGraph: Debug {
 
     /// Clones execution graph
     fn cloned(&self) -> ExecutionGraphBox;
+
+    /// Drops the shuffle file locations that a job which has produced its output no
+    /// longer needs, keeping its plan, metrics and final output locations.
+    ///
+    /// Called on the snapshot that is stored for a finished job. Locations grow with
+    /// the square of the partition count, so keeping them for every finished job made
+    /// the scheduler's memory grow by hundreds of MB per query at 200 partitions.
+    fn release_shuffle_locations(&mut self) {}
 }
 
 /// [ExecutionGraph] implementation which generates

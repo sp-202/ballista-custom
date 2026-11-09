@@ -10,7 +10,7 @@ use futures::stream;
 use log::debug;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
-use sail_common_datafusion::session::job::JobService;
+use sail_common_datafusion::session::job::{JobMeta, JobService, with_job_meta};
 use sail_plan::resolve_and_execute_plan;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
@@ -153,8 +153,65 @@ pub(crate) async fn handle_execute_relation(
     relation: Relation,
     metadata: ExecutorMetadata,
 ) -> SparkResult<ExecutePlanResponseStream> {
+    let meta = job_meta(ctx, &relation)?;
     let plan = relation.try_into()?;
-    handle_execute_plan(ctx, plan, metadata, ExecutorMode::Query).await
+    with_job_meta(
+        meta,
+        handle_execute_plan(ctx, plan, metadata, ExecutorMode::Query),
+    )
+    .await
+}
+
+/// The description and user to record on the job that runs `relation`.
+fn job_meta(ctx: &SessionContext, relation: &Relation) -> SparkResult<JobMeta> {
+    let spark = ctx.extension::<SparkSession>()?;
+    Ok(JobMeta {
+        description: describe_relation(relation),
+        user: spark.user_id().to_string(),
+        app_name: spark
+            .get_config_option(vec!["spark.app.name".to_string()])
+            .ok()
+            .and_then(|pairs| pairs.into_iter().next())
+            .and_then(|pair| pair.value)
+            .unwrap_or_default(),
+    })
+}
+
+/// Longest query description kept; a job name travels to the scheduler and its UI.
+const MAX_DESCRIPTION_CHARS: usize = 4000;
+
+/// What to call the job that runs `relation`: its SQL text if it has any, otherwise the kind
+/// of DataFrame operation.
+fn describe_relation(relation: &Relation) -> String {
+    let debug = format!("{relation:?}");
+    let description = match sql_text(&debug) {
+        Some(sql) => sql,
+        None => {
+            let kind = relation.rel_type.as_ref().map(|t| format!("{t:?}")).unwrap_or_default();
+            let kind = kind.split(['(', ' ', '{']).next().unwrap_or("").to_string();
+            format!("DataFrame ({kind})")
+        }
+    };
+    description.chars().take(MAX_DESCRIPTION_CHARS).collect()
+}
+
+/// The first SQL query string inside the `Debug` output of a relation (`query: "..."`).
+fn sql_text(debug: &str) -> Option<String> {
+    let start = debug.find("query: \"")? + "query: \"".len();
+    let mut out = String::new();
+    let mut chars = debug[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
 }
 
 pub(crate) async fn handle_execute_register_function(
@@ -254,7 +311,12 @@ pub(crate) async fn handle_execute_sql_command(
                     }),
                 ))))
             });
-            handle_execute_plan(ctx, spec::Plan::Command(command), metadata, mode).await
+            let meta = job_meta(ctx, &relation)?;
+            with_job_meta(
+                meta,
+                handle_execute_plan(ctx, spec::Plan::Command(command), metadata, mode),
+            )
+            .await
         }
         spec::Plan::Query(_) => {
             let result = ExecutorBatch::SqlCommandResult(Box::new(SqlCommandResult {
@@ -729,4 +791,63 @@ pub(crate) async fn handle_execute_register_datasource(
         metadata.operation_id,
         Box::pin(stream::iter(output.into_iter().map(Ok))),
     ))
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+    use crate::spark::connect::Sql;
+
+    fn sql_relation(query: &str) -> Relation {
+        Relation {
+            common: None,
+            #[expect(deprecated)]
+            rel_type: Some(relation::RelType::Sql(Sql {
+                query: query.to_string(),
+                args: Default::default(),
+                pos_args: vec![],
+                named_arguments: Default::default(),
+                pos_arguments: vec![],
+            })),
+        }
+    }
+
+    #[test]
+    fn a_sql_relation_is_described_by_its_query() {
+        let relation = sql_relation("SELECT a,\n  \"b\" FROM t WHERE x = 'y'");
+        assert_eq!(
+            describe_relation(&relation),
+            "SELECT a,\n  \"b\" FROM t WHERE x = 'y'"
+        );
+    }
+
+    #[test]
+    fn a_relation_without_sql_is_described_by_its_kind() {
+        let relation = Relation {
+            common: None,
+            rel_type: Some(relation::RelType::Range(crate::spark::connect::Range {
+                start: Some(0),
+                end: 10,
+                step: 1,
+                num_partitions: None,
+            })),
+        };
+        assert_eq!(describe_relation(&relation), "DataFrame (Range)");
+    }
+
+    #[test]
+    fn a_long_query_is_cut() {
+        let relation = sql_relation(&"x".repeat(MAX_DESCRIPTION_CHARS + 500));
+        assert_eq!(describe_relation(&relation).chars().count(), MAX_DESCRIPTION_CHARS);
+    }
+
+    #[tokio::test]
+    async fn the_description_is_visible_only_inside_its_scope() {
+        use sail_common_datafusion::session::job::current_job_meta;
+        assert!(current_job_meta().is_none());
+        let meta = JobMeta { description: "SELECT 1".to_string(), user: "ada".to_string(), app_name: String::new() };
+        let seen = with_job_meta(meta, async { current_job_meta() }).await.unwrap();
+        assert_eq!((seen.description.as_str(), seen.user.as_str()), ("SELECT 1", "ada"));
+        assert!(current_job_meta().is_none());
+    }
 }

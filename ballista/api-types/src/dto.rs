@@ -45,6 +45,20 @@ pub struct JobResponse {
     pub start_time: u64,
     /// Timestamp when the job ended (0 if still running).
     pub end_time: u64,
+    /// The client session that submitted the job (a Spark Connect or Flight SQL
+    /// session id). Empty when the scheduler does not know it.
+    #[serde(default)]
+    pub session_id: String,
+    /// The user that submitted the job, when the client reported one.
+    #[serde(default)]
+    pub user: String,
+    /// The application the job belongs to: one client session, with an id like Spark's
+    /// (`app-20261109202025-0001`).
+    #[serde(default)]
+    pub app_id: String,
+    /// The client's name for its application, if it gave one.
+    #[serde(default)]
+    pub app_name: String,
     /// Rendered logical plan. Absent in the job list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_plan: Option<String>,

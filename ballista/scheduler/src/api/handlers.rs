@@ -21,7 +21,7 @@ use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
 };
-use ballista_api_types::dto::{JobResponse, PlanFormat, QueryStagesResponse};
+use ballista_api_types::dto::{JobConfig, JobResponse, PlanFormat, QueryStagesResponse};
 use ballista_core::BALLISTA_VERSION;
 use ballista_core::serde::protobuf::job_status::Status;
 use ballista_core::serde::protobuf::{ExecutorMetric, executor_metric::Metric};
@@ -173,6 +173,90 @@ pub async fn get_webtui<
     let target = format!("{NIGHTLIES_URL}/{BALLISTA_VERSION}/?{query_string}");
 
     Ok(Redirect::to(&target))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/scheduler/config",
+    tag = "state",
+    responses(
+        (status = 200, description = "The scheduler's own configuration, as name/value pairs", body = JobConfig)
+    )
+)]
+pub async fn get_scheduler_config<
+    T: AsLogicalPlan + Clone + Send + Sync + 'static,
+    U: AsExecutionPlan + Send + Sync + 'static,
+>(
+    State(data_server): State<Arc<SchedulerServer<T, U>>>,
+) -> impl IntoResponse {
+    let c = &data_server.state.config;
+    let mut entries = JobConfig::new();
+    let mut put = |name: &str, value: String| {
+        entries.insert(name.to_string(), value);
+    };
+    put("scheduler_id", c.scheduler_id.clone());
+    put("namespace", c.namespace.clone());
+    put("external_host", c.external_host.clone());
+    put("bind_host", c.bind_host.clone());
+    put("bind_port", c.bind_port.to_string());
+    put("scheduling_policy", c.scheduling_policy.to_string());
+    put("task_distribution", format!("{:?}", c.task_distribution));
+    put("event_loop_buffer_size", c.event_loop_buffer_size.to_string());
+    put(
+        "finished_job_data_clean_up_interval_seconds",
+        c.finished_job_data_clean_up_interval_seconds.to_string(),
+    );
+    put(
+        "finished_job_state_clean_up_interval_seconds",
+        c.finished_job_state_clean_up_interval_seconds.to_string(),
+    );
+    put("executor_timeout_seconds", c.executor_timeout_seconds.to_string());
+    put(
+        "expire_dead_executor_interval_seconds",
+        c.expire_dead_executor_interval_seconds.to_string(),
+    );
+    put(
+        "executor_termination_grace_period",
+        c.executor_termination_grace_period.to_string(),
+    );
+    put(
+        "graceful_shutdown_timeout_seconds",
+        c.graceful_shutdown_timeout_seconds.to_string(),
+    );
+    put(
+        "no_executors_grace_period_seconds",
+        c.no_executors_grace_period_seconds.to_string(),
+    );
+    put("min_ready_executors", c.min_ready_executors.to_string());
+    put("task_max_failures", c.task_max_failures.to_string());
+    put("stage_max_failures", c.stage_max_failures.to_string());
+    put(
+        "grpc_server_max_decoding_message_size",
+        c.grpc_server_max_decoding_message_size.to_string(),
+    );
+    put(
+        "grpc_server_max_encoding_message_size",
+        c.grpc_server_max_encoding_message_size.to_string(),
+    );
+    put(
+        "grpc_client_max_message_size",
+        c.grpc_client_max_message_size.to_string(),
+    );
+    put("use_tls", c.use_tls.to_string());
+    #[cfg(feature = "flight-sql")]
+    put("flight_sql", c.flight_sql.to_string());
+    #[allow(deprecated)]
+    put(
+        "enable_embedded_flight_proxy",
+        c.enable_embedded_flight_proxy.to_string(),
+    );
+    if let Some(v) = &c.advertise_flight_endpoint {
+        put("advertise_flight_endpoint", v.clone());
+    }
+    if let Some(v) = c.job_resubmit_interval_ms {
+        put("job_resubmit_interval_ms", v.to_string());
+    }
+    Json(entries)
 }
 
 #[utoipa::path(

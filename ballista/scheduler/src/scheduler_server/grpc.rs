@@ -16,7 +16,7 @@
 // under the License.
 
 use axum::extract::ConnectInfo;
-use ballista_core::config::BALLISTA_JOB_NAME;
+use ballista_core::config::{BALLISTA_CLIENT_SESSION_ID, BALLISTA_JOB_NAME};
 use ballista_core::error::{BallistaError, Result as BResult};
 use ballista_core::execution_plans::JOB_ID_HEADER;
 use ballista_core::extension::SessionConfigHelperExt;
@@ -855,7 +855,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         session_id: String,
     ) -> BResult<(String, Arc<SessionContext>)> {
         let session_config = self.state.session_manager.produce_config();
-        let session_config = session_config.update_from_key_value_pair(settings);
+        let mut session_config = session_config.update_from_key_value_pair(settings);
+        // The application the session belongs to, named like Spark's.
+        let app_id = crate::app_registry::app_id_for_session(&session_id);
+        if let Err(e) = session_config
+            .options_mut()
+            .set(ballista_core::config::BALLISTA_APP_ID, &app_id)
+        {
+            log::debug!("could not record the application id: {e}");
+        }
+        // Every query gets its own scheduler-side session, so remember which client session
+        // it came from for the job list.
+        if let Err(e) = session_config
+            .options_mut()
+            .set(BALLISTA_CLIENT_SESSION_ID, &session_id)
+        {
+            log::debug!("could not record the client session id: {e}");
+        }
 
         let ctx = self
             .state

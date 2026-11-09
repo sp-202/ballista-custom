@@ -203,6 +203,20 @@ pub struct JobIndex {
     pub completed_stages: usize,
     /// Progress as a percentage of completed stages.
     pub percent_complete: u8,
+    /// The client session that submitted the job. Empty in logs written before
+    /// this field existed.
+    #[serde(default)]
+    pub session_id: String,
+    /// The user that submitted the job. Empty when unknown or in older logs.
+    #[serde(default)]
+    pub user: String,
+    /// The application (client session) the job belongs to. Empty in older logs, which the
+    /// history server groups by `session_id` instead.
+    #[serde(default)]
+    pub app_id: String,
+    /// The client's name for its application. Empty if it gave none.
+    #[serde(default)]
+    pub app_name: String,
 }
 
 /// Terminal record, and the only one the history server serves from.
@@ -319,6 +333,10 @@ mod tests {
                 num_stages: 1,
                 completed_stages: 1,
                 percent_complete: 100,
+                session_id: String::new(),
+                user: String::new(),
+                app_id: String::new(),
+                app_name: String::new(),
             },
             job: RawValue::from_string(r#"{"job_id":"job-1"}"#.to_string()).unwrap(),
             stages: RawValue::from_string(r#"{"stages":[]}"#.to_string()).unwrap(),

@@ -101,6 +101,26 @@ Pointing the TUI somewhere else means setting `BALLISTA__SCHEDULER__URL`, or
 the TUI on its default of `http://localhost:50050`, where it either finds your
 live scheduler or reports that the scheduler is down.
 
+## The web UI
+
+The history server also serves the scheduler's web UI at `/`, with the same pages over the replayed
+responses. Like Spark's history server it opens on a list of **applications**: a Spark Connect (or Flight SQL)
+client session is an application, with an id the scheduler assigns the first time it sees the session
+(`app-20261109150547-0002`, the format of a Spark standalone cluster's application ids). The list shows the
+app id, app name (`spark.app.name`, or the first query), start, completion, duration, user and last update, and a
+download of the application's event log (`GET /api/history/app/{app_id}/log`). An application opens into its own
+Jobs, Stages and SQL pages at `#/app/<app id>/jobs`. Logs written before applications existed are grouped by
+session id.
+
+Choose a port that is free: Spark's own history server uses 18080.
+
+```shell
+ballista-history-server --event-log-dir /var/lib/ballista/history --bind-port 18090
+```
+
+The scheduler's UI has a light theme (Spark's classic look, the default) and a dark one; the switch in the top bar
+is remembered, and `?theme=dark` sets it from a link.
+
 ## Picking up new jobs
 
 The scheduler keeps writing to the directory while the history server is up, so

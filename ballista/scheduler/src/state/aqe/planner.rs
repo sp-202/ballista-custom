@@ -33,6 +33,7 @@ use ballista_core::JobId;
 use ballista_core::execution_plans::ShuffleWriter;
 use ballista_core::serde::scheduler::PartitionLocation;
 use datafusion::common;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{HashMap, exec_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -362,6 +363,21 @@ impl AdaptivePlanner {
         partitions: Vec<Vec<PartitionLocation>>,
     ) -> common::Result<()> {
         self.finalise_stage_internal(stage_id, partitions)
+    }
+
+    /// Drops the shuffle file locations that a finished job no longer needs.
+    ///
+    /// A job that has produced its output keeps only its plan, for display, and its
+    /// final output locations. The locations of the intermediate shuffles, `N * N`
+    /// per shuffle, would otherwise stay in memory as long as the job's state does.
+    pub(crate) fn release_shuffle_locations(&mut self) {
+        self.runnable_stage_output.clear();
+        let _ = self.plan.apply(|node| {
+            if let Some(exchange) = node.downcast_ref::<ExchangeExec>() {
+                exchange.release_shuffle_partitions();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
     }
 
     /// Replans the stages by applying physical optimizations.

@@ -22,22 +22,37 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ballista UI</title>
+<script>
+  /* Set the theme before the page paints: light unless the user chose dark. */
+  try {
+    var q = new URLSearchParams(location.search).get("theme");
+    if (q === "dark" || q === "light") localStorage.setItem("ballista-theme", q);
+    document.documentElement.dataset.theme = localStorage.getItem("ballista-theme") === "dark" ? "dark" : "light";
+  }
+  catch (e) { document.documentElement.dataset.theme = "light"; }
+</script>
 <link rel="stylesheet" href="ui.css">
 </head>
 <body>
 <header class="topbar">
   <a class="brand" href="#/jobs" title="Ballista scheduler">
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="m3 7 9 5 9-5M12 12v10"/></svg>
-    <span>Ballista</span><small id="version"></small>
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 3 7v10l9 5 9-5V7z"/><path d="m3 7 9 5 9-5M12 12v10"/></svg>
+    <span class="name">Ballista</span><small id="version"></small>
   </a>
   <nav id="nav">
-    <a href="#/jobs" data-tab="jobs">Jobs</a>
-    <a href="#/stages" data-tab="stages">Stages</a>
-    <a href="#/executors" data-tab="executors">Executors</a>
+    <a href="#/apps" data-tab="apps" class="hist">Applications</a>
+    <a href="#/jobs" data-tab="jobs" class="app">Jobs</a>
+    <a href="#/stages" data-tab="stages" class="app">Stages</a>
+    <a href="#/sql" data-tab="sql" class="app">SQL</a>
+    <a href="#/sessions" data-tab="sessions" class="live">Sessions</a>
+    <a href="#/executors" data-tab="executors" class="live">Executors</a>
+    <a href="#/cluster" data-tab="cluster" class="live">Cluster</a>
     <a href="#/environment" data-tab="environment">Environment</a>
   </nav>
   <div class="status">
+    <span class="chip" id="df-version" title="DataFusion version"></span>
     <span class="dot" id="conn"></span><span id="conn-text">connecting…</span>
+    <button class="themebtn" id="theme" type="button" title="Switch between light and dark" aria-label="Switch between light and dark"></button>
     <label class="refresh"><input type="checkbox" id="auto" checked> auto-refresh</label>
   </div>
 </header>

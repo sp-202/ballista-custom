@@ -26,6 +26,7 @@ use sail_delta_lake::session_extension::DeltaTableCache;
 use sail_session::session_factory::{
     ServerSessionFactory, ServerSessionInfo, ServerSessionMutator, SessionFactory,
 };
+use sail_spark_connect::engine_conf;
 use sail_spark_connect::session_manager::SparkSessionMutator;
 
 /// Sail's Spark session mutator, followed by Ballista's restrictions.
@@ -38,13 +39,17 @@ use sail_spark_connect::session_manager::SparkSessionMutator;
 /// scan would block), no round-robin repartition and no Utf8View types.
 pub struct BallistaSparkSessionMutator {
     spark: SparkSessionMutator,
+    /// The operator pinned the partition count (`execution.default_parallelism`).
+    pinned_parallelism: bool,
 }
 
 impl BallistaSparkSessionMutator {
     pub fn new(config: Arc<AppConfig>) -> Self {
         let default_conf = SERVER_SPARK_CONF.get().cloned().unwrap_or_default();
+        let pinned_parallelism = config.execution.default_parallelism > 0;
         Self {
             spark: SparkSessionMutator::new(config).with_default_conf(default_conf),
+            pinned_parallelism,
         }
     }
 }
@@ -66,11 +71,19 @@ impl ServerSessionMutator for BallistaSparkSessionMutator {
         info: &ServerSessionInfo,
     ) -> Result<SessionConfig> {
         let config = self.spark.mutate_config(config, info)?;
-        Ok(config
+        let mut config = config
             .ballista_restricted_configuration()
             // Spark plans reach the scheduler as physical plans; plan them
             // adaptively like Ballista's own SQL jobs (BS-007).
-            .with_ballista_adaptive_physical_plans(true))
+            .with_ballista_adaptive_physical_plans(true);
+        // A cluster-sized shuffle partition count, then the
+        // server's own `--conf` values (BS-036).
+        let options = config.options_mut();
+        engine_conf::apply_defaults(options, self.pinned_parallelism);
+        for (key, value) in SERVER_SPARK_CONF.get().into_iter().flatten() {
+            engine_conf::apply(options, key, value);
+        }
+        Ok(config)
     }
 
     fn mutate_state(

@@ -189,7 +189,21 @@ pub(crate) fn handle_config_set(
         let key = SparkConfigKey::SPARK_SQL_SESSION_TIME_ZONE.to_string();
         kv.iter().any(|pair| pair.key == key)
     };
+    let engine_settings: Vec<(String, String)> = kv
+        .iter()
+        .filter_map(|pair| Some((pair.key.clone(), pair.value.clone()?)))
+        .collect();
     spark.set_config(kv)?;
+    if !engine_settings.is_empty() {
+        // Settings such as `spark.sql.shuffle.partitions` only take effect once the
+        // engine option that implements them is set.
+        let state = ctx.state_ref();
+        let mut state = state.write();
+        let options = state.config_mut().options_mut();
+        for (key, value) in &engine_settings {
+            crate::engine_conf::apply(options, key, value);
+        }
+    }
     if sets_session_timezone {
         // Mirror `spark.sql.session.timeZone` onto the DataFusion session configuration. Parquet
         // listing-table schema inference reads `execution.time_zone` to reconcile mixed-timezone
@@ -271,7 +285,18 @@ pub(crate) fn handle_config_unset(
         let key = SparkConfigKey::SPARK_SQL_SESSION_TIME_ZONE.to_string();
         keys.iter().any(|k| k == &key)
     };
-    spark.unset_config(keys)?;
+    spark.unset_config(keys.clone())?;
+    {
+        // An unset setting returns to Spark's default, so does its engine option.
+        let state = ctx.state_ref();
+        let mut state = state.write();
+        let options = state.config_mut().options_mut();
+        for key in &keys {
+            if let Some(default) = crate::engine_conf::spark_default(key) {
+                crate::engine_conf::apply(options, key, default);
+            }
+        }
+    }
     if unsets_session_timezone {
         // Unsetting `spark.sql.session.timeZone` reverts it toward the default, so re-sync
         // `execution.time_zone` to the now-effective session zone instead of leaving the last

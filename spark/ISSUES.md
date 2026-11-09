@@ -44,6 +44,10 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-033](#bs-033) | 🟢 | S3 | No dynamic partition pruning: broadcast joins read the whole fact table | 07 |
 | [BS-034](#bs-034) | 🟢 | S3 | File writes run in one task; partitioned writes run out of memory | 05 |
 | [BS-035](#bs-035) | 🔴 | S2 | `bucketBy` writes unsupported (no co-located bucketed joins) | 05 |
+| [BS-036](#bs-036) | 🟢 | S3 | Spark sessions shuffled into one partition per planning-machine CPU core (28 vs 16 task slots) | 07 |
+| [BS-037](#bs-037) | 🟢 | S1 | Scheduler kept ~1 GB of per-partition metrics per join-heavy job and was OOM-killed | 06 |
+| [BS-038](#bs-038) | 🔴 | S2 | `COUNT(DISTINCT)` on a column unique per row fails with `ResourcesExhausted` (313M strings, 20 GB star schema) | 06 |
+| [BS-039](#bs-039) | 🔴 | S3 | Window over a skewed partition key runs in one partition (q6 of skewbench: 31.7 s, Spark 12.4 s) | 07 |
 
 ---
 
@@ -604,3 +608,41 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Evidence:** `df.write.bucketBy(8, "k").saveAsTable(...)`: `bucketing for writing listing
   data source` (Sail `listing/source.rs`). Joins of co-partitioned inputs inside one query
   already avoid an extra exchange (two aggregates on the join key join without a shuffle).
+
+---
+## BS-036
+**Spark sessions shuffled into one partition per planning-machine CPU core** · 🟢 fixed 2026-11-09 · step 07
+- **Evidence:** TPC-H SF100, whole suite in one session, 2 executors / 16 task slots. The connect host has 28 cores,
+  so every shuffle had 28 partitions: 301.7 s (303.3, 300.0 in an ABBA run). 64 partitions: 252 s, 100: 228-237 s,
+  200: 254 s (queries over small tables slow down: q2 2 → 10 s, q22 2 → 7 s). q18 67 → 34 s, q21 54 → 36 s, q7 27 → 16 s.
+- **Cause:** `execution.default_parallelism` defaults to the CPU count of the machine that plans the query, and Spark
+  Connect's `spark.sql.shuffle.partitions` never reached DataFusion's `target_partitions`.
+- **Fix:** new sessions default to 100 partitions (`DEFAULT_SHUFFLE_PARTITIONS`) unless `execution.default_parallelism`
+  is set; `spark.sql.shuffle.partitions`, `spark.sql.adaptive.*` (coalescing, skew join) and
+  `spark.sql.autoBroadcastJoinThreshold` map onto the engine options (`sail-spark-connect/src/engine_conf.rs`), at
+  session creation (`--conf`) and on `spark.conf.set` / `SET`.
+- **Not gains:** AQE coalescing on or off made no difference at SF100; parquet filter pushdown and Sail's cost-based
+  join reorder were slower.
+- **Left:** the count should follow the input size, not be fixed.
+
+## BS-037
+**Scheduler kept ~1 GB of per-partition metrics per join-heavy job and was OOM-killed** · 🟢 fixed 2026-11-09 · step 06
+- **Evidence:** at 200 partitions the scheduler grew by ~1 GB per TPC-H q5 and was killed (exit 137); at 28 partitions
+  by ~20 MB. One finished job held 5.5 million metric entries.
+- **Cause:** `metrics_set_from_task_metrics` copied every metric of an operator that runs in full in each task (a scan
+  below a broadcast build side reports all 200 plan partitions) onto every partition of the task's slice, and never
+  merged them.
+- **Fix:** entries with the same metric name and partition tag are folded (a fresh accumulator each: cloned metric
+  values share their counters). Totals are unchanged; the set is bounded by names x partitions. Finished jobs also
+  drop their shuffle file locations (`release_shuffle_locations`). q5: ~1 GB → 20-50 MB per job.
+
+## BS-038
+**`COUNT(DISTINCT)` on a column unique per row fails with `ResourcesExhausted`** · 🔴 open · step 06
+- **Evidence:** `skewbench` q4 (`SELECT COUNT(DISTINCT session_id), COUNT(DISTINCT user_id) FROM events`, 313M rows):
+  `ResourcesExhausted` in `AggregateStream` on 8 GB executors; vanilla Spark finishes in 35 s.
+
+## BS-039
+**Window over a skewed partition key runs in one partition** · 🔴 open · step 07
+- **Evidence:** `skewbench` q6 (`ROW_NUMBER() OVER (PARTITION BY product_id ...)`, product 1 is ~25% of 313M rows):
+  31.7 s against Spark's 12.4 s. The skew-join rule does not cover windows.
+

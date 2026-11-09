@@ -50,6 +50,7 @@ use utoipa::OpenApi;
         crate::api::health::healthz,
         crate::api::health::readyz,
         crate::api::handlers::get_scheduler_state,
+        crate::api::handlers::get_scheduler_config,
         crate::api::handlers::get_scheduler_version,
         crate::api::handlers::get_executors,
         crate::api::handlers::get_executor_info,

@@ -16,6 +16,7 @@
 // under the License.
 
 use datafusion::common::ColumnStatistics;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::stats::Precision;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::aggregate_statistics::AggregateStatistics;
@@ -35,7 +36,8 @@ use log::{debug, warn};
 use crate::cache::is_external_stage_id;
 use ballista_core::error::{BallistaError, Result};
 use ballista_core::execution_plans::{
-    RangeShuffleWriterExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    RangeShuffleReaderExec, RangeShuffleWriterExec, ShuffleReaderExec, ShuffleWriterExec,
+    SortShuffleWriterExec,
     TaskRuntimeStats, TaskWindowState,
 };
 use ballista_core::serde::protobuf::failed_task::FailedReason;
@@ -77,6 +79,39 @@ pub enum ExecutionStage {
     Successful(SuccessfulStage),
     /// Stage that failed during execution.
     Failed(FailedStage),
+}
+
+impl ExecutionStage {
+    /// Drops the shuffle file locations of a stage that has succeeded.
+    ///
+    /// Its readers and its `inputs` list where each input partition's files are, which
+    /// is only needed to run or re-run the stage. A finished job keeps its stages for
+    /// display and metrics, so the locations (`N * N` per shuffle) would stay in memory
+    /// as long as the job's state does. Readers keep their partition count.
+    pub(crate) fn release_shuffle_locations(&mut self) {
+        if let ExecutionStage::Successful(stage) = self {
+            stage.inputs.clear();
+            stage.plan = strip_shuffle_locations(stage.plan.clone());
+        }
+    }
+}
+
+/// `plan` with every shuffle reader's partition locations emptied.
+fn strip_shuffle_locations(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let stripped = plan.clone().transform_up(|node| {
+        if let Some(reader) = node.downcast_ref::<ShuffleReaderExec>() {
+            let mut reader = reader.clone();
+            reader.partition = reader.partition.iter().map(|_| Vec::new()).collect();
+            return Ok(Transformed::yes(Arc::new(reader) as Arc<dyn ExecutionPlan>));
+        }
+        if let Some(reader) = node.downcast_ref::<RangeShuffleReaderExec>() {
+            let mut reader = reader.clone();
+            reader.partition = reader.partition.iter().map(|_| Vec::new()).collect();
+            return Ok(Transformed::yes(Arc::new(reader) as Arc<dyn ExecutionPlan>));
+        }
+        Ok(Transformed::no(node))
+    });
+    stripped.map(|t| t.data).unwrap_or(plan)
 }
 
 impl Debug for ExecutionStage {
@@ -1036,7 +1071,16 @@ impl RunningStage {
         metrics: OperatorMetricsSet,
         global_partitions: &[usize],
     ) -> Result<MetricsSet> {
-        let mut metrics_set = MetricsSet::new();
+        // One entry per (metric name, partition tag). A scan below a coalesce or a
+        // broadcast build side runs in full in every task, so a task reports it for all
+        // of the plan's partitions (200 by default); the cross product with the task's
+        // slice below made that `partitions * slice` entries per metric name per task,
+        // about 5 million entries (1 GB) for a six-way join. Folding entries that share
+        // a name and tag keeps every sum the same (the totals are what is displayed) and
+        // bounds the set to `names * partitions`.
+        let mut folded: Vec<Metric> = Vec::new();
+        let mut index: std::collections::HashMap<(String, Option<usize>), usize> =
+            std::collections::HashMap::new();
         for proto_metric in metrics.metrics {
             let local_partition = proto_metric.partition.map(|p| p as usize);
             let inner = proto_metric.metric.ok_or_else(|| {
@@ -1056,8 +1100,24 @@ impl RunningStage {
                 None => vec![None],
             };
             for tag in tags {
-                metrics_set.push(Arc::new(Metric::new(metric_value.clone(), tag)));
+                match index.entry((metric_value.name().to_string(), tag)) {
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        folded[*slot.get()].value_mut().aggregate(&metric_value);
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        // A fresh accumulator: cloned metric values share their
+                        // counters, so aggregating into a clone would change the others.
+                        let mut accumulated = metric_value.new_empty();
+                        accumulated.aggregate(&metric_value);
+                        slot.insert(folded.len());
+                        folded.push(Metric::new(accumulated, tag));
+                    }
+                }
             }
+        }
+        let mut metrics_set = MetricsSet::new();
+        for metric in folded {
+            metrics_set.push(Arc::new(metric));
         }
         Ok(metrics_set)
     }
@@ -2013,6 +2073,48 @@ mod tests {
         // per-partition lie called out in the TODO.
         let aggregated = operator_metrics.aggregate_by_name();
         assert_eq!(aggregated.output_rows(), Some(2000));
+    }
+
+    /// A scan below a coalesce or a broadcast build side runs in full in every
+    /// task, so a task reports it for all of the plan's partitions. Those entries
+    /// must fold into one per (metric, slice member), not one per local partition
+    /// per slice member, or a join-heavy job keeps millions of entries (about
+    /// 1 GB at 200 partitions) in the scheduler. Totals must stay the same.
+    #[test]
+    fn test_update_task_metrics_under_collect_entries_are_bounded() {
+        let mut stage = make_running_stage(4);
+        append_running_task(&mut stage, 0, "executor-1", vec![3, 7, 5, 1]);
+
+        // 200 local partitions, each reporting rows and compute time.
+        let metrics = (0..200u32)
+            .flat_map(|local| {
+                make_operator_metrics_set_at(local + 4, 10, 1).metrics
+            })
+            .collect::<Vec<_>>();
+        stage
+            .update_task_metrics(0, vec![OperatorMetricsSet { metrics }])
+            .unwrap();
+
+        let operator_metrics = &stage.stage_metrics.as_ref().unwrap()[0];
+        // 2 metric names x 4 slice members, not 2 x 200 x 4.
+        assert_eq!(operator_metrics.iter().count(), 8);
+        let aggregated = operator_metrics.aggregate_by_name();
+        // Each of the 200 reports is counted once per slice member, as before.
+        assert_eq!(aggregated.output_rows(), Some(200 * 10 * 4));
+        assert_eq!(aggregated.elapsed_compute().unwrap(), 200 * 4);
+
+        // A second task adds its own slice and keeps the set bounded.
+        append_running_task(&mut stage, 1, "executor-1", vec![0, 2, 4, 6]);
+        let metrics = (0..200u32)
+            .flat_map(|local| {
+                make_operator_metrics_set_at(local + 4, 10, 1).metrics
+            })
+            .collect::<Vec<_>>();
+        stage
+            .update_task_metrics(1, vec![OperatorMetricsSet { metrics }])
+            .unwrap();
+        let operator_metrics = &stage.stage_metrics.as_ref().unwrap()[0];
+        assert_eq!(operator_metrics.iter().count(), 16);
     }
 
     /// Build a bare-bones report tagged with a `partition_id` we can look
