@@ -32,7 +32,7 @@ const SAMPLES = 200;
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const num = (n) => (n == null ? "–" : Number(n).toLocaleString());
+const num = (n) => (n == null ? "–" : Number(n).toLocaleString("en-US"));
 const compact = (n) => {
   if (n == null) return "–";
   const a = Math.abs(n);
@@ -69,12 +69,71 @@ const badge = (s) => `<span class="badge s-${esc(String(s).toLowerCase())}">${es
 const isLive = (status) => ["running", "queued"].includes(String(status).toLowerCase());
 const jobDuration = (j) => (j.end_time ? j.end_time - j.start_time : j.start_time ? Date.now() - j.start_time : null);
 const metric = (e, type) => (e.metrics || []).find((m) => m.type === type)?.value;
+// A query as a person reads it: leading license/comment lines dropped, whitespace collapsed.
+const cleanSql = (s) => {
+  const t = String(s ?? "").replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ").replace(/\s+/g, " ").trim();
+  return t || String(s ?? "").replace(/\s+/g, " ").trim();
+};
+// A short name for a query, like Spark's job description ("tpch q22"): the first comment line when the
+// query starts with one ("SQLBench-H query 22"), else "SELECT · lineitem, part".
+function queryTitle(sql) {
+  const raw = String(sql ?? "");
+  const c = /^\s*--\s*([^\n]+)/.exec(raw);
+  if (c) {
+    const t = c[1].trim().replace(/\s+(derived from|under the terms|copyright).*$/i, "").trim();
+    if (t) return t;
+  }
+  const text = cleanSql(raw);
+  const kind = (/^\w+/.exec(text) || [""])[0].toUpperCase();
+  const tables = [...text.matchAll(/\b(?:from|join)\s+([A-Za-z_][\w.]*)/gi)].map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+  if (kind && tables.length) return `${kind} · ${tables.join(", ")}`;
+  return oneLine(text, 80) || "(no description)";
+}
+// The SQL as written, minus comment lines, keeping its line breaks.
+const sqlBody = (s) => String(s ?? "").replace(/^\s*--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\n{2,}/g, "\n").trim();
+
+// Spark's description cell: a short name, and the full text behind "+details".
+const descCell = (s, href, id) => {
+  if (!String(s ?? "").trim()) return '<span class="faint">(no description)</span>';
+  const title = esc(queryTitle(s));
+  const name = href ? `<a class="qname" href="${href}">${title}</a>` : `<span class="qname">${title}</span>`;
+  return `${name}<details class="qdetails" ${id ? `id="q-${esc(id)}"` : ""}><summary>+details</summary><pre class="qsql">${esc(sqlBody(s))}</pre></details>`;
+};
+
+// A stage named from what it runs (Spark describes its stages; "ShuffleWriterExec" says nothing):
+// "Scan lineitem → Filter → Aggregate (Partial)". Operators are listed in data-flow order.
+function stageName(stage) {
+  const ops = parseMetricPlan(stage.stage_plan);
+  const parts = [];
+  const add = (t) => { if (t && parts[parts.length - 1] !== t) parts.push(t); };
+  for (const op of [...ops].reverse()) {
+    const n = op.op.replace(/Exec$/, ""), d = op.detail;
+    if (/DataSource|ParquetExec|CsvExec/.test(n)) {
+      const t = /([A-Za-z0-9_]+)\.(?:parquet|csv|json)/.exec(d);
+      add(`Scan ${t ? t[1] : "files"}`);
+    } else if (/Join$/.test(n)) {
+      const kind = (/join_type=(\w+)/.exec(d) || [])[1];
+      add(`${n.replace(/^Hash/, "Hash ")} (${[kind, /mode=CollectLeft/.test(d) ? "broadcast" : /mode=Partitioned/.test(d) ? "shuffled" : ""].filter(Boolean).join(", ")})`.replace(" ()", ""));
+    } else if (/Aggregate$/.test(n) && !/Window/.test(n)) add(`Aggregate (${(/mode=(\w+)/.exec(d) || [])[1] || "…"})`);
+    else if (/Window/.test(n)) add("Window");
+    else if (n === "Sort") add(/TopK/.test(d) ? "TopK" : "Sort");
+    else if (n === "SortPreservingMerge") add("Merge sorted");
+    else if (n === "Filter") add("Filter");
+    else if (/Union/.test(n)) add("Union");
+    else if (/Limit/.test(n)) add("Limit");
+  }
+  if (!parts.length) return ops.some((o) => /ShuffleReader/.test(o.op)) ? "Collect shuffle" : "Stage";
+  return parts.length > 4 ? parts.slice(0, 4).join(" → ") + " → …" : parts.join(" → ");
+}
 const oneLine = (s, n = 200) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
 const shortId = (id) => (id && id.length > 13 ? id.slice(0, 8) + "…" : id || "–");
 const lower = (s) => String(s).toLowerCase();
 
 async function get(path) {
-  const r = await fetch(API + path, { cache: "no-store" });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15000);
+  let r;
+  try { r = await fetch(API + path, { cache: "no-store", signal: ctl.signal }); } finally { clearTimeout(timer); }
   const ct = r.headers.get("content-type") || "";
   const body = ct.includes("json") ? await r.json() : await r.text();
   if (!r.ok) throw new Error(body?.reason || body || r.statusText);
@@ -297,7 +356,7 @@ function summarize(ops) {
       s.scanRows += val(op, "output_rows") || 0;
       s.scanBytes += val(op, "bytes_scanned") || 0;
       const eff = String(op.m.get("scan_efficiency_ratio") || "").match(/\(([\d.]+\s*[KMBT]?)\s*\/\s*([\d.]+\s*[KMBT]?)\)/);
-      if (eff) s.scanFileBytes += parseValue("bytes", eff[2]) || 0;
+      if (eff) s.scanFileBytes += parseValue("count", eff[2]) || 0; // "102.5 B" is billions of bytes
       const f = total(op.m.get("files_ranges_pruned_statistics")); if (f) { s.filesTotal += f.total; s.filesMatched += f.matched; }
       const g = total(op.m.get("row_groups_pruned_statistics")); if (g) { s.rgTotal += g.total; s.rgMatched += g.matched; }
       s.pagesPruned += val(op, "page_index_pages_pruned") || 0;
@@ -471,6 +530,135 @@ function dagSvg(dag, info, jobId) {
     <span>edge label: rows shuffled</span></div>`;
 }
 
+// ---------- operator graph (Spark's SQL plan graph): stages are clusters of operators ----------
+const opKind = (n) => /DataSource|ParquetExec|CsvExec/.test(n) ? "scan" : /Join/.test(n) ? "join" : /Aggregate/.test(n) ? "agg"
+  : /Shuffle|Exchange|Repartition|Coalesce|Merge/.test(n) ? "shuffle" : /Sort|TopK/.test(n) ? "sort" : /Window/.test(n) ? "win" : "op";
+
+function opTree(ops) {
+  const stack = [], nodes = [];
+  for (const op of ops) {
+    while (stack.length && stack[stack.length - 1].indent >= op.indent) stack.pop();
+    const node = { op, indent: op.indent, kids: [], parent: stack[stack.length - 1] || null, kind: opKind(op.op) };
+    if (node.parent) node.parent.kids.push(node);
+    stack.push(node);
+    nodes.push(node);
+  }
+  return nodes;
+}
+
+function opLines(node) {
+  const g = (n) => node.op.m.get(n), L = [];
+  if (g("output_rows")) L.push(`output rows: ${g("output_rows")}`);
+  if (g("elapsed_compute") && g("elapsed_compute") !== "0ns") L.push(`time: ${g("elapsed_compute")}`);
+  if (node.kind === "scan") {
+    if (g("bytes_scanned")) L.push(`bytes scanned: ${g("bytes_scanned")}`);
+    const rg = total(g("row_groups_pruned_statistics")); if (rg) L.push(`row groups: ${rg.matched}/${rg.total} read`);
+  } else if (node.kind === "join") {
+    if (g("build_input_rows")) L.push(`build rows: ${g("build_input_rows")}`);
+    if (g("build_time")) L.push(`build time: ${g("build_time")}`);
+    if (g("probe_hit_rate")) L.push(`probe hits: ${String(g("probe_hit_rate")).split(" ")[0]}`);
+  } else if (node.kind === "sort" || node.kind === "agg") {
+    if ((val(node.op, "spill_count") || 0) > 0) L.push(`spilled: ${g("spilled_bytes") || g("spill_count")}`);
+  } else if (node.kind === "shuffle") {
+    if (g("write_time")) L.push(`write time: ${g("write_time")}`);
+    if (g("fetch_time")) L.push(`fetch time: ${g("fetch_time")}`);
+  }
+  return L.slice(0, 4);
+}
+
+function opGraphSvg(stages, parsed, jobId) {
+  const NW = 214, GAPX = 18, GAPY = 38, PAD = 14, TITLE = 44, COLGAP = 56, ROWGAP = 74;
+  const byId = new Map(), layout = new Map();
+  const nodeH = (n) => 26 + opLines(n).length * 14 + 6;
+  for (const st of stages) {
+    const ops = parsed.get(String(st.stage_id)) || [];
+    if (!ops.length) continue;
+    const nodes = opTree(ops);
+    const root = nodes.find((n) => !n.parent);
+    // Subtree widths, then x positions: children centred above their parent (data flows down to the root).
+    const width = (n) => (n.w ??= Math.max(NW, n.kids.length ? n.kids.reduce((a, k) => a + width(k), 0) + GAPX * (n.kids.length - 1) : NW));
+    width(root);
+    const place = (n, left, depth) => {
+      n.depth = depth; n.cx = left + n.w / 2;
+      let x = left;
+      n.kids.forEach((k) => { place(k, x, depth + 1); x += k.w + GAPX; });
+    };
+    place(root, 0, 0);
+    const maxDepth = Math.max(...nodes.map((n) => n.depth));
+    const rowH = Array.from({ length: maxDepth + 1 }, (_, d) => Math.max(...nodes.filter((n) => n.depth === d).map(nodeH)));
+    const rowY = []; let y = TITLE + PAD;
+    for (let d = maxDepth; d >= 0; d--) { rowY[d] = y; y += rowH[d] + GAPY; }
+    nodes.forEach((n) => { n.y = rowY[n.depth]; n.h = nodeH(n); });
+    const info = { st, nodes, root, w: root.w + PAD * 2, h: y - GAPY + PAD };
+    layout.set(String(st.stage_id), info); byId.set(String(st.stage_id), info);
+  }
+  if (!layout.size) return `<div class="empty">No operator metrics yet.</div>`;
+  // Stage dependencies come from the shuffle readers' `upstream_stage`.
+  const deps = new Map(), links = [];
+  for (const [id, L] of layout) for (const n of L.nodes) {
+    const m = /upstream_stage:\s*(\d+)/.exec(n.op.detail);
+    if (m && /Shuffle/.test(n.op.op) && layout.has(m[1])) { links.push({ from: m[1], to: id, node: n }); (deps.get(id) || deps.set(id, []).get(id)).push(m[1]); }
+  }
+  // Vertical flow like Spark's plan graph: a stage's rank is how far it is from the leaf stages, ranks are
+  // rows from top to bottom, and the stages of one row sit side by side. Shuffle edges then run straight down.
+  const rank = new Map();
+  const rankOf = (id, seen = new Set()) => { if (rank.has(id)) return rank.get(id); if (seen.has(id)) return 0;
+    seen.add(id); const r = Math.max(-1, ...(deps.get(id) || []).map((d) => rankOf(d, seen))) + 1; rank.set(id, r); return r; };
+  [...layout.keys()].forEach((id) => rankOf(id));
+  const rowsOf = []; [...layout.keys()].sort((a, b) => a - b).forEach((id) => (rowsOf[rank.get(id)] ||= []).push(id));
+  const rowWidth = (ids) => ids.reduce((a, id) => a + layout.get(id).w, 0) + COLGAP * (ids.length - 1);
+  const W = Math.max(...rowsOf.map(rowWidth));
+  let yy = 0;
+  rowsOf.forEach((ids) => {
+    // Order a row by where its inputs are, so edges cross as little as possible.
+    const centre = (id) => { const ds = (deps.get(id) || []).map((d) => layout.get(d)).filter((L) => L.x != null);
+      return ds.length ? ds.reduce((s, L) => s + L.x + L.w / 2, 0) / ds.length : 0; };
+    ids.sort((p, q) => centre(p) - centre(q) || p - q);
+    let x = (W - rowWidth(ids)) / 2, h = 0;
+    ids.forEach((id) => { const L = layout.get(id); L.x = x; L.y = yy; x += L.w + COLGAP; h = Math.max(h, L.h); });
+    yy += h + ROWGAP;
+  });
+  const H = yy - ROWGAP;
+  const abs = (L, n) => ({ cx: L.x + PAD + n.cx, top: L.y + n.y, bot: L.y + n.y + n.h });
+  const rows = (op) => op && val(op, "output_rows");
+  let clusters = "", edges = "", nodesSvg = "";
+  // Labels of shuffle edges sit just under their source, clear of the stage headers they would cross.
+  const edge = (x1, y1, x2, y2, label, near) => {
+    const my = (y1 + y2) / 2, d = `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2 - 7}`;
+    const lx = near ? x1 + 6 : (x1 + x2) / 2 + 4, ly = near ? y1 + 20 : my - 3;
+    return `<path class="oedge" d="${d}" marker-end="url(#oarrow)"/>` + (label ? `<text class="oedgelabel" x="${lx}" y="${ly}">${esc(label)}</text>` : "");
+  };
+  for (const L of layout.values()) for (const n of L.nodes) if (n.parent) {
+    const a = abs(L, n), b = abs(L, n.parent);
+    edges += edge(a.cx, a.bot, b.cx, b.top, rows(n.op) != null ? compact(rows(n.op)) : "");
+  }
+  for (const l of links) {
+    const A = layout.get(l.from), B = layout.get(l.to), a = abs(A, A.root), b = abs(B, l.node);
+    const from = A.root.op, label = rows(from) ?? A.st.output_rows;
+    edges += edge(a.cx, a.bot, b.cx, b.top, label != null ? compact(label) : "", true);
+  }
+  for (const L of layout.values()) {
+    const status = lower(L.st.stage_status);
+    clusters += `<a href="#/jobs/${esc(jobId)}/stages/${esc(L.st.stage_id)}"><g class="ocluster ${esc(status)}">
+      <rect x="${L.x}" y="${L.y}" width="${L.w}" height="${L.h}" rx="9"/>
+      <title>${esc(stageName(L.st))}</title>
+      <text class="otitle" x="${L.x + 12}" y="${L.y + 18}">Stage ${esc(L.st.stage_id)} · ${esc(L.st.stage_status)}</text>
+      <text class="osub" x="${L.x + 12}" y="${L.y + 35}">${esc(compact(L.st.input_rows))} → ${esc(compact(L.st.output_rows))} rows</text></g></a>`;
+    for (const n of L.nodes) {
+      const a = abs(L, n), lines = opLines(n), spilled = (val(n.op, "spill_count") || 0) > 0;
+      const tip = `${n.op.op}\n${n.op.detail}\n\n` + n.op.metrics.map((m) => `${m.name}: ${m.raw}`).join("\n");
+      nodesSvg += `<g class="onode ${n.kind} ${spilled ? "spilled" : ""}"><title>${esc(tip)}</title>
+        <rect x="${a.cx - NW / 2}" y="${a.top}" width="${NW}" height="${n.h}" rx="7"/>
+        <text class="oname" x="${a.cx - NW / 2 + 9}" y="${a.top + 17}">${esc(n.op.op.replace(/Exec$/, ""))}</text>
+        ${lines.map((t, i) => `<text class="ometric" x="${a.cx - NW / 2 + 9}" y="${a.top + 33 + i * 14}">${esc(t.length > 34 ? t.slice(0, 33) + "…" : t)}</text>`).join("")}</g>`;
+    }
+  }
+  return `<svg width="${W + 4}" height="${H + 4}" viewBox="-2 -2 ${W + 4} ${H + 4}" role="img" aria-label="Query plan">
+    <defs><marker id="oarrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="oarrowhead"/></marker></defs>${clusters}${edges}${nodesSvg}</svg>
+    <div class="legend"><span><i class="lg scan"></i>scan</span><span><i class="lg op"></i>operator</span>
+    <span><i class="lg spill"></i>spilled</span><span>edge label: rows</span></div>`;
+}
+
 async function jobDetails(jobId, finishedOk = true) {
   const [job, stagesResp, dot] = await Promise.all([
     get(`/job/${jobId}`),
@@ -494,7 +682,7 @@ function jobRow(j) {
   const live = isLive(j.status);
   return [
     cell(`<a class="mono" href="#/jobs/${esc(j.job_id)}">${esc(j.job_id)}</a>`, j.job_id),
-    cell(`<a class="sqlcell" href="#/sql/${esc(j.job_id)}" title="${esc(sqlOf(j) || j.job_status)}">${esc(oneLine(sqlOf(j)) || j.job_status)}</a>`, sqlOf(j)),
+    cell(sqlOf(j) ? descCell(sqlOf(j), `#/sql/${esc(j.job_id)}`, "j-" + j.job_id) : `<span class="faint">${esc(j.job_status)}</span>`, queryTitle(sqlOf(j))),
     cell(time(j.start_time), j.start_time || 0),
     cell(dur(jobDuration(j)), jobDuration(j) ?? -1, "num"),
     cell(`<div class="progress"><i class="${live ? "run" : ""}" style="width:${j.percent_complete}%"></i><span>${j.completed_stages}/${j.num_stages}</span></div>`, j.completed_stages),
@@ -545,15 +733,15 @@ async function jobsPage() {
     <h2>Failed Jobs <span class="count">(${failed.length})</span></h2><div class="panel">${dtable("jobs-failed", jobHeaders, failed.map(jobRow), "No failed jobs")}</div>`);
 }
 
-function stageRows(jobId, stages) {
+function stageRows(jobId, stages, query) {
   return stages.map((s) => {
     const w = stageWindow(s);
     const tasks = (s.tasks || []).filter(Boolean);
     const done = tasks.filter((t) => lower(t.status) === "successful").length;
-    const op = (s.stage_plan || "").split("\n")[0].replace(/:.*/, "").trim();
+    const name = stageName(s);
     return [
       cell(`<a href="#/jobs/${esc(jobId)}/stages/${esc(s.stage_id)}">${esc(s.stage_id)}</a>`, Number(s.stage_id)),
-      cell(`<span class="mono">${esc(op)}</span>`, op),
+      cell(`<a class="stagename" href="#/jobs/${esc(jobId)}/stages/${esc(s.stage_id)}">${esc(name)}</a>${query ? `<div class="stagequery clamp1" title="${esc(cleanSql(query))}">${esc(queryTitle(query))}</div>` : ""}`, name),
       cell(badge(s.stage_status), s.stage_status),
       cell(w ? dur(w.end - w.start) : "–", w ? w.end - w.start : -1, "num"),
       cell(`<div class="progress"><i style="width:${tasks.length ? (100 * done) / tasks.length : 0}%"></i><span>${done}/${tasks.length}</span></div>`, done),
@@ -562,7 +750,7 @@ function stageRows(jobId, stages) {
     ];
   });
 }
-const stageHeaders = ["Stage", "Root operator", "Status", { label: "Duration", num: true }, "Tasks: Succeeded/Total",
+const stageHeaders = ["Stage", "Description", "Status", { label: "Duration", num: true }, "Tasks: Succeeded/Total",
   { label: "Input rows", num: true }, { label: "Output rows", num: true }, { label: "Compute", num: true }];
 
 async function jobPage(jobId) {
@@ -581,6 +769,7 @@ async function jobPage(jobId) {
   render(`
     <div class="crumbs"><a href="#/jobs">Jobs</a> / ${esc(jobId)}</div>
     <h1>Details for Job ${esc(jobId)}</h1>
+    ${job.job_name ? `<div class="sub"><b>${esc(queryTitle(job.job_name))}</b></div>` : ""}
     <ul class="summary">
       <li><span>Status:</span>${badge(job.status)}</li>
       <li><span>Submitted:</span>${time(job.start_time)}</li>
@@ -596,7 +785,7 @@ async function jobPage(jobId) {
     ${summaryCards(summarize(allOps))}
     <details class="section" id="job-timeline"><summary>Event Timeline</summary><div class="panel">${tl}</div></details>
     <details class="section" id="job-dag" open><summary>DAG Visualization</summary><div class="panel dag">${dagSvg(dag, info, jobId)}</div></details>
-    <h2>Stages <span class="count">(${stages.length})</span></h2><div class="panel">${dtable("job-stages", stageHeaders, stageRows(jobId, stages), "No stages")}</div>
+    <h2>Stages <span class="count">(${stages.length})</span></h2><div class="panel">${dtable("job-stages", stageHeaders, stageRows(jobId, stages, job.job_name), "No stages")}</div>
     ${plans}`);
   $("#cancel")?.addEventListener("click", async () => {
     await fetch(`${API}/job/${jobId}`, { method: "PATCH" });
@@ -631,6 +820,7 @@ async function stagePage(jobId, stageId) {
   render(`
     <div class="crumbs"><a href="#/jobs">Jobs</a> / <a href="#/jobs/${esc(jobId)}">${esc(jobId)}</a> / Stage ${esc(stageId)}</div>
     <h1>Details for Stage ${esc(stageId)}</h1>
+    <div class="sub"><b>${esc(stageName(stage))}</b></div>
     <ul class="summary">
       <li><span>Status:</span>${badge(stage.stage_status)}</li>
       <li><span>Duration:</span>${w ? dur(w.end - w.start) : "–"}</li>
@@ -662,7 +852,7 @@ async function stagesPage() {
   }));
   const rows = lists.flatMap(([j, stages]) => [...stages]
     .sort((a, b) => Number(a.stage_id) - Number(b.stage_id))
-    .map((s) => [cell(`<a class="mono" href="#/jobs/${esc(j.job_id)}">${esc(j.job_id)}</a>`, j.job_id), ...stageRows(j.job_id, [s])[0]]));
+    .map((s) => [cell(`<a class="mono" href="#/jobs/${esc(j.job_id)}">${esc(j.job_id)}</a>`, j.job_id), ...stageRows(j.job_id, [s], j.job_name)[0]]));
   render(`
     <h1>Stages for the last ${jobs.length} jobs</h1>
     <div class="panel">${dtable("stages-all", ["Job", ...stageHeaders], rows, "No stages")}</div>`);
@@ -676,7 +866,7 @@ async function sqlPage() {
     (!q || sqlOf(j).toLowerCase().includes(q) || j.job_id.toLowerCase().includes(q) || (j.session_id || "").includes(q)));
   const rows = jobs.map((j) => [
     cell(`<a class="mono" href="#/sql/${esc(j.job_id)}">${esc(j.job_id)}</a>`, j.job_id),
-    cell(`<a class="sqlcell" href="#/sql/${esc(j.job_id)}" title="${esc(sqlOf(j))}">${esc(oneLine(sqlOf(j), 240)) || '<span class="faint">(no description)</span>'}</a>`, sqlOf(j)),
+    cell(descCell(sqlOf(j), `#/sql/${esc(j.job_id)}`, "s-" + j.job_id), queryTitle(sqlOf(j))),
     cell(time(j.start_time), j.start_time || 0),
     cell(dur(jobDuration(j)), jobDuration(j) ?? -1, "num"),
     cell(j.session_id ? `<a class="mono" href="#/sessions/${esc(j.session_id)}">${esc(shortId(j.session_id))}</a>` : "–", j.session_id || ""),
@@ -697,24 +887,41 @@ async function sqlPage() {
   $("#sql-status").addEventListener("change", (e) => { (tableState["sql-status"] ||= {}).filter = e.target.value; route(); });
 }
 
+// One table for all stages, like Spark's SQL details: a row per stage (click to fold) and a row per operator.
+function opMetricsTable(stages, parsed, jobId, collapsed, showZero) {
+  if (!stages.length) return '<div class="empty">No stages yet.</div>';
+  const body = stages.map((st) => {
+    const id = String(st.stage_id), ops = parsed.get(id) || [], sm = summarize(ops), shut = !!collapsed[id];
+    const tags = [sm.scanRows ? `scan ${compact(sm.scanRows)} rows` : "", sm.spillCount ? `⚠ spilled ${bytes(sm.spillBytes)}` : ""].filter(Boolean).join(" · ");
+    const head = `<tr class="stagehdr" data-stage="${esc(id)}"><td colspan="4"><span class="chev">${shut ? "▸" : "▾"}</span>
+      <b>Stage ${esc(id)}</b> · ${esc(stageName(st))} · ${badge(st.stage_status)} · ${compact(st.output_rows)} rows out
+      ${tags ? `<span class="faint"> · ${esc(tags)}</span>` : ""} <a href="#/jobs/${esc(jobId)}/stages/${esc(id)}">stage details →</a></td></tr>`;
+    if (shut) return head;
+    const rows = ops.map((op) => {
+      const out = val(op, "output_rows"), t = val(op, "elapsed_compute"), pad = Math.min(op.indent, 30) * 4;
+      return `<tr class="oprow"><td><div class="opname" style="padding-left:${pad}px">${esc(op.op.replace(/Exec$/, ""))}</div>
+        <div class="opdetail" style="padding-left:${pad}px" title="${esc(op.detail)}">${esc(oneLine(op.detail, 110))}</div></td>
+        <td class="num">${out == null ? "–" : compact(out)}</td><td class="num">${t == null ? "–" : nanos(t)}</td><td>${chips(op, showZero)}</td></tr>`;
+    }).join("");
+    return head + (rows || `<tr class="oprow"><td colspan="4" class="faint">No operator metrics yet</td></tr>`);
+  }).join("");
+  return `<div class="panel"><div class="scroll"><table class="optable"><thead><tr><th>Operator</th><th class="num">Output rows</th><th class="num">Time</th><th>Metrics</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+}
+
 async function sqlDetailPage(jobId) {
   const { job, stages, parsed, info, dag, allOps } = await jobDetails(jobId);
   const s = summarize(allOps);
+  const planView = tableState["sql-view"]?.v || "ops";
   const showZero = tableState["sql-zero"]?.on;
-  const perStage = stages.map((st) => {
-    const ops = parsed.get(String(st.stage_id)) || [];
-    const sm = summarize(ops);
-    const tag = [sm.scanRows ? `scan ${compact(sm.scanRows)} rows` : "", sm.spillCount ? `⚠ spilled ${bytes(sm.spillBytes)}` : ""].filter(Boolean).join(" · ");
-    return `<details class="section" id="sqlst-${esc(st.stage_id)}"><summary>Stage ${esc(st.stage_id)} · ${esc(st.stage_status)} · ${compact(st.output_rows)} rows out
-      <span class="faint">${esc(tag)}</span> <a href="#/jobs/${esc(jobId)}/stages/${esc(st.stage_id)}">details →</a></summary>
-      <div class="panel">${operatorTable("sqlops-" + st.stage_id, ops)}</div></details>`;
-  }).join("");
+  const collapsed = tableState["sql-collapsed"]?.ids || {};
+  const metricsTable = opMetricsTable(stages, parsed, jobId, collapsed, showZero);
   const plans = [["Logical plan", job.logical_plan], ["Physical plan", job.physical_plan]].filter(([, p]) => p)
     .map(([t, p], i) => `<details class="section" id="sqlplan-${i}"><summary>${t}</summary><div class="panel"><pre class="plan">${esc(p)}</pre></div></details>`).join("");
   render(`
-    <div class="crumbs"><a href="#/sql">SQL</a> / ${esc(jobId)}</div>
-    <h1>Query ${esc(jobId)}</h1>
+    <div class="crumbs"><a href="#/sql">SQL</a> / ${esc(job.job_name ? queryTitle(job.job_name) : jobId)}</div>
+    <h1>${esc(job.job_name ? queryTitle(job.job_name) : "Query " + jobId)}</h1>
     <ul class="summary">
+      <li><span>Query ID:</span><span class="mono" style="font-weight:400">${esc(jobId)}</span></li>
       <li><span>Status:</span>${badge(job.status)}</li>
       <li><span>Submitted:</span>${time(job.start_time)}</li>
       <li><span>Duration:</span>${dur(jobDuration(job))}</li>
@@ -726,12 +933,29 @@ async function sqlDetailPage(jobId) {
     ${job.job_name ? `<div class="toolbar"><button class="btn" id="copy">Copy SQL</button></div><pre class="sql" id="sqltext">${esc(job.job_name)}</pre>`
       : `<div class="sub faint">No SQL text was sent with this job (it was not submitted through Spark Connect).</div>`}
     ${summaryCards(s)}
-    <h2>Query plan <span class="count">(stage graph · rows between stages)</span></h2>
-    <div class="panel dag">${dagSvg(dag, info, jobId)}</div>
-    <h2>DataFusion operator metrics <label class="muted" style="font-weight:400;font-size:12px"><input type="checkbox" id="zero" ${showZero ? "checked" : ""}> include zero metrics</label></h2>
-    ${perStage || '<div class="empty">No stages yet.</div>'}
+    <h2>Query plan
+      <span class="seg"><button class="${planView === "ops" ? "on" : ""}" data-view="ops">Operators</button><button class="${planView === "stages" ? "on" : ""}" data-view="stages">Stages</button></span></h2>
+    <div class="panel dag">${planView === "ops" ? opGraphSvg(stages, parsed, jobId) : dagSvg(dag, info, jobId)}</div>
+    <h2>DataFusion operator metrics</h2>
+    <div class="toolbar">
+      <button class="btn" id="op-expand">Expand all</button><button class="btn" id="op-collapse">Collapse all</button>
+      <label class="muted"><input type="checkbox" id="zero" ${showZero ? "checked" : ""}> include zero metrics</label>
+    </div>
+    ${metricsTable}
     ${plans}`);
   $("#copy")?.addEventListener("click", () => navigator.clipboard?.writeText(job.job_name));
+  document.querySelectorAll(".seg button").forEach((b) => { b.onclick = () => { (tableState["sql-view"] ||= {}).v = b.dataset.view; route(); }; });
+  $("#op-expand")?.addEventListener("click", () => { tableState["sql-collapsed"] = { ids: {} }; route(); });
+  $("#op-collapse")?.addEventListener("click", () => { tableState["sql-collapsed"] = { ids: Object.fromEntries(stages.map((s) => [String(s.stage_id), true])) }; route(); });
+  document.querySelectorAll("tr.stagehdr").forEach((tr) => {
+    tr.onclick = (ev) => {
+      if (ev.target.closest("a")) return;
+      const st = (tableState["sql-collapsed"] ||= { ids: {} });
+      const id = tr.dataset.stage;
+      if (st.ids[id]) delete st.ids[id]; else st.ids[id] = true;
+      route();
+    };
+  });
   $("#zero")?.addEventListener("change", (e) => { (tableState["sql-zero"] ||= {}).on = e.target.checked; route(); });
 }
 
@@ -751,7 +975,7 @@ function appsOf(jobs) {
   }
   for (const a of by.values()) {
     const first = [...a.jobs].sort((x, y) => (x.start_time || 0) - (y.start_time || 0))[0];
-    a.name = a.appName || oneLine(first?.job_name, 70) || "Spark Connect session";
+    a.name = a.appName || (first?.job_name ? queryTitle(first.job_name) : "") || "Spark Connect session";
   }
   return [...by.values()].sort((a, b) => b.ended - a.ended);
 }
@@ -956,10 +1180,11 @@ function initTheme() {
 }
 
 // ---------- router ----------
-let routing = false;
+let routing = false, routingSince = 0;
 async function route() {
-  if (routing) return;
+  if (routing && Date.now() - routingSince < 30000) return;
   routing = true;
+  routingSince = Date.now();
   try {
     let parts = (location.hash.replace(/^#\/?/, "") || "jobs").split("/").map(decodeURIComponent);
     // History server: #/app/<app id>/<page> is a page inside one application, like Spark's

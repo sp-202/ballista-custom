@@ -260,3 +260,79 @@ body.history:not(.in-app) nav a.app { display: none; }
 .apps-table table { font-size: 13px; }
 .apps-table th, .apps-table td { padding: 8px 6px; }
 .apps-table .mono { font-size: 12px; }
+
+/* ---- operator graph: Spark's SQL plan graph (stages are clusters, operators are boxes) ---- */
+.dag svg .oedge { fill: none; stroke: #444; stroke-width: 1.5px; }
+.dag svg .oarrowhead { fill: #444; }
+.dag svg .oedgelabel { font: 700 11.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #000; paint-order: stroke; stroke: #fff; stroke-width: 4px; stroke-linejoin: round; }
+.dag svg .ocluster rect { fill: #a0dfff; stroke: #3ec0ff; stroke-width: 1px; }
+.dag svg .ocluster.running rect { stroke-width: 2.5px; stroke: #1b8fd6; }
+.dag svg .ocluster.failed rect { fill: #ffd3d3; stroke: #d9534f; stroke-width: 2px; }
+.dag svg .otitle { font-size: 13px; font-weight: 700; fill: #333; }
+.dag svg .osub { font-size: 11.5px; fill: #345; }
+.dag svg .onode rect { fill: #c3ebff; stroke: #3ec0ff; stroke-width: 1px; }
+.dag svg .onode.scan rect { fill: #ffdfa0; stroke: #ffc03e; stroke-width: 1.5px; }
+.dag svg .onode.join rect { fill: #e3d8f7; stroke: #b79be3; }
+.dag svg .onode.agg rect { fill: #d4f1d6; stroke: #7fcf86; }
+.dag svg .onode.shuffle rect { fill: #e6e6e6; stroke: #b8b8b8; }
+.dag svg .onode.spilled rect { stroke: #e8590c; stroke-width: 2.5px; stroke-dasharray: 5 3; }
+.dag svg .oname { font-size: 13px; font-weight: 700; fill: #333; }
+.dag svg .ometric { font-size: 11.5px; fill: #333; }
+.dag svg .onode:hover rect { filter: brightness(.96); }
+.legend .lg { border-radius: 3px; border: 1px solid transparent; }
+.legend .lg.scan { background: #ffdfa0; border-color: #ffc03e; } .legend .lg.op { background: #c3ebff; border-color: #3ec0ff; }
+.legend .lg.join { background: #e3d8f7; border-color: #b79be3; } .legend .lg.agg { background: #d4f1d6; border-color: #7fcf86; }
+.legend .lg.shuffle { background: #e6e6e6; border-color: #b8b8b8; }
+.seg { display: inline-flex; margin-left: 10px; border: 1px solid var(--border-2); border-radius: 6px; overflow: hidden; font-weight: 400; }
+.seg button { border: 0; background: var(--panel); color: var(--muted); padding: 3px 12px; font-size: 12.5px; cursor: pointer; }
+.seg button.on { background: var(--panel-2); color: var(--text); font-weight: 600; }
+:root:not([data-theme="dark"]) h2 .seg button { color: #555; }
+
+:root[data-theme="dark"] .dag svg .oedge { stroke: #8b98a8; } :root[data-theme="dark"] .dag svg .oarrowhead { fill: #8b98a8; }
+:root[data-theme="dark"] .dag svg .oedgelabel { fill: #e6eaf0; stroke: var(--panel); }
+:root[data-theme="dark"] .dag svg .ocluster rect { fill: #10283d; stroke: #2b6a99; }
+:root[data-theme="dark"] .dag svg .ocluster.failed rect { fill: #3a1a1a; stroke: #f87171; }
+:root[data-theme="dark"] .dag svg .otitle, :root[data-theme="dark"] .dag svg .oname { fill: #e6eaf0; }
+:root[data-theme="dark"] .dag svg .osub, :root[data-theme="dark"] .dag svg .ometric { fill: #aab6c4; }
+:root[data-theme="dark"] .dag svg .onode rect { fill: #17405f; stroke: #2b6a99; }
+:root[data-theme="dark"] .dag svg .onode.scan rect { fill: #4a3a12; stroke: #b98a1f; }
+:root[data-theme="dark"] .dag svg .onode.join rect { fill: #342a52; stroke: #7c63b8; }
+:root[data-theme="dark"] .dag svg .onode.agg rect { fill: #1d3d26; stroke: #3f8f55; }
+:root[data-theme="dark"] .dag svg .onode.shuffle rect { fill: #2a323c; stroke: #55616f; }
+
+/* descriptions wrap (up to 3 lines) instead of being cut; the full text is the tooltip */
+.clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: normal; word-break: break-word;
+  font-family: var(--mono); font-size: 12px; line-height: 1.45; color: var(--text); max-width: 720px; }
+a.clamp:hover { color: var(--accent); text-decoration: none; }
+.clamp1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.stagename { font-weight: 600; color: var(--text); } a.stagename { color: var(--link); }
+.stagequery { font-family: var(--mono); font-size: 11.5px; color: var(--faint); max-width: 560px; margin-top: 2px; }
+
+/* Spark-style description: a short name, full SQL behind "+details" */
+.qname { font-weight: 600; font-size: 14px; }
+a.qname { color: var(--link); }
+.qdetails { margin-top: 2px; }
+.qdetails summary { display: inline; cursor: pointer; color: var(--link); font-size: 12.5px; list-style: none; }
+.qdetails summary::-webkit-details-marker { display: none; }
+.qdetails[open] summary { display: block; margin-bottom: 4px; }
+.qsql { margin: 0; padding: 10px 12px; max-width: 760px; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  background: var(--panel-2); border: 1px solid var(--border); font-family: var(--mono); font-size: 12px; line-height: 1.5; }
+
+/* operator metrics: one table, a foldable row per stage */
+.optable { table-layout: auto; }
+.optable tr.stagehdr td { background: var(--panel-2); cursor: pointer; font-size: 13.5px; user-select: none; }
+.optable tr.stagehdr:hover td { background: var(--border); }
+.optable .chev { display: inline-block; width: 16px; color: var(--muted); }
+.optable tr.oprow td { background: var(--panel); }
+.optable tbody tr:nth-child(odd) td { background: inherit; }
+.optable tr.oprow:hover td { background: var(--panel-2); }
+.optable tr.stagehdr td a { margin-left: 8px; font-weight: 400; font-size: 12.5px; }
+.optable td { vertical-align: top; }
+
+/* Spark's palette: pale-blue operators in a deeper-blue stage box, yellow for the native scan; no per-kind colors */
+.dag svg .onode.join rect, .dag svg .onode.agg rect, .dag svg .onode.shuffle rect, .dag svg .onode.sort rect, .dag svg .onode.win rect { fill: #c3ebff; stroke: #3ec0ff; stroke-width: 1px; }
+.dag svg .onode.scan rect { fill: #ffdfa0; stroke: #ffc03e; stroke-width: 1.5px; }
+.dag svg .onode.spilled rect { stroke: #e8590c; stroke-width: 2.5px; stroke-dasharray: 5 3; }
+.legend .lg.spill { background: #c3ebff; border: 2px dashed #e8590c; }
+:root[data-theme="dark"] .dag svg .onode.join rect, :root[data-theme="dark"] .dag svg .onode.agg rect, :root[data-theme="dark"] .dag svg .onode.shuffle rect,
+:root[data-theme="dark"] .dag svg .onode.sort rect, :root[data-theme="dark"] .dag svg .onode.win rect { fill: #17405f; stroke: #2b6a99; }
