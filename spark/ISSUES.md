@@ -48,6 +48,7 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-037](#bs-037) | 🟢 | S1 | Scheduler kept ~1 GB of per-partition metrics per join-heavy job and was OOM-killed | 06 |
 | [BS-038](#bs-038) | 🔴 | S2 | `COUNT(DISTINCT)` on a column unique per row fails with `ResourcesExhausted` (313M strings, 20 GB star schema) | 06 |
 | [BS-039](#bs-039) | 🔴 | S3 | Window over a skewed partition key runs in one partition (q6 of skewbench: 31.7 s, Spark 12.4 s) | 07 |
+| [BS-040](#bs-040) | 🟢 | S2 | `spark.read.json(path)` fails on sparse nested JSON: schema inferred from only the first 1000 records | 04 |
 
 ---
 
@@ -645,4 +646,20 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 **Window over a skewed partition key runs in one partition** · 🔴 open · step 07
 - **Evidence:** `skewbench` q6 (`ROW_NUMBER() OVER (PARTITION BY product_id ...)`, product 1 is ~25% of 313M rows):
   31.7 s against Spark's 12.4 s. The skew-join rule does not cover windows.
+
+## BS-040
+**`spark.read.json(path)` fails on sparse nested JSON** · 🟢 fixed 2026-11-09 · step 04
+- **Evidence:** GitHub Archive `2026-01-01-0.json.gz` (137,019 events): `df.show()` →
+  `JsonError: whilst decoding field 'payload': ... 'milestone': ... 'closed_at': expected null got "2025-12-31T23:58:33Z"`.
+  Vanilla Spark reads it with no options. Adding `.option("schema_infer_max_records", 1_000_000)` worked.
+- **Cause:** the JSON reader inferred the schema from the first 1000 records (`schema_infer_max_records`, default
+  `"1000"` in `sail-data-source/data/options/json.yaml`). A field that is null in those records is inferred as null
+  and then fails on a later value. Spark infers from every record (`samplingRatio` 1.0).
+- **Fix:** the default is now every record (`usize::MAX`), like Spark; the option still limits inference for a
+  large input. Test `test_json_schema_inference_reads_every_record_by_default`. Plain
+  `spark.read.json(path).show()` on the file above: 1.2 s.
+- **Cost:** inference reads the whole input in the Spark Connect server during planning (Spark does the pass
+  distributed). For very large JSON inputs lower the option or give a schema.
+- **Also found:** data paths are opened inside the containers, so a host folder must be mounted
+  (`cluster/spark/compose.yml`); `~/Downloads/data` was added.
 

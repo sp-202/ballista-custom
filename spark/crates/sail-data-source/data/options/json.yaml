@@ -26,8 +26,11 @@
 - key: schema_infer_max_records
   description: |
     The maximum number of rows to read from JSON files for schema inference if needed.
+    By default every record is read, as Spark does (`samplingRatio` 1.0): sparse, nested data such as
+    GitHub Archive events has fields that are null in the first records and set later, and a sample
+    misses them and fails to decode. Lower it to infer faster from a large input.
   default:
-    value: "1000"
+    value: "18446744073709551615"
     parser: crate::options::parsers::parse_usize
   supported: true
   rust_type: usize

@@ -121,6 +121,19 @@ mod tests {
         Ok(())
     }
 
+    /// Spark infers a JSON schema from every record. A sample of the first records infers a field that is
+    /// null there (GitHub Archive's `milestone.closed_at`) as null and then fails on a later value.
+    #[test]
+    fn test_json_schema_inference_reads_every_record_by_default() -> datafusion_common::Result<()> {
+        let ctx = SessionContext::default();
+        let state = ctx.state();
+        let options = JsonReadOptions::resolve(&state, vec![])?
+            .into_table_options()
+            .map_err(datafusion_common::DataFusionError::from)?;
+        assert_eq!(options.schema_infer_max_rec, Some(usize::MAX));
+        Ok(())
+    }
+
     #[test]
     fn test_resolve_json_write_options() -> datafusion_common::Result<()> {
         let ctx = SessionContext::default();
