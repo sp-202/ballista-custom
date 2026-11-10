@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ballista-airflow"
+version = "0.1.0"
+description = "Airflow operators for submitting BallistaApplication jobs (Spark-compatible) on Kubernetes"
+requires-python = ">=3.9"
+dependencies = [
+    "apache-airflow>=2.7",
+    "apache-airflow-providers-cncf-kubernetes>=7.0",
+    "pyyaml",
+]
+
+[project.entry-points.apache_airflow_provider]
+provider_info = "ballista_airflow:get_provider_info"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ballista_airflow"]

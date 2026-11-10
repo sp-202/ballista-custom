@@ -1,0 +1,23 @@
+Ballista {{ .Chart.AppVersion }} is deploying in namespace {{ .Release.Namespace }}.
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+{{- if .Values.connect.enabled }}
+
+PySpark (Spark Connect):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.fullname" . }}-connect {{ .Values.connect.port }}
+  SparkSession.builder.remote("sc://localhost:{{ .Values.connect.port }}").getOrCreate()
+  In the cluster: sc://{{ include "ballista.fullname" . }}-connect.{{ .Release.Namespace }}.svc:{{ .Values.connect.port }}
+{{- end }}
+
+Web UI:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.schedulerHost" . }} {{ .Values.scheduler.uiPort }}
+  http://localhost:{{ .Values.scheduler.uiPort }}
+{{- if .Values.history.enabled }}
+
+History server:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.fullname" . }}-history {{ .Values.history.port }}
+{{- end }}
+
+Data paths in Spark code are opened by the connect server, scheduler and executors:
+use object stores or the same `dataVolumes` mount in all three.

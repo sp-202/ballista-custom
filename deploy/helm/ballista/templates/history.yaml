@@ -1,0 +1,97 @@
+{{- if .Values.history.enabled }}
+{{- $h := .Values.history -}}
+{{- if not $h.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ballista.historyClaim" . }}
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # event logs outlive the release, like Spark's
+spec:
+  accessModes:
+    {{- toYaml $h.persistence.accessModes | nindent 4 }}
+  {{- with $h.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $h.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ballista.fullname" . }}-history
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: history
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ballista.selector" (list . "history") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ballista.selector" (list . "history") | nindent 8 }}
+    spec:
+      {{- include "ballista.podCommon" . | nindent 6 }}
+      {{- if has "ReadWriteOnce" $h.persistence.accessModes }}
+      # A ReadWriteOnce event-log volume is attached to the scheduler's node.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "ballista.selector" (list . "scheduler") | nindent 18 }}
+      {{- end }}
+      containers:
+        - name: history
+          image: {{ include "ballista.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ballista-history-server"]
+          args:
+            - --event-log-dir=/history
+            - --bind-host=0.0.0.0
+            - --bind-port={{ $h.port }}
+            - --update-interval-seconds={{ $h.updateIntervalSeconds }}
+          {{- include "ballista.env" (list . $h.env) | nindent 10 }}
+          ports:
+            - {name: http, containerPort: {{ $h.port }}}
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $h.resources | nindent 12 }}
+          volumeMounts:
+            - {name: event-log, mountPath: /history, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+        - name: event-log
+          persistentVolumeClaim:
+            claimName: {{ include "ballista.historyClaim" . }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ballista.fullname" . }}-history
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: history
+spec:
+  type: {{ $h.service.type }}
+  selector:
+    {{- include "ballista.selector" (list . "history") | nindent 4 }}
+  ports:
+    - {name: http, port: {{ $h.port }}, targetPort: http}
+{{- end }}

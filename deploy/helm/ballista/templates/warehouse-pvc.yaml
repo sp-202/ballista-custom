@@ -1,0 +1,20 @@
+{{- $w := .Values.warehouse.persistence -}}
+{{- if and $w.enabled (not $w.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "ballista.warehouseClaim" . }}
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # managed tables outlive the release
+spec:
+  accessModes:
+    {{- toYaml $w.accessModes | nindent 4 }}
+  {{- with $w.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $w.size }}
+{{- end }}

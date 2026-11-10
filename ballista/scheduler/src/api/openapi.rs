@@ -19,8 +19,9 @@
 
 use crate::api::SchedulerErrorResponse;
 use crate::api::handlers::{
-    CancelJobResponse, ExecutorMetricResponse, ExecutorResponse, JobQueryParams,
-    SchedulerStateResponse, SchedulerVersionResponse,
+    CancelJobResponse, ExecutorMetricResponse, ExecutorResponse,
+    ExecutorScalingResponse, JobQueryParams, ScalingResponse, SchedulerStateResponse,
+    SchedulerVersionResponse,
 };
 use axum::Json;
 use axum::response::IntoResponse;
@@ -54,6 +55,7 @@ use utoipa::OpenApi;
         crate::api::handlers::get_scheduler_version,
         crate::api::handlers::get_executors,
         crate::api::handlers::get_executor_info,
+        crate::api::handlers::get_scaling,
         crate::api::handlers::get_jobs,
         crate::api::handlers::get_job,
         crate::api::handlers::cancel_job,
@@ -70,6 +72,8 @@ use utoipa::OpenApi;
             SchedulerVersionResponse,
             ExecutorResponse,
             ExecutorMetricResponse,
+            ScalingResponse,
+            ExecutorScalingResponse,
             ExecutorSpecification,
             ExecutorOperatingSystemSpecification,
             CancelJobResponse,
@@ -190,6 +194,7 @@ mod tests {
             "/api/version",
             "/api/executors",
             "/api/executor/{executor_id}",
+            "/api/scaling",
             "/api/jobs",
             "/api/job/{job_id}",
             "/api/job/{job_id}/config",

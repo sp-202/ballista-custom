@@ -1,0 +1,7 @@
+apiVersion: v2
+name: ballista-operator
+description: Kubernetes operator for Ballista clusters (with executor autoscaling) and Spark-style applications
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [ballista, spark, datafusion, operator]

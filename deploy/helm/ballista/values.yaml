@@ -1,0 +1,186 @@
+# Ballista: a Spark-compatible batch engine on Kubernetes.
+#
+#   helm install ballista deploy/helm/ballista -n ballista --create-namespace
+#   kubectl -n ballista port-forward svc/ballista-connect 15002   # PySpark: sc://localhost:15002
+#   kubectl -n ballista port-forward svc/ballista-scheduler 4040  # web UI
+#
+# Paths in Spark code are opened by the connect server (planning lists files), the
+# scheduler and the executors, so every data location must be visible to all three:
+# use object stores (s3://, gs://, abfss://) or mount the same volume via `dataVolumes`.
+
+image:
+  # One image carries every binary: ballista-spark-scheduler, ballista-spark-executor,
+  # ballista-connect, ballista-history-server (cluster/spark/Containerfile).
+  repository: localhost/ballista-spark
+  tag: dev
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}   # e.g. eks.amazonaws.com/role-arn for S3 access via IRSA
+  # Ballista never calls the Kubernetes API: no token in its pods.
+  automount: false
+
+# Environment for every component, e.g. RUST_LOG. Put credentials in a Secret and
+# reference it with envFrom (or use IRSA / Workload Identity), never in values.
+env: []
+envFrom: []         # e.g. [{secretRef: {name: s3-credentials}}]
+
+# Volumes mounted at the same path in the scheduler, executors and connect server.
+dataVolumes: []
+#  - name: tpch
+#    mountPath: /data/tpch
+#    readOnly: true
+#    volume:
+#      persistentVolumeClaim: {claimName: tpch-data}
+
+# Security defaults meet the Pod Security Standard "restricted" (label the namespace
+# pod-security.kubernetes.io/enforce=restricted; hostPath data volumes need
+# "privileged"). uid/gid 185 as in Spark's images.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 185
+  runAsGroup: 185
+  fsGroup: 185
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true   # writable emptyDir at /tmp
+  runAsNonRoot: true
+  capabilities: {drop: [ALL]}
+
+# Ballista's ports have no authentication yet (roadmap step 10), like Spark without
+# spark.authenticate: keep services ClusterIP and restrict who reaches them.
+networkPolicy:
+  enabled: false
+  # Pods allowed to reach Spark Connect (15002), e.g. Airflow workers or notebooks.
+  connectFrom: []
+  #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: airflow}}
+  # Pods allowed to reach the web UIs (4040, 18090), e.g. an ingress controller.
+  uiFrom: []
+  #  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+
+scheduler:
+  # State is in memory (control-plane HA is roadmap step 09): one replica, Recreate.
+  port: 50050          # gRPC + REST /api
+  uiPort: 4040         # web UI, like Spark's
+  policy: push-staged  # push-staged | pull-staged
+  taskDistribution: bias
+  extraArgs: []        # e.g. ["--executor-timeout-seconds", "180"]
+  env:
+    - name: RUST_LOG
+      value: ballista=info
+  resources:
+    requests: {cpu: "1", memory: 2Gi}
+    limits: {memory: 4Gi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+
+executor:
+  replicas: 2
+  vcores: 4            # task slots per executor
+  # Memory pool: either a fixed size ("8GB") or, when empty, poolFraction of the
+  # container memory limit (the executor reads its cgroup limit).
+  memoryPoolSize: ""
+  memoryPoolFraction: 0.7
+  gracefulShutdownSeconds: 60   # running tasks drain on SIGTERM
+  extraArgs: []
+  env:
+    - name: RUST_LOG
+      value: ballista=info
+  resources:
+    requests: {cpu: "4", memory: 8Gi}
+    limits: {memory: 8Gi}
+  # Shuffle files and spills. emptyDir by default; point at local NVMe in production.
+  workDir:
+    sizeLimit: ""
+    medium: ""                  # "" (disk) or Memory
+    volume: {}                  # overrides emptyDir, e.g. {hostPath: {path: /mnt/nvme}}
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # Scale executors with KEDA from the scheduler's external scaler (needs the
+  # scheduler built with the `keda-scaler` feature). The Ballista operator offers
+  # task-level autoscaling instead (deploy/helm/ballista-operator).
+  keda:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    pollingInterval: 10
+    cooldownPeriod: 300
+
+connect:
+  enabled: true
+  port: 15002
+  # Spark settings applied to every session (`start-connect-server.sh --conf`).
+  sparkConf:
+    spark.sql.warehouse.dir: /warehouse
+  extraArgs: []
+  env:
+    - name: RUST_LOG
+      value: info
+  resources:
+    requests: {cpu: "1", memory: 2Gi}
+    limits: {memory: 4Gi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+
+# Managed tables are written by executors and listed by the connect server, so the
+# warehouse must be shared: an object store (set connect.sparkConf
+# spark.sql.warehouse.dir to s3://...) or a ReadWriteMany volume here.
+warehouse:
+  persistence:
+    enabled: true
+    mountPath: /warehouse
+    existingClaim: ""
+    storageClass: ""
+    accessModes: [ReadWriteOnce]   # ReadWriteMany (EFS, Filestore, NFS) on multi-node clusters
+    size: 20Gi
+
+# The scheduler writes one event log per application; the history server reads them.
+history:
+  enabled: true
+  port: 18090
+  updateIntervalSeconds: 10
+  env:
+    - name: RUST_LOG
+      value: info
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  service:
+    type: ClusterIP
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    # ReadWriteOnce: the history server is scheduled next to the scheduler (pod affinity).
+    accessModes: [ReadWriteOnce]
+    size: 5Gi
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # One host per UI; leave a host empty to skip it.
+  schedulerUiHost: ""
+  historyHost: ""
+  tls: []

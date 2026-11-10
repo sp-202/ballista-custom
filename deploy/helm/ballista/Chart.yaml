@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ballista
+description: >-
+  Apache DataFusion Ballista as a drop-in Spark replacement for batch jobs:
+  scheduler (with web UI), executors, Spark Connect server and history server.
+type: application
+version: 0.1.0
+appVersion: "55.0.0"
+keywords: [ballista, datafusion, spark, spark-connect, batch]
+home: https://github.com/apache/datafusion-ballista
+sources:
+  - https://github.com/apache/datafusion-ballista

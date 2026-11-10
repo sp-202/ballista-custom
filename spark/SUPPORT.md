@@ -9,7 +9,7 @@ Issues are in [ISSUES.md](ISSUES.md); the plan is `~/Documents/ballista/roadmap/
 **Front ends.** *Connect* = PySpark / Spark SQL through `ballista-connect` (Sail planner,
 Ballista execution). *SQL* = Ballista's own SQL path (DataFusion planner on the scheduler).
 
-Last updated 2026-11-01.
+Last updated 2026-11-10.
 
 ## 1. Benchmarks (answers compared with vanilla Spark 3.5.8, Comet off)
 
@@ -18,6 +18,8 @@ Last updated 2026-11-01.
 | TPC-H SF10, 22 queries | SQL | ✅ 22/22 | `tpcbench/compare_answers.py`, answers in `~/Documents/tpch/answers/` |
 | TPC-H SF10, 22 queries | Connect | ✅ 22/22 | same; re-verified after BS-017 |
 | TPC-DS SF10, 99 queries | Connect | ✅ 99/99 | runs of 2026-11-01 after BS-022/023/024/025; `compare_answers.py` |
+| TPC-H SF1, 22 queries | Connect | ✅ 22/22 (12.0 s) | 2026-11-10, podman cluster and kind (Helm chart, 2 nodes); `conformance/nightly.py --scale SF1`, reports in `~/Documents/ballista/conformance-reports/sf1*/` |
+| TPC-DS SF1, 99 queries | Connect | ✅ 99/99 (103.2 s) | same runs; data `/mnt/data/tpcds/sf1-parquet` |
 | TPC-DS SF10 | SQL | ❔ not run | |
 | Nightly TPC-H + TPC-DS comparison | Connect | ✅ `conformance/nightly.py`, dated reports | first run 2026-11-01: 22/22, 99/99 |
 | Spark `sql-tests` suite | both | ❔ not run | step 01 |
@@ -118,8 +120,23 @@ decimal averages differ in the last digit (BS-009).
 |---|---|---|
 | Web UI (jobs, stages, executors) on :4040 | ✅ | step 11 |
 | Per-stage input/output row counts | ⚠️ | stages whose task metrics don't line up show 0 rows (seen on TPC-DS q5 union stages) |
-| History server UI, SQL operator metrics, auth | ❌ | step 11 |
-| Authentication, TLS on Connect | ❌ | step 10 |
+| History server UI (:18090), SQL operator metrics | ✅ | `01db572`, `1919071`; step 11 |
+| Authentication, TLS on Connect, scheduler gRPC, Flight | ❌ | step 10; until then keep services ClusterIP and use `networkPolicy` |
+
+### Kubernetes (step 12; `deploy/README.md`)
+
+| Feature | Status | Evidence / gap |
+|---|---|---|
+| Helm chart: scheduler, executors, Spark Connect, history server, warehouse | ✅ | `deploy/helm/ballista`; TPC-H/TPC-DS SF1 22/22 + 99/99 on kind (2 nodes), 2026-11-10 |
+| Pod Security "restricted" defaults (uid 185, read-only rootfs, no capabilities, no SA token) | ✅ | query + CTAS on kind as uid 185 |
+| NetworkPolicy, ClusterIP-only services, secrets via `envFrom` | ⚠️ | chart options; NetworkPolicy rendered and linted, not tested with an enforcing CNI |
+| Operator `BallistaCluster` | ✅ | `spark/bins/ballista-operator`; scheduler/connect/history + executor pods |
+| Dynamic allocation (`spark.dynamicAllocation.*` equivalents) | ✅ | kind: 1→4 executors ~2 s after load, 4→1 after 30 s idle with graceful drain; reads `GET /api/scaling` |
+| Operator `BallistaApplication` (SparkApplication-like) | ✅ | Python and SQL apps, `clusterRef` and ephemeral clusters, `restartPolicy` OnFailure retries, TTL |
+| Airflow `BallistaApplicationOperator` / `BallistaApplicationSensor` | ⚠️ | `deploy/airflow`; run against kind with Airflow imports stubbed, not yet inside a real Airflow |
+| Executor-side Python environments for UDFs | ❌ | driver-side `pythonPackages` only; step 12 |
+| Scheduler HA, operator leader election | ❌ | one replica each; step 09 |
+| `SparkApplication` CRD compatibility (Spark operator's own CRD) | ❌ | own CRD with the same field names; step 12 |
 
 ## 8. Next, in order
 1. Iceberg beyond path tables: REST catalog, time travel, metadata tables, schema evolution.
@@ -127,3 +144,4 @@ decimal averages differ in the last digit (BS-009).
 3. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
 4. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
 5. BS-028 — q72 at 71 s (Spark 17 s), deferred.
+6. Step 10 — TLS and authentication on Connect, scheduler and Flight (needed before multi-tenant Kubernetes).

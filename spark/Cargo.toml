@@ -49,6 +49,7 @@ members = [
     "bins/ballista-spark-scheduler",
     "bins/ballista-spark-executor",
     "bins/ballista-connect",
+    "bins/ballista-operator",
 ]
 resolver = "2"
 

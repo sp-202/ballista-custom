@@ -1,0 +1,41 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Default deny for Ballista pods; only the traffic Ballista needs is allowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ballista.fullname" . }}
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ballista.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    # Ballista components talk to each other on any port (scheduler gRPC,
+    # executor flight / shuffle, connect -> scheduler).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "ballista.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+    # Kubelet probes come from the node and are not subject to NetworkPolicy on
+    # most CNIs; the health port is listed for those that filter them.
+    - ports:
+        - {port: 50053, protocol: TCP}
+    {{- with $np.connectFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - {port: {{ $.Values.connect.port }}, protocol: TCP}
+    {{- end }}
+    {{- with $np.uiFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - {port: {{ $.Values.scheduler.uiPort }}, protocol: TCP}
+        - {port: {{ $.Values.history.port }}, protocol: TCP}
+    {{- end }}
+{{- end }}

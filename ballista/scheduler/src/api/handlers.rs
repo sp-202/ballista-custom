@@ -76,6 +76,42 @@ pub struct ExecutorResponse {
     pub os_info: ExecutorOperatingSystemSpecification,
 }
 
+/// What an executor autoscaler needs to know, in vcore units (like Spark's
+/// `ExecutorAllocationManager`: pending + running task demand vs. slots).
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ScalingResponse {
+    /// Jobs accepted but not yet planned into stages.
+    pub pending_jobs: usize,
+    /// Jobs with an execution graph (planned, not finished).
+    pub running_jobs: usize,
+    /// Input partitions of running stages not yet handed to a task; each needs
+    /// one vcore to run.
+    pub pending_vcores: usize,
+    /// Tasks currently running.
+    pub running_tasks: usize,
+    /// vcores held by running tasks.
+    pub busy_vcores: u64,
+    /// vcores of executors that accept new tasks (not terminating).
+    pub total_vcores: u64,
+    pub executors: Vec<ExecutorScalingResponse>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ExecutorScalingResponse {
+    pub id: String,
+    pub host: String,
+    pub vcores: u32,
+    pub running_tasks: usize,
+    pub busy_vcores: u64,
+    /// Shutting down: the scheduler sends it no new tasks.
+    pub terminating: bool,
+    /// Holds task output of a job that is still running. Removing the executor
+    /// makes the scheduler recompute that output (like Spark's shuffle tracking).
+    pub holds_shuffle_data: bool,
+    /// Seconds since the epoch of the last heartbeat.
+    pub last_seen: Option<u64>,
+}
+
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)]
@@ -349,6 +385,109 @@ pub async fn get_executors<
         .collect();
 
     Json(executors)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/scaling",
+    tag = "executors",
+    responses(
+        (status = 200, description = "Task demand and executor usage for autoscalers", body = ScalingResponse)
+    )
+)]
+pub async fn get_scaling<
+    T: AsLogicalPlan + Clone + Send + Sync + 'static,
+    U: AsExecutionPlan + Send + Sync + 'static,
+>(
+    State(data_server): State<Arc<SchedulerServer<T, U>>>,
+) -> impl IntoResponse {
+    Json(scaling_snapshot(&data_server).await)
+}
+
+pub(crate) async fn scaling_snapshot<
+    T: AsLogicalPlan + Clone + Send + Sync + 'static,
+    U: AsExecutionPlan + Send + Sync + 'static,
+>(
+    data_server: &SchedulerServer<T, U>,
+) -> ScalingResponse {
+    use crate::state::execution_stage::ExecutionStage;
+    use ballista_core::serde::protobuf::{executor_status, task_status};
+    use std::collections::HashSet;
+
+    let state = &data_server.state;
+    let mut busy: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut holds: HashSet<String> = HashSet::new();
+    let mut pending_vcores = 0;
+    let jobs = state.task_manager.get_running_job_cache();
+    for job in jobs.values() {
+        let graph = job.execution_graph.read().await;
+        pending_vcores += graph.available_tasks();
+        for stage in graph.stages().values() {
+            let infos = match stage {
+                ExecutionStage::Running(s) => &s.task_infos,
+                ExecutionStage::Successful(s) => &s.task_infos,
+                _ => continue,
+            };
+            for info in infos {
+                match &info.task_status {
+                    task_status::Status::Running(r) => {
+                        let e = busy.entry(r.executor_id.clone()).or_default();
+                        e.0 += 1;
+                        e.1 += u64::from(info.vcores_consumed);
+                    }
+                    task_status::Status::Successful(s) => {
+                        holds.insert(s.executor_id.clone());
+                    }
+                    task_status::Status::Failed(_) => {}
+                }
+            }
+        }
+    }
+
+    let mut executors = vec![];
+    for (metadata, _, _) in state
+        .executor_manager
+        .get_executors_state()
+        .await
+        .unwrap_or_default()
+    {
+        let heartbeat = state.executor_manager.get_executor_hearbeat(&metadata.id);
+        let terminating = matches!(
+            heartbeat
+                .as_ref()
+                .and_then(|hb| hb.status.as_ref())
+                .and_then(|s| s.status.as_ref()),
+            Some(executor_status::Status::Terminating(_))
+                | Some(executor_status::Status::Dead(_))
+        );
+        let (running_tasks, busy_vcores) =
+            busy.get(&metadata.id).copied().unwrap_or_default();
+        executors.push(ExecutorScalingResponse {
+            holds_shuffle_data: holds.contains(&metadata.id),
+            id: metadata.id,
+            host: metadata.host,
+            vcores: metadata.specification.vcores,
+            running_tasks,
+            busy_vcores,
+            terminating,
+            last_seen: heartbeat.map(|hb| hb.timestamp),
+        });
+    }
+    executors.sort_by(|a, b| a.id.cmp(&b.id));
+
+    ScalingResponse {
+        pending_jobs: state.task_manager.pending_job_number(),
+        running_jobs: jobs.len(),
+        pending_vcores,
+        running_tasks: executors.iter().map(|e| e.running_tasks).sum(),
+        busy_vcores: executors.iter().map(|e| e.busy_vcores).sum(),
+        total_vcores: executors
+            .iter()
+            .filter(|e| !e.terminating)
+            .map(|e| u64::from(e.vcores))
+            .sum(),
+        executors,
+    }
 }
 
 #[utoipa::path(

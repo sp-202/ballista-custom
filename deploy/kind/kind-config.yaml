@@ -1,0 +1,16 @@
+# Local Kubernetes for developing the Ballista chart and operator.
+#   deploy/kind/up.sh
+# Host directories are mounted into every node at the same path, so hostPath volumes
+# are shared by all pods (like a ReadWriteMany volume on a real cluster).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ballista
+nodes:
+  - role: control-plane
+  - role: worker
+    extraMounts: &mounts
+      - {hostPath: /home/subhodeep/Documents/tpch, containerPath: /data/tpch, readOnly: true}
+      - {hostPath: /mnt/data/tpcds, containerPath: /data/tpcds, readOnly: true}
+      - {hostPath: /mnt/data/ballista-kind, containerPath: /data/ballista}
+  - role: worker
+    extraMounts: *mounts

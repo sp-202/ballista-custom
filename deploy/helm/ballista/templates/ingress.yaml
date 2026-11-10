@@ -1,0 +1,43 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ballista.fullname" . }}
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- with .Values.ingress.schedulerUiHost }}
+    - host: {{ . }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ballista.schedulerHost" $ }}
+                port: {name: ui}
+    {{- end }}
+    {{- if and .Values.history.enabled .Values.ingress.historyHost }}
+    - host: {{ .Values.ingress.historyHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ballista.fullname" . }}-history
+                port: {name: http}
+    {{- end }}
+{{- end }}

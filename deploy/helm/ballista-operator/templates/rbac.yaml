@@ -1,0 +1,62 @@
+{{- if .Values.rbac.create }}
+{{- $kind := ternary "Role" "ClusterRole" (ne .Values.watchNamespace "") }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $kind }}
+metadata:
+  name: {{ include "op.fullname" . }}
+  {{- if .Values.watchNamespace }}
+  namespace: {{ .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "op.labels" . | nindent 4 }}
+rules:
+  {{- include "op.rules" . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: {{ $kind }}Binding
+metadata:
+  name: {{ include "op.fullname" . }}
+  {{- if .Values.watchNamespace }}
+  namespace: {{ .Values.watchNamespace }}
+  {{- end }}
+  labels:
+    {{- include "op.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: {{ $kind }}
+  name: {{ include "op.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "op.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.rbac.aggregateToDefaultRoles }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "op.fullname" . }}-edit
+  labels:
+    {{- include "op.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: [ballista.apache.org]
+    resources: [ballistaclusters, ballistaapplications]
+    verbs: [get, list, watch, create, patch, update, delete, deletecollection]
+  - apiGroups: [ballista.apache.org]
+    resources: [ballistaclusters/status, ballistaapplications/status]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "op.fullname" . }}-view
+  labels:
+    {{- include "op.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: [ballista.apache.org]
+    resources: [ballistaclusters, ballistaapplications, ballistaclusters/status, ballistaapplications/status]
+    verbs: [get, list, watch]
+{{- end }}
+{{- end }}

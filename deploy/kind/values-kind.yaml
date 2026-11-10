@@ -1,0 +1,40 @@
+# Chart values for the local kind cluster (deploy/kind/kind-config.yaml).
+image:
+  repository: localhost/ballista-spark
+  tag: dev
+  pullPolicy: Never   # loaded with `kind load`
+
+dataVolumes:
+  - name: tpch
+    mountPath: /data/tpch
+    readOnly: true
+    volume: {hostPath: {path: /data/tpch, type: Directory}}
+  - name: tpcds
+    mountPath: /data/tpcds
+    readOnly: true
+    volume: {hostPath: {path: /data/tpcds, type: Directory}}
+  # Shared by connect and executors on every node (managed tables).
+  - name: warehouse
+    mountPath: /warehouse
+    volume: {hostPath: {path: /data/ballista/warehouse, type: DirectoryOrCreate}}
+
+warehouse:
+  persistence:
+    enabled: false   # the hostPath data volume above is the warehouse
+
+scheduler:
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 3Gi}
+
+executor:
+  replicas: 2
+  vcores: 4
+  resources:
+    requests: {cpu: "1", memory: 1Gi}
+    limits: {memory: 4Gi}
+
+connect:
+  resources:
+    requests: {cpu: 500m, memory: 512Mi}
+    limits: {memory: 3Gi}

@@ -118,6 +118,25 @@ See the [architecture guide](docs/source/contributors-guide/architecture.md) for
 The easiest way to get started is to run one of the standalone or distributed [examples](./examples/README.md). After
 that, refer to the [Getting Started Guide](ballista/client/README.md).
 
+## Spark on Ballista (branch `ballista-spark`)
+
+This fork runs Spark workloads on Ballista: PySpark and Spark SQL clients connect through Spark Connect
+(`ballista-connect`, planned by [Sail](https://github.com/lakehq/sail)) and run on Ballista's scheduler and
+executors with AQE. TPC-H and TPC-DS answers match vanilla Spark at SF1 and SF10.
+
+- [spark/SUPPORT.md](spark/SUPPORT.md): what is supported, feature by feature, with evidence.
+- [spark/ISSUES.md](spark/ISSUES.md): issue tracker (BS-xxx).
+- [deploy/README.md](deploy/README.md): Kubernetes deployment.
+  - Helm chart `deploy/helm/ballista`.
+  - Operator with `BallistaCluster` (Spark-style dynamic allocation) and `BallistaApplication` (SparkApplication-like jobs).
+  - Airflow operator and sensor.
+  - Pod Security "restricted" defaults.
+
+```sh
+helm install ballista deploy/helm/ballista -n ballista --create-namespace
+kubectl -n ballista port-forward svc/ballista-connect 15002   # SparkSession.builder.remote("sc://localhost:15002")
+```
+
 ## Web Terminal User Interface (Web TUI)
 
 Ballista provides a browser-based Web TUI for monitoring a running cluster. It exposes the TUI views for jobs, executors, metrics, and scheduler information directly in a web browser.

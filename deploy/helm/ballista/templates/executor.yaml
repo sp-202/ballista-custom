@@ -1,0 +1,154 @@
+{{- $e := .Values.executor -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ballista.fullname" . }}-executor
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  {{- if not $e.keda.enabled }}
+  replicas: {{ $e.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ballista.selector" (list . "executor") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ballista.selector" (list . "executor") | nindent 8 }}
+      {{- with $e.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "ballista.podCommon" . | nindent 6 }}
+      # Running tasks finish before the executor exits (it reports Terminating first).
+      terminationGracePeriodSeconds: {{ add $e.gracefulShutdownSeconds 15 }}
+      containers:
+        - name: executor
+          image: {{ include "ballista.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ballista-spark-executor"]
+          args:
+            - --bind-host=0.0.0.0
+            # Other executors fetch shuffle files from this address.
+            - --external-host=$(POD_IP)
+            - --id=$(POD_NAME)
+            - --scheduler-host={{ include "ballista.schedulerHost" . }}
+            - --scheduler-port={{ .Values.scheduler.port }}
+            - --vcores={{ $e.vcores }}
+            {{- if $e.memoryPoolSize }}
+            - --memory-pool-size={{ $e.memoryPoolSize }}
+            {{- else }}
+            - --memory-pool-fraction={{ $e.memoryPoolFraction }}
+            {{- end }}
+            - --work-dir=/work
+            - --graceful-shutdown-timeout-seconds={{ $e.gracefulShutdownSeconds }}
+            - --scheduler-connect-timeout-seconds=120
+            {{- range $e.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - {name: HOME, value: /tmp}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            {{- with concat (.Values.env | default list) ($e.env | default list) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - {name: flight, containerPort: 50051}
+            - {name: grpc, containerPort: 50052}
+            - {name: health, containerPort: 50053}
+          readinessProbe:
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $e.resources | nindent 12 }}
+          volumeMounts:
+            - {name: work, mountPath: /work}
+            {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- if .Values.warehouse.persistence.enabled }}
+            - {name: warehouse, mountPath: {{ .Values.warehouse.persistence.mountPath }}}
+            {{- end }}
+      volumes:
+        - name: work
+          {{- if $e.workDir.volume }}
+          {{- toYaml $e.workDir.volume | nindent 10 }}
+          {{- else }}
+          emptyDir:
+            {{- with $e.workDir.medium }}
+            medium: {{ . }}
+            {{- end }}
+            {{- with $e.workDir.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+          {{- end }}
+        {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- if .Values.warehouse.persistence.enabled }}
+        - name: warehouse
+          persistentVolumeClaim:
+            claimName: {{ include "ballista.warehouseClaim" . }}
+        {{- end }}
+      {{- with $e.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $e.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $e.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if $e.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ballista.fullname" . }}-executor
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  maxUnavailable: {{ $e.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "ballista.selector" (list . "executor") | nindent 6 }}
+{{- end }}
+{{- if $e.keda.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "ballista.fullname" . }}-executor
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "ballista.fullname" . }}-executor
+  minReplicaCount: {{ $e.keda.minReplicas }}
+  maxReplicaCount: {{ $e.keda.maxReplicas }}
+  pollingInterval: {{ $e.keda.pollingInterval }}
+  cooldownPeriod: {{ $e.keda.cooldownPeriod }}
+  triggers:
+    - type: external
+      metadata:
+        scalerAddress: {{ include "ballista.schedulerHost" . }}.{{ .Release.Namespace }}.svc:{{ .Values.scheduler.port }}
+{{- end }}

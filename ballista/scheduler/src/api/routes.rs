@@ -38,6 +38,7 @@ fn api_router<
             "/api/executor/{executor_id}",
             get(handlers::get_executor_info::<T, U>),
         )
+        .route("/api/scaling", get(handlers::get_scaling::<T, U>))
         .route("/api/jobs", get(handlers::get_jobs::<T, U>))
         .route(
             "/api/job/{job_id}",

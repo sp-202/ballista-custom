@@ -49,6 +49,8 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 | [BS-038](#bs-038) | 🔴 | S2 | `COUNT(DISTINCT)` on a column unique per row fails with `ResourcesExhausted` (313M strings, 20 GB star schema) | 06 |
 | [BS-039](#bs-039) | 🔴 | S3 | Window over a skewed partition key runs in one partition (q6 of skewbench: 31.7 s, Spark 12.4 s) | 07 |
 | [BS-040](#bs-040) | 🟢 | S2 | `spark.read.json(path)` fails on sparse nested JSON: schema inferred from only the first 1000 records | 04 |
+| [BS-041](#bs-041) | 🔴 | S3 | Idle executors keep ~2.2 GB RSS after queries finish | 08 |
+| [BS-042](#bs-042) | 🟢 | S2 | `ballista-cli` fails to compile: `api::web_ui_assets` not gated on `rest-api` | 11 |
 
 ---
 
@@ -663,3 +665,18 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
 - **Also found:** data paths are opened inside the containers, so a host folder must be mounted
   (`cluster/spark/compose.yml`); `~/Downloads/data` was added.
 
+## BS-041
+**Idle executors keep ~2.2 GB RSS after queries finish** · 🔴 open · step 08
+- **Evidence:** after the SF1 TPC-DS run on the podman cluster, each idle executor still held ~2.2 GB RSS
+  (`podman stats`) with no running tasks; total cluster ~6.6 GB at rest.
+- **Likely cause:** allocator retention (memory freed to the allocator, not returned to the OS); not yet measured
+  with allocator stats. Matters for packing executors on shared nodes and for dynamic allocation, where idle
+  executors are kept for `executorIdleTimeout`.
+
+## BS-042
+**`ballista-cli` fails to compile: `api::web_ui_assets` not gated on `rest-api`** · 🟢 fixed 2026-11-10 · step 11
+- **Evidence:** `cargo check -p ballista-cli` → `E0433 cannot find module ui` in `ballista/scheduler/src/api/mod.rs`;
+  the CLI depends on the scheduler without the `rest-api` feature. rust-analyzer reported it as errors in
+  `ballista-cli/src/tui` (`JobResponse` fields).
+- **Cause:** `web_ui_assets` (added with the history server, `01db572`) uses the `rest-api`-only `ui` module.
+- **Fix:** `#[cfg(feature = "rest-api")]` on `web_ui_assets`; `ballista-cli` compiles.

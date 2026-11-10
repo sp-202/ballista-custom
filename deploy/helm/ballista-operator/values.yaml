@@ -1,0 +1,57 @@
+# Ballista operator: reconciles BallistaCluster (scheduler, executors with Spark-style
+# dynamic allocation, Spark Connect, history server) and BallistaApplication
+# (spark-submit-like jobs on a shared or ephemeral cluster).
+#
+#   helm install ballista-operator deploy/helm/ballista-operator -n ballista-system --create-namespace
+#
+# CRDs live in crds/ (Helm installs them once and never upgrades or deletes them):
+#   kubectl apply --server-side -f deploy/helm/ballista-operator/crds/
+
+image:
+  repository: localhost/ballista-spark   # the operator ships in the engine image
+  tag: dev
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Default image for application drivers (Python + pyspark-client + /opt/ballista/run.py).
+driverImage: localhost/ballista-pyspark:dev
+
+# Namespaces the operator watches. Empty: all namespaces (ClusterRole). One name:
+# only that namespace (Role), which is the least-privilege choice.
+watchNamespace: ""
+
+logLevel: info,kube_runtime=warn   # RUST_LOG for the operator
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+  # Aggregate edit rights on BallistaCluster/BallistaApplication into the built-in
+  # "edit"/"admin" roles, and read rights into "view", so namespace users can submit.
+  aggregateToDefaultRoles: true
+
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {memory: 256Mi}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 185
+  runAsGroup: 185
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities: {drop: [ALL]}
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

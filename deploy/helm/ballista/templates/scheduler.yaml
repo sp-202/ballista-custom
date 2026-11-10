@@ -1,0 +1,106 @@
+{{- $s := .Values.scheduler -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ballista.fullname" . }}-scheduler
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 1
+  # Job state lives in the scheduler's memory: never run two at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ballista.selector" (list . "scheduler") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ballista.selector" (list . "scheduler") | nindent 8 }}
+      {{- with $s.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "ballista.podCommon" . | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: scheduler
+          image: {{ include "ballista.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ballista-spark-scheduler"]
+          args:
+            - --bind-host=0.0.0.0
+            - --bind-port={{ $s.port }}
+            - --external-host={{ include "ballista.schedulerHost" . }}
+            - --web-ui-port={{ $s.uiPort }}
+            - --scheduler-policy={{ $s.policy }}
+            - --task-distribution={{ $s.taskDistribution }}
+            {{- if .Values.history.enabled }}
+            - --event-log-dir=/history
+            {{- end }}
+            {{- range $s.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- include "ballista.env" (list . $s.env) | nindent 10 }}
+          ports:
+            - {name: grpc, containerPort: {{ $s.port }}}
+            - {name: ui, containerPort: {{ $s.uiPort }}}
+          readinessProbe:
+            httpGet: {path: /api/version, port: grpc}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /api/version, port: grpc}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $s.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- if .Values.history.enabled }}
+            - {name: event-log, mountPath: /history}
+            {{- end }}
+      volumes:
+        {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- if .Values.history.enabled }}
+        - name: event-log
+          persistentVolumeClaim:
+            claimName: {{ include "ballista.historyClaim" . }}
+        {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ballista.schedulerHost" . }}
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+  {{- with $s.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $s.service.type }}
+  selector:
+    {{- include "ballista.selector" (list . "scheduler") | nindent 4 }}
+  ports:
+    - {name: grpc, port: {{ $s.port }}, targetPort: grpc, appProtocol: grpc}
+    - {name: ui, port: {{ $s.uiPort }}, targetPort: ui}

@@ -1,0 +1,101 @@
+{{- if .Values.connect.enabled }}
+{{- $c := .Values.connect -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ballista.fullname" . }}-connect
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: connect
+spec:
+  # Spark Connect sessions live in this process; one replica keeps them reachable.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ballista.selector" (list . "connect") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ballista.selector" (list . "connect") | nindent 8 }}
+      {{- with $c.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include "ballista.podCommon" . | nindent 6 }}
+      containers:
+        - name: connect
+          image: {{ include "ballista.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["ballista-connect"]
+          args:
+            - --ip=0.0.0.0
+            - --port={{ $c.port }}
+            - --scheduler-url=http://{{ include "ballista.schedulerHost" . }}:{{ .Values.scheduler.port }}
+            {{- range $k, $v := $c.sparkConf }}
+            - --conf={{ $k }}={{ $v }}
+            {{- end }}
+            {{- range $c.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- include "ballista.env" (list . $c.env) | nindent 10 }}
+          ports:
+            - {name: spark-connect, containerPort: {{ $c.port }}}
+          readinessProbe:
+            tcpSocket: {port: spark-connect}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: spark-connect}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- if .Values.warehouse.persistence.enabled }}
+            - {name: warehouse, mountPath: {{ .Values.warehouse.persistence.mountPath }}}
+            {{- end }}
+      volumes:
+        {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- if .Values.warehouse.persistence.enabled }}
+        - name: warehouse
+          persistentVolumeClaim:
+            claimName: {{ include "ballista.warehouseClaim" . }}
+        {{- end }}
+      {{- with $c.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ballista.fullname" . }}-connect
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+    app.kubernetes.io/component: connect
+  {{- with $c.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $c.service.type }}
+  selector:
+    {{- include "ballista.selector" (list . "connect") | nindent 4 }}
+  ports:
+    - {name: spark-connect, port: {{ $c.port }}, targetPort: spark-connect, appProtocol: grpc}
+{{- end }}

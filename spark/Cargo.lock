@@ -541,6 +541,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-broadcast"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1103,6 +1115,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
+]
+
+[[package]]
 name = "ballista-api-types"
 version = "55.0.0"
 dependencies = [
@@ -1198,6 +1221,27 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ballista-operator"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "env_logger",
+ "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
  "tokio",
 ]
 
@@ -3155,6 +3199,18 @@ dependencies = [
 
 [[package]]
 name = "educe"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7bc049e1bd8cdeb31b68bbd586a9464ecf9f3944af3958a7a9d0f8b9799417"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "educe"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebdb1f8f8d2815bbe7b369a7da10343c82026a4503b68bd1279ba557611e96d"
@@ -3738,6 +3794,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "granit-parser"
 version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3808,6 +3876,11 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashbrown"
@@ -3948,6 +4021,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
 ]
 
 [[package]]
@@ -4973,6 +5057,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
 
 [[package]]
+name = "json-patch"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7421438de105a0827e44fadd05377727847d717c80ce29a229f85fd04c427b72"
+dependencies = [
+ "jsonptr",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "jsonpath-rust"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4986,6 +5082,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonptr"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5a3cc660ba5d72bce0b3bb295bf20847ccbb40fd423f3f05b61273672e561fe"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "k8s-openapi"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4993,6 +5099,7 @@ checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
 dependencies = [
  "base64 0.22.1",
  "jiff",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
 ]
@@ -5006,6 +5113,8 @@ dependencies = [
  "k8s-openapi",
  "kube-client",
  "kube-core",
+ "kube-derive",
+ "kube-runtime",
 ]
 
 [[package]]
@@ -5054,11 +5163,54 @@ dependencies = [
  "form_urlencoded",
  "http",
  "jiff",
+ "json-patch",
  "k8s-openapi",
+ "schemars 1.2.2",
  "serde",
  "serde-value",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "kube-derive"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92141c19e1fa83bf91633c1234c66b03375c29aa8ca5486331ddb47e3a3da9c0"
+dependencies = [
+ "darling 0.23.0",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "kube-runtime"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eb064ef71c7bea55e934a443960da9e9ec31fbb2ba63e47e4aeca32603d5cc7"
+dependencies = [
+ "ahash",
+ "async-broadcast",
+ "async-stream",
+ "backon",
+ "educe 0.6.0",
+ "futures",
+ "hashbrown 0.16.1",
+ "hostname",
+ "json-patch",
+ "k8s-openapi",
+ "kube-client",
+ "parking_lot",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -7362,7 +7514,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
- "educe",
+ "educe 0.8.1",
  "futures",
  "parquet-variant",
  "parquet-variant-compute",
@@ -7514,7 +7666,7 @@ dependencies = [
  "datafusion-datasource-json",
  "datafusion-expr",
  "datafusion-session",
- "educe",
+ "educe 0.8.1",
  "futures",
  "glob",
  "log",
@@ -7552,7 +7704,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-nested",
  "datafusion-physical-expr",
- "educe",
+ "educe 0.8.1",
  "futures",
  "indexmap 2.14.2",
  "itertools 0.15.0",
@@ -7709,7 +7861,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-datasource",
  "datafusion-expr",
- "educe",
+ "educe 0.8.1",
  "flate2",
  "futures",
  "log",
@@ -7766,7 +7918,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
- "educe",
+ "educe 0.8.1",
  "html-escape",
  "log",
  "sail-common",
@@ -7864,7 +8016,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-nested",
  "datafusion-spark",
- "educe",
+ "educe 0.8.1",
  "either",
  "fancy-regex",
  "half",
@@ -7906,7 +8058,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
- "educe",
+ "educe 0.8.1",
  "futures",
  "md-5 0.11.0",
  "num-bigint 0.5.1",
@@ -8171,8 +8323,21 @@ checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
  "ref-cast",
+ "schemars_derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -8310,6 +8475,17 @@ name = "serde_derive"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8991,6 +9167,7 @@ dependencies = [
  "futures-util",
  "libc",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
