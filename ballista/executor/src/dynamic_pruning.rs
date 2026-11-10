@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Dynamic partition pruning for broadcast joins, inside one task.
+//! Dynamic partition pruning for broadcast joins, and TopK filters, inside one
+//! task.
 //!
 //! Spark prunes the fact-side scan of a broadcast join with the build side's
 //! keys (`PartitionPruning` + `PlanDynamicPruningFilters`, broadcast reuse only).
@@ -54,6 +55,7 @@ use datafusion::error::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, replace_children_if_necessary};
 use datafusion::prelude::SessionConfig;
 
@@ -86,17 +88,46 @@ pub fn enable_join_filters(config: &mut SessionConfig) {
     optimizer.enable_join_dynamic_filter_pushdown = true;
 }
 
-/// Pushes the dynamic filters of every safely rewritable `CollectLeft` hash
-/// join in a decoded task plan down to its probe-side scans.
+/// Pushes the dynamic filters of TopK sorts and of every safely rewritable
+/// `CollectLeft` hash join in a decoded task plan down to the scans below them.
 pub fn push_join_filters(
     plan: Arc<dyn ExecutionPlan>,
     config: &SessionConfig,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut options: ConfigOptions = config.options().as_ref().clone();
+    let plan = push_topk_filters(plan, &options)?;
     options.optimizer.enable_join_dynamic_filter_pushdown = true;
     options.optimizer.enable_topk_dynamic_filter_pushdown = false;
     options.optimizer.enable_aggregate_dynamic_filter_pushdown = false;
     rewrite(plan, &options)
+}
+
+/// Gives every TopK (`ORDER BY .. LIMIT`) in the task plan its dynamic filter:
+/// the k-th best value seen so far, which scans below use to skip row groups,
+/// pages and (with Parquet filter pushdown) rows that cannot make the top k.
+///
+/// Unlike a join's, a TopK filter is safe in a task that runs only some of the
+/// sort's partitions. Each partition only tightens a threshold shared by all of
+/// them, and any one partition's k-th value already bounds the global top k
+/// from below. The filter is never waited on, so partitions the task does not
+/// run (and that never report) block nothing.
+fn push_topk_filters(
+    plan: Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let has_topk = plan.exists(|node| {
+        Ok(node
+            .downcast_ref::<SortExec>()
+            .is_some_and(|sort| sort.fetch().is_some()))
+    })?;
+    if !has_topk {
+        return Ok(plan);
+    }
+    let mut options = options.clone();
+    options.optimizer.enable_topk_dynamic_filter_pushdown = true;
+    options.optimizer.enable_join_dynamic_filter_pushdown = false;
+    options.optimizer.enable_aggregate_dynamic_filter_pushdown = false;
+    FilterPushdown::new_post_optimization().optimize(plan, &options)
 }
 
 fn rewrite(
@@ -197,6 +228,7 @@ fn every_partition_polled(plan: &Arc<dyn ExecutionPlan>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::compute::SortOptions;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::datasource::listing::PartitionedFile;
@@ -206,6 +238,7 @@ mod tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::displayable;
 
     fn scan(name: &str) -> Arc<dyn ExecutionPlan> {
@@ -293,5 +326,44 @@ mod tests {
         let inner = join(scan("b"), scan("c"), PartitionMode::CollectLeft);
         let plan = join(inner, scan("a"), PartitionMode::Partitioned);
         assert!(pushed(plan).contains("DynamicFilter"));
+    }
+
+    fn top_k(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            col(&input.schema().field(0).name().clone(), &input.schema()).unwrap(),
+            SortOptions::new(true, false),
+        )])
+        .unwrap();
+        Arc::new(
+            SortExec::new(ordering, input)
+                .with_fetch(Some(10))
+                .with_preserve_partitioning(true),
+        )
+    }
+
+    #[test]
+    fn top_k_filters_its_scan() {
+        let plan = pushed(top_k(scan("a")));
+        let scan_line = plan.lines().find(|l| l.contains("DataSourceExec")).unwrap();
+        assert!(scan_line.contains("DynamicFilter"), "{plan}");
+    }
+
+    #[test]
+    fn top_k_filters_reach_scans_below_partitioned_joins() {
+        // A TopK filter has no barrier, so unlike a join filter it is safe
+        // whatever joins sit between the sort and the scan.
+        let plan = top_k(join(scan("a"), scan("b"), PartitionMode::Partitioned));
+        assert!(pushed(plan).contains("DynamicFilter"));
+    }
+
+    #[test]
+    fn plans_without_top_k_are_unchanged() {
+        let sort = LexOrdering::new(vec![PhysicalSortExpr::new(
+            col("a", &scan("a").schema()).unwrap(),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort, scan("a")));
+        assert!(!pushed(plan).contains("DynamicFilter"));
     }
 }
