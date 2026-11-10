@@ -119,7 +119,7 @@ A default flip was tried on branch `perf/scan-pushdown` and reverted.
 | # | Change | Size | Expected gain | State |
 |---|---|---|---|---|
 | P1 | Turn row-level Parquet filtering on by default | config | Negative at SF100 | **Dropped** |
-| P2 | TopK filters on executors: `push_topk_filters` in `ballista/executor/src/dynamic_pruning.rs` before the join rewrite | small | `ORDER BY .. LIMIT` on sorted or clustered data skips row groups and files (e.g. "latest N rows") | Code and 3 unit tests written on local branch `perf/scan-pushdown`, not compiled or run yet |
+| P2 | TopK filters on executors: `push_topk_filters` in `ballista/executor/src/dynamic_pruning.rs` before the join rewrite | small | `ORDER BY .. LIMIT` on sorted or clustered data skips row groups and files (e.g. "latest N rows") | Code and 3 unit tests on branch `perf/scan-pushdown` (`436458a`), not compiled or run yet |
 | P3 | Nested field pruning: re-enable `push_down_leaf_projections` | small code, high risk | Struct-heavy tables read only the fields they use | Needs Sail's gold tests and a differential test against vanilla Spark |
 | P4 | Remove the duplicated scan predicate | small | Small: pruning-time CPU only | Low priority |
 | P5 | Runtime filters for shuffle joins, Spark's `InjectRuntimeFilter`: build a bloom filter and min/max of the join keys from the build-side stage, then apply it to the probe-side scan stage before its shuffle | large: AQE plus shuffle writer | TPC-H q18, q21 and q7 are shuffle-bound at SF100. This is where most of the remaining time is | Design not started (roadmap step 07, item "cross-stage runtime filters") |
