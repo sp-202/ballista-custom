@@ -587,7 +587,10 @@ impl ExecutorManager {
     async fn test_connectivity(metadata: &ExecutorMetadata) -> Result<()> {
         let executor_url = format!("http://{}:{}", metadata.host, metadata.grpc_port);
         debug!("Connecting to executor {executor_url:?}");
-        let _ = protobuf::executor_grpc_client::ExecutorGrpcClient::connect(executor_url)
+        // Same TLS settings as task launch, so a registration over mutual TLS
+        // is checked over mutual TLS.
+        let _ = create_grpc_client_endpoint(executor_url, None)?
+            .connect()
             .await
             .map_err(|e| {
                 BallistaError::Internal(format!(

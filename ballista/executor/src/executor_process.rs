@@ -58,7 +58,8 @@ use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
 use ballista_core::utils::{
-    GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint, create_grpc_server,
+    GrpcClientConfig, GrpcServerConfig, create_grpc_client_endpoint,
+    create_secure_grpc_server,
     create_grpc_server_incoming, default_config_producer, drain_or_time_out,
     get_time_before, shutdown_signal,
 };
@@ -1008,7 +1009,8 @@ async fn flight_server_task(
             "Built-in arrow flight server listening on: {address:?} max_encoding_size: {max_encoding_message_size} max_decoding_size: {max_decoding_message_size}"
         );
 
-        let server_future = create_grpc_server(&grpc_server_config)
+        // Shuffle reads and result fetches: mutual TLS when the cluster has it.
+        let server_future = create_secure_grpc_server(&grpc_server_config)?
             .add_service(
                 FlightServiceServer::new(
                     BallistaFlightService::new(work_dir)

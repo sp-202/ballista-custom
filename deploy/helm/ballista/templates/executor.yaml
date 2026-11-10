@@ -55,6 +55,7 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            {{- include "ballista.securityEnv" (list . "member") | nindent 12 }}
             {{- with concat (.Values.env | default list) ($e.env | default list) }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -83,6 +84,7 @@ spec:
           volumeMounts:
             - {name: work, mountPath: /work}
             {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- include "ballista.securityMount" . | nindent 12 }}
             {{- if .Values.warehouse.persistence.enabled }}
             - {name: warehouse, mountPath: {{ .Values.warehouse.persistence.mountPath }}}
             {{- end }}
@@ -100,6 +102,7 @@ spec:
             {{- end }}
           {{- end }}
         {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- include "ballista.securityVolume" (list . "member") | nindent 8 }}
         {{- if .Values.warehouse.persistence.enabled }}
         - name: warehouse
           persistentVolumeClaim:
@@ -151,4 +154,23 @@ spec:
     - type: external
       metadata:
         scalerAddress: {{ include "ballista.schedulerHost" . }}.{{ .Release.Namespace }}.svc:{{ .Values.scheduler.port }}
+      {{- if .Values.security.enabled }}
+      # The scheduler port requires a cluster certificate (mutual TLS).
+      authenticationRef:
+        name: {{ include "ballista.fullname" . }}-scheduler-tls
+      {{- end }}
+{{- if .Values.security.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "ballista.fullname" . }}-scheduler-tls
+  labels:
+    {{- include "ballista.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - {parameter: caCert, name: {{ include "ballista.securitySecret" . }}, key: ca.crt}
+    - {parameter: tlsClientCert, name: {{ include "ballista.securitySecret" . }}, key: tls.crt}
+    - {parameter: tlsClientKey, name: {{ include "ballista.securitySecret" . }}, key: tls.key}
+{{- end }}
 {{- end }}

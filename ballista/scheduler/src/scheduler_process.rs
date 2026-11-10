@@ -24,6 +24,9 @@ use crate::api::health_routes;
 use crate::api::route_disabled;
 use crate::cluster::BallistaCluster;
 use crate::config::SchedulerConfig;
+use crate::http_security::TlsListener;
+#[cfg(feature = "rest-api")]
+use crate::http_security::require_ui_token;
 use crate::metrics::default_metrics_collector;
 use crate::scheduler_server::SchedulerServer;
 #[cfg(feature = "keda-scaler")]
@@ -46,6 +49,7 @@ use log::info;
 use std::future::Future;
 use std::time::Duration;
 use std::{net::SocketAddr, sync::Arc};
+use axum::serve::ListenerExt;
 use tonic::service::RoutesBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
 /// Creates as initialized scheduler service
@@ -140,6 +144,9 @@ pub async fn start_grpc_service_with_listener<
 ) -> ballista_core::error::Result<()> {
     let mut shutdown = scheduler.subscribe_for_shutdown();
     let config = scheduler.state.config.clone();
+    let security = ballista_core::security::current();
+    // Built first so bad TLS settings fail startup, not the first connection.
+    let tls = security.rustls_server_config(true)?;
     let scheduler_grpc_server = SchedulerGrpcServer::new(scheduler.clone())
         .max_encoding_message_size(config.grpc_server_max_encoding_message_size as usize)
         .max_decoding_message_size(config.grpc_server_max_decoding_message_size as usize);
@@ -244,7 +251,9 @@ pub async fn start_grpc_service_with_listener<
             .merge(health)
     } else {
         spawn_web_ui(scheduler.clone()).await;
-        let axum = get_routes(scheduler);
+        // The REST API takes the UI token here too, so it is protected even
+        // when mutual TLS is off.
+        let axum = require_ui_token(get_routes(scheduler), security.ui_token());
         axum.merge(tonic).merge(health)
     };
 
@@ -258,10 +267,22 @@ pub async fn start_grpc_service_with_listener<
     let final_route =
         with_version_headers(merged).into_make_service_with_connect_info::<SocketAddr>();
 
-    axum::serve(listener, final_route)
-        .with_graceful_shutdown(async move { shutdown.recv().await })
-        .await
-        .map_err(BallistaError::from)
+    match tls {
+        // Executors, clients and the Spark Connect server present certificates
+        // signed by the cluster CA; nothing else gets a connection.
+        Some(tls) => {
+            info!("Scheduler gRPC/REST port requires mutual TLS");
+            let listener = TlsListener::new(listener, tls)?.tap_io(|_| {});
+            axum::serve(listener, final_route)
+                .with_graceful_shutdown(async move { shutdown.recv().await })
+                .await
+                .map_err(BallistaError::from)
+        }
+        None => axum::serve(listener, final_route)
+            .with_graceful_shutdown(async move { shutdown.recv().await })
+            .await
+            .map_err(BallistaError::from),
+    }
 }
 
 /// How many ports after `web_ui_port` are tried when it is in use, as Spark
@@ -296,22 +317,53 @@ async fn spawn_web_ui<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         log::warn!("Web UI disabled: no free port in {first}..={last}");
         return;
     };
+    // HTTPS on the cluster certificate (spark.ssl.ui) without client
+    // certificates: browsers and tools authenticate with the UI token.
+    let security = ballista_core::security::current();
+    let tls = if security.ui_tls() {
+        match security.rustls_server_config(false) {
+            Ok(tls) => tls,
+            Err(e) => {
+                log::warn!("Web UI disabled: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     match listener.local_addr() {
         Ok(addr) => info!(
-            "Ballista web UI available at http://{}:{}",
+            "Ballista web UI available at {}://{}:{}{}",
+            crate::http_security::scheme(tls.is_some()),
             config.external_host,
-            addr.port()
+            addr.port(),
+            if security.ui_token().is_some() {
+                " (token required)"
+            } else {
+                ""
+            }
         ),
         Err(e) => log::warn!("Web UI listening, address unknown: {e}"),
     }
 
     let mut shutdown = scheduler.subscribe_for_shutdown();
-    let app = with_version_headers(get_web_ui_routes(scheduler));
+    // Probes go to this port when the gRPC port requires client certificates.
+    let routes = get_web_ui_routes(scheduler.clone()).merge(health_routes(scheduler));
+    let app = with_version_headers(require_ui_token(routes, security.ui_token()));
     tokio::spawn(async move {
-        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let stop = async move {
             let _ = shutdown.recv().await;
-        });
-        if let Err(e) = serve.await {
+        };
+        let result = match tls {
+            Some(tls) => match TlsListener::new(listener, tls) {
+                Ok(listener) => {
+                    axum::serve(listener, app).with_graceful_shutdown(stop).await
+                }
+                Err(e) => Err(e),
+            },
+            None => axum::serve(listener, app).with_graceful_shutdown(stop).await,
+        };
+        if let Err(e) = result {
             log::warn!("Web UI server stopped: {e}");
         }
     });

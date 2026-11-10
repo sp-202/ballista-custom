@@ -6,14 +6,16 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
-    HTTPGetAction, ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodAffinity,
-    PodAffinityTerm, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, SeccompProfile,
-    SecurityContext, Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+    HTTPGetAction, KeyToPath, ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod,
+    PodAffinity, PodAffinityTerm, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    SeccompProfile, SecretKeySelector, SecretVolumeSource, SecurityContext, Service, ServicePort,
+    ServiceSpec, TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::crd::{AppType, BallistaApplicationSpec, BallistaClusterSpec, PodOptions};
+use crate::security;
 
 pub const MANAGER: &str = "ballista-operator";
 pub const CLUSTER_LABEL: &str = "ballista.apache.org/cluster";
@@ -132,6 +134,15 @@ fn http_probe(path: &str, p: i32, initial: i32, period: i32, failures: i32) -> P
     }
 }
 
+fn https_probe(path: &str, p: i32, initial: i32, period: i32, failures: i32) -> Probe {
+    let mut probe = http_probe(path, p, initial, period, failures);
+    if let Some(get) = probe.http_get.as_mut() {
+        // The kubelet does not verify the certificate.
+        get.scheme = Some("HTTPS".to_string());
+    }
+    probe
+}
+
 fn tcp_probe(p: i32, period: i32, failures: i32) -> Probe {
     Probe {
         tcp_socket: Some(TCPSocketAction {
@@ -198,6 +209,105 @@ fn plain_env(name: &str, value: &str) -> EnvVar {
         name: name.to_string(),
         value: Some(value.to_string()),
         ..Default::default()
+    }
+}
+
+// --- Authentication and encryption (see `security`) ---
+
+/// Where components find the cluster certificate, key, CA and UI token.
+pub const TLS_DIR: &str = "/etc/ballista/tls";
+const TLS_VOLUME: &str = "ballista-tls";
+
+/// What a component needs from the cluster's security Secret.
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    /// Serves the web UI and REST API: certificate and UI token.
+    Ui,
+    /// Cluster member only: certificate.
+    Member,
+    /// Spark Connect server: certificate and Connect token; `tls` serves
+    /// Spark Connect over TLS.
+    Connect { tls: bool },
+}
+
+/// Env, mounts and volumes for `role`; all empty with security off.
+#[derive(Default)]
+struct SecurityParts {
+    env: Vec<EnvVar>,
+    mounts: Vec<VolumeMount>,
+    volumes: Vec<Volume>,
+}
+
+fn secret_env(name: &str, secret: &str, key: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret.to_string(),
+                key: key.to_string(),
+                optional: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn security_parts(cluster: &str, spec: &BallistaClusterSpec, role: Role) -> SecurityParts {
+    let Some(secret) = security::secret_name(cluster, spec) else {
+        return SecurityParts::default();
+    };
+    let file = |key: &str| format!("{TLS_DIR}/{key}");
+    let mut env = vec![
+        plain_env("BALLISTA_TLS_CERT", &file(security::CERT_KEY)),
+        plain_env("BALLISTA_TLS_KEY", &file(security::KEY_KEY)),
+        plain_env("BALLISTA_TLS_CA", &file(security::CA_KEY)),
+    ];
+    let mut items = vec![security::CA_KEY, security::CERT_KEY, security::KEY_KEY];
+    match role {
+        Role::Ui => {
+            env.push(plain_env("BALLISTA_UI_TOKEN_FILE", &file(security::UI_TOKEN_KEY)));
+            items.push(security::UI_TOKEN_KEY);
+        }
+        Role::Member => {}
+        Role::Connect { tls } => {
+            env.push(secret_env(
+                "SPARK_CONNECT_AUTHENTICATE_TOKEN",
+                &secret,
+                security::CONNECT_TOKEN_KEY,
+            ));
+            if tls {
+                env.push(plain_env("BALLISTA_CONNECT_TLS", "true"));
+            }
+        }
+    }
+    SecurityParts {
+        env,
+        mounts: vec![VolumeMount {
+            name: TLS_VOLUME.to_string(),
+            mount_path: TLS_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        }],
+        volumes: vec![Volume {
+            name: TLS_VOLUME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(secret),
+                // Only the files this component needs.
+                items: Some(
+                    items
+                        .into_iter()
+                        .map(|k| KeyToPath {
+                            key: k.to_string(),
+                            path: k.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
     }
 }
 
@@ -365,7 +475,8 @@ pub fn scheduler(
         format!("--external-host={name}"),
         format!("--web-ui-port={UI_PORT}"),
     ];
-    let (mut volumes, mut mounts) = (vec![], vec![]);
+    let sec = security_parts(cluster, spec, Role::Ui);
+    let (mut volumes, mut mounts) = (sec.volumes, sec.mounts);
     if let Some((v, m)) = event_log(spec) {
         args.push("--event-log-dir=/history".to_string());
         volumes.push(v);
@@ -377,12 +488,19 @@ pub fn scheduler(
         "ballista-spark-scheduler",
         args,
         opts,
-        vec![],
+        sec.env,
         mounts,
     );
     c.ports = Some(vec![port("grpc", SCHEDULER_PORT), port("ui", UI_PORT)]);
-    c.readiness_probe = Some(http_probe("/api/version", SCHEDULER_PORT, 0, 5, 3));
-    c.liveness_probe = Some(http_probe("/api/version", SCHEDULER_PORT, 10, 20, 6));
+    if spec.security.enabled {
+        // The gRPC port takes cluster members only; probe the HTTPS UI port,
+        // whose health routes need no token.
+        c.readiness_probe = Some(https_probe("/readyz", UI_PORT, 0, 5, 3));
+        c.liveness_probe = Some(https_probe("/healthz", UI_PORT, 10, 20, 6));
+    } else {
+        c.readiness_probe = Some(http_probe("/api/version", SCHEDULER_PORT, 0, 5, 3));
+        c.liveness_probe = Some(http_probe("/api/version", SCHEDULER_PORT, 10, 20, 6));
+    }
     let template = PodTemplateSpec {
         metadata: Some(template_meta(cluster, "scheduler", opts)),
         spec: Some(pod_spec(spec, opts, vec![c], volumes)),
@@ -408,6 +526,9 @@ pub fn connect(
 ) -> (Deployment, Service) {
     let name = connect_name(cluster);
     let opts = &spec.connect.pod;
+    let role = Role::Connect {
+        tls: spec.security.connect_tls,
+    };
     let c = connect_container(
         cluster,
         ns,
@@ -415,10 +536,12 @@ pub fn connect(
         &spec.connect.spark_conf,
         opts.resources.clone(),
         opts,
+        role,
     );
+    let volumes = security_parts(cluster, spec, role).volumes;
     let template = PodTemplateSpec {
         metadata: Some(template_meta(cluster, "connect", opts)),
-        spec: Some(pod_spec(spec, opts, vec![c], vec![])),
+        spec: Some(pod_spec(spec, opts, vec![c], volumes)),
     };
     (
         singleton(&name, ns, cluster, "connect", owner, template),
@@ -440,7 +563,9 @@ fn connect_container(
     spark_conf: &BTreeMap<String, String>,
     resources: Option<k8s_openapi::api::core::v1::ResourceRequirements>,
     opts: &PodOptions,
+    role: Role,
 ) -> Container {
+    let sec = security_parts(cluster, spec, role);
     let mut args = vec![
         "--ip=0.0.0.0".to_string(),
         format!("--port={CONNECT_PORT}"),
@@ -453,8 +578,8 @@ fn connect_container(
         "ballista-connect",
         args,
         opts,
-        vec![],
-        vec![],
+        sec.env,
+        sec.mounts,
     );
     c.resources = resources;
     c.ports = Some(vec![port("spark-connect", CONNECT_PORT)]);
@@ -477,21 +602,22 @@ pub fn history(
         "--bind-host=0.0.0.0".to_string(),
         format!("--bind-port={HISTORY_PORT}"),
     ];
+    let sec = security_parts(cluster, spec, Role::Ui);
     let mut c = cluster_container(
         spec,
         "history",
         "ballista-history-server",
         args,
         opts,
-        vec![],
+        sec.env,
         vec![],
     );
-    // Only the event log, not the data volumes.
-    c.volume_mounts = Some(vec![mount, tmp_mount()]);
+    // Only the event log (and certificates), not the data volumes.
+    c.volume_mounts = Some([vec![mount, tmp_mount()], sec.mounts].concat());
     c.ports = Some(vec![port("http", HISTORY_PORT)]);
     c.readiness_probe = Some(tcp_probe(HISTORY_PORT, 10, 3));
     let mut pod = pod_spec(spec, opts, vec![c], vec![]);
-    pod.volumes = Some(vec![volume, tmp_volume()]);
+    pod.volumes = Some([vec![volume, tmp_volume()], sec.volumes].concat());
     // A ReadWriteOnce claim is attached to the scheduler's node.
     pod.affinity = Some(Affinity {
         pod_affinity: Some(PodAffinity {
@@ -553,10 +679,12 @@ pub fn executor_pod(
         (None, Some(f)) => args.push(format!("--memory-pool-fraction={f}")),
         (None, None) => {}
     }
-    let env = vec![
+    let sec = security_parts(cluster, spec, Role::Member);
+    let mut env = vec![
         env_field("POD_IP", "status.podIP"),
         env_field("POD_NAME", "metadata.name"),
     ];
+    env.extend(sec.env);
     let work = VolumeMount {
         name: "work".to_string(),
         mount_path: "/work".to_string(),
@@ -569,7 +697,7 @@ pub fn executor_pod(
         args,
         &e.pod,
         env,
-        vec![work],
+        [vec![work], sec.mounts].concat(),
     );
     c.ports = Some(vec![
         port("flight", 50051),
@@ -589,7 +717,7 @@ pub fn executor_pod(
             ..Default::default()
         },
     };
-    let mut pod = pod_spec(spec, &e.pod, vec![c], vec![work_volume]);
+    let mut pod = pod_spec(spec, &e.pod, vec![c], [vec![work_volume], sec.volumes].concat());
     // A failed executor is replaced by the operator, under a new id.
     pod.restart_policy = Some("Never".to_string());
     pod.termination_grace_period_seconds = Some(i64::from(e.graceful_shutdown_seconds) + 15);
@@ -623,6 +751,9 @@ pub fn driver_pod(
     conf.extend(app_spec.spark_conf.clone());
     conf.entry("spark.app.name".to_string())
         .or_insert_with(|| app.to_string());
+    // The script reaches the sidecar on localhost, so no TLS there; the token
+    // keeps other pods off the sidecar's port.
+    let role = Role::Connect { tls: false };
     let mut sidecar = connect_container(
         cluster,
         ns,
@@ -630,6 +761,7 @@ pub fn driver_pod(
         &conf,
         d.connect_resources.clone(),
         &PodOptions::default(),
+        role,
     );
     sidecar.restart_policy = Some("Always".to_string());
     sidecar.readiness_probe = None;
@@ -643,6 +775,13 @@ pub fn driver_pod(
         plain_env("PIP_CACHE_DIR", "/tmp/pip-cache"),
         plain_env("PYTHONDONTWRITEBYTECODE", "1"),
     ];
+    // PySpark sends it to the sidecar.
+    env.extend(
+        security_parts(cluster, cluster_spec, role)
+            .env
+            .into_iter()
+            .filter(|v| v.name == "SPARK_CONNECT_AUTHENTICATE_TOKEN"),
+    );
     let mut set = |k: &str, v: String| {
         env.push(EnvVar {
             name: k.to_string(),
@@ -692,6 +831,7 @@ pub fn driver_pod(
         ..Default::default()
     };
     let mut volumes = vec![tmp_volume()];
+    volumes.extend(security_parts(cluster, cluster_spec, role).volumes);
     volumes.extend(cluster_spec.volumes.iter().cloned());
     volumes.extend(d.volumes.iter().cloned());
     let mut l = labels(cluster, "driver");
@@ -766,6 +906,7 @@ mod tests {
             },
             connect: Default::default(),
             history: Default::default(),
+            security: Default::default(),
         }
     }
 
@@ -831,6 +972,14 @@ mod tests {
             driver.args.clone().unwrap_or_default(),
             vec!["--date", "2026-11-10"]
         );
+        // The script presents the token the sidecar requires; the sidecar
+        // reaches the cluster over mutual TLS.
+        assert!(env_names(driver).contains(&"SPARK_CONNECT_AUTHENTICATE_TOKEN".to_string()));
+        assert!(env_names(sidecar).contains(&"SPARK_CONNECT_AUTHENTICATE_TOKEN".to_string()));
+        assert!(env_names(sidecar).contains(&"BALLISTA_TLS_CERT".to_string()));
+        assert!(spec.volumes.iter().flatten().any(|v| {
+            v.secret.as_ref().and_then(|s| s.secret_name.as_deref()) == Some("c1-security")
+        }));
     }
 
     /// Every pod meets Pod Security "restricted" by default and has no API token.
@@ -889,5 +1038,80 @@ mod tests {
             .map(|p| p.containers[0].args.clone().unwrap_or_default())
             .unwrap_or_default();
         assert!(args.contains(&"--event-log-dir=/history".to_string()));
+    }
+
+    fn env_names(c: &Container) -> Vec<String> {
+        c.env
+            .iter()
+            .flatten()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    fn secret_of(pod: &PodSpec) -> Option<String> {
+        pod.volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == TLS_VOLUME)
+            .and_then(|v| v.secret.as_ref())
+            .and_then(|s| s.secret_name.clone())
+    }
+
+    #[test]
+    fn security_is_wired_into_every_component() {
+        let s = spec();
+        assert!(s.security.enabled, "security is on by default");
+
+        let (d, _) = scheduler("c1", "ns", &s, &owner());
+        let pod = d.spec.and_then(|d| d.template.spec).unwrap_or_default();
+        let c = &pod.containers[0];
+        let names = env_names(c);
+        for n in ["BALLISTA_TLS_CERT", "BALLISTA_TLS_KEY", "BALLISTA_TLS_CA", "BALLISTA_UI_TOKEN_FILE"] {
+            assert!(names.iter().any(|x| x == n), "scheduler lacks {n}");
+        }
+        let probe = c.readiness_probe.as_ref().and_then(|p| p.http_get.as_ref());
+        assert_eq!(probe.and_then(|g| g.scheme.as_deref()), Some("HTTPS"));
+        assert_eq!(probe.map(|g| g.port.clone()), Some(IntOrString::Int(UI_PORT)));
+        assert_eq!(secret_of(&pod).as_deref(), Some("c1-security"));
+
+        let exec = executor_pod("c1", "ns", &s, &owner()).spec.unwrap_or_default();
+        let names = env_names(&exec.containers[0]);
+        assert!(names.iter().any(|x| x == "BALLISTA_TLS_CERT"));
+        assert!(!names.iter().any(|x| x == "BALLISTA_UI_TOKEN_FILE"));
+        assert_eq!(secret_of(&exec).as_deref(), Some("c1-security"));
+
+        let (d, _) = connect("c1", "ns", &s, &owner());
+        let pod = d.spec.and_then(|d| d.template.spec).unwrap_or_default();
+        let token = pod.containers[0]
+            .env
+            .iter()
+            .flatten()
+            .find(|e| e.name == "SPARK_CONNECT_AUTHENTICATE_TOKEN")
+            .and_then(|e| e.value_from.as_ref())
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .map(|k| (k.name.clone(), k.key.clone()));
+        assert_eq!(
+            token,
+            Some(("c1-security".to_string(), "connect-token".to_string()))
+        );
+        assert!(!env_names(&pod.containers[0]).contains(&"BALLISTA_CONNECT_TLS".to_string()));
+
+        let mut named = spec();
+        named.security.secret_name = Some("mine".into());
+        let (d, _) = scheduler("c1", "ns", &named, &owner());
+        let pod = d.spec.and_then(|d| d.template.spec).unwrap_or_default();
+        assert_eq!(secret_of(&pod).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn security_off_leaves_pods_plain() {
+        let mut s = spec();
+        s.security.enabled = false;
+        let (d, _) = scheduler("c1", "ns", &s, &owner());
+        let pod = d.spec.and_then(|d| d.template.spec).unwrap_or_default();
+        assert!(secret_of(&pod).is_none());
+        assert!(!env_names(&pod.containers[0]).iter().any(|n| n.starts_with("BALLISTA_TLS")));
+        let probe = pod.containers[0].readiness_probe.as_ref().and_then(|p| p.http_get.as_ref());
+        assert_eq!(probe.and_then(|g| g.scheme.as_deref()), None);
     }
 }

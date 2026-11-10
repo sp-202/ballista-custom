@@ -121,7 +121,10 @@ decimal averages differ in the last digit (BS-009).
 | Web UI (jobs, stages, executors) on :4040 | ✅ | step 11 |
 | Per-stage input/output row counts | ⚠️ | stages whose task metrics don't line up show 0 rows (seen on TPC-DS q5 union stages) |
 | History server UI (:18090), SQL operator metrics | ✅ | `01db572`, `1919071`; step 11 |
-| Authentication, TLS on Connect, scheduler gRPC, Flight | ❌ | step 10; until then keep services ClusterIP and use `networkPolicy` |
+| Mutual TLS between scheduler, executors and connect, gRPC + Flight (`spark.authenticate` + `spark.network.crypto`) | ⚠️ | step 10; `ballista_core::security`, on by default in chart and operator. Unit test: cluster member accepted; stranger CA, missing client certificate and plaintext rejected. Kind end-to-end pending |
+| Spark Connect token (`spark.connect.authenticate.token`), optional TLS | ⚠️ | `BearerTokenLayer` in sail-common; unit test rejects missing/wrong token. Kind end-to-end pending |
+| HTTPS + token on web UI, REST API, history server (`spark.ssl.ui` + UI filter) | ⚠️ | `http_security.rs`; unit tests for token forms and HTTPS listener. Kind end-to-end pending |
+| Shuffle/spill encryption at rest (`spark.io.encryption.enabled`), per-user ACLs | ❌ | a token holder is fully trusted; step 10 |
 
 ### Kubernetes (step 12; `deploy/README.md`)
 
@@ -144,4 +147,4 @@ decimal averages differ in the last digit (BS-009).
 3. BS-031 — Delta `MERGE` loses rows intermittently (wrong answer).
 4. BS-026 — build a broadcast hash table once per executor, not once per task (q23).
 5. BS-028 — q72 at 71 s (Spark 17 s), deferred.
-6. Step 10 — TLS and authentication on Connect, scheduler and Flight (needed before multi-tenant Kubernetes).
+6. Step 10 — verify mutual TLS and tokens end to end on kind; then shuffle/spill encryption at rest and per-user identity.

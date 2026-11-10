@@ -21,6 +21,7 @@
 
 use ballista_core::error::{BallistaError, Result};
 use ballista_scheduler::history::{HistoryStore, history_router, spawn_refresh_task};
+use ballista_scheduler::http_security::{TlsListener, require_ui_token};
 use clap::Parser;
 use std::env;
 use std::net::SocketAddr;
@@ -61,6 +62,9 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    // HTTPS and the UI token, as on the scheduler's web UI (spark.ssl.historyServer
+    // and the history server's ui.filters in Spark).
+    ballista_core::security::init_from_env()?;
 
     // `HistoryStore::load` walks the log directory with blocking file I/O, and
     // how long it takes scales with the number of stored jobs. Run it here,
@@ -96,7 +100,16 @@ async fn serve(args: Args, store: Arc<HistoryStore>) -> Result<()> {
     }
 
     // The same web UI as the scheduler's, over the replayed `/api` responses.
-    let app = history_router(store).merge(ballista_scheduler::api::web_ui_assets());
+    let security = ballista_core::security::current();
+    let app = require_ui_token(
+        history_router(store).merge(ballista_scheduler::api::web_ui_assets()),
+        security.ui_token(),
+    );
+    let tls = if security.ui_tls() {
+        security.rustls_server_config(false)?
+    } else {
+        None
+    };
 
     let addr: SocketAddr = format!("{}:{}", args.bind_host, args.bind_port)
         .parse()
@@ -107,11 +120,22 @@ async fn serve(args: Args, store: Arc<HistoryStore>) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(BallistaError::IoError)?;
-    tracing::info!("History server listening on http://{addr}");
+    tracing::info!(
+        "History server listening on {}://{addr}{}",
+        if tls.is_some() { "https" } else { "http" },
+        if security.ui_token().is_some() {
+            " (token required)"
+        } else {
+            ""
+        }
+    );
 
-    axum::serve(listener, app.into_make_service())
-        .await
-        .map_err(BallistaError::IoError)?;
-
-    Ok(())
+    match tls {
+        Some(tls) => {
+            axum::serve(TlsListener::new(listener, tls)?, app.into_make_service())
+                .await
+        }
+        None => axum::serve(listener, app.into_make_service()).await,
+    }
+    .map_err(BallistaError::IoError)
 }

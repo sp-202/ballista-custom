@@ -56,6 +56,8 @@ async fn run() -> ballista_core::error::Result<()> {
         .with_ansi(false)
         .with_env_filter(log_filter)
         .init();
+    // Mutual TLS for task launch, shuffle reads and scheduler calls (BALLISTA_TLS_*).
+    ballista_core::security::init_from_env()?;
 
     // `/healthz` (liveness) and `/readyz` (heartbeat state), as in the stock binary.
     let (health_shutdown_tx, health_shutdown_rx) = tokio::sync::oneshot::channel();

@@ -351,7 +351,9 @@ where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
 {
-    let endpoint = tonic::transport::Endpoint::new(dst)?
+    // Cluster TLS first: it rebuilds the endpoint, dropping other settings.
+    let endpoint = crate::security::current()
+        .secure_endpoint(tonic::transport::Endpoint::new(dst)?)?
         .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
         .timeout(Duration::from_secs(config.timeout_seconds))
         // Disable Nagle's Algorithm since we don't want packets to wait
@@ -370,6 +372,7 @@ where
 /// Creates a gRPC client endpoint (without connecting) for customization.
 /// This is typically used when TLS or other custom configuration is needed.
 /// If `config` is provided, standard timeout and keepalive settings are applied.
+/// When cluster TLS is configured ([`crate::security`]), the endpoint uses it.
 pub fn create_grpc_client_endpoint<D>(
     dst: D,
     config: Option<&GrpcClientConfig>,
@@ -378,7 +381,8 @@ where
     D: std::convert::TryInto<tonic::transport::Endpoint>,
     D::Error: Into<StdError>,
 {
-    let endpoint = tonic::transport::Endpoint::new(dst)?;
+    let endpoint =
+        crate::security::current().secure_endpoint(tonic::transport::Endpoint::new(dst)?)?;
     if let Some(config) = config {
         let mut endpoint = endpoint
             .connect_timeout(Duration::from_secs(config.connect_timeout_seconds))
@@ -425,6 +429,19 @@ pub fn create_grpc_server(config: &GrpcServerConfig) -> Server {
         .http2_keepalive_timeout(Some(Duration::from_secs(
             config.http2_keepalive_timeout_seconds,
         )))
+}
+
+/// [`create_grpc_server`] with cluster TLS when it is configured: every
+/// client must then present a certificate signed by the cluster CA
+/// ([`crate::security`]).
+pub fn create_secure_grpc_server(config: &GrpcServerConfig) -> Result<Server> {
+    let server = create_grpc_server(config);
+    match crate::security::current().server_tls_config() {
+        Some(tls) => server.tls_config(tls).map_err(|e| {
+            BallistaError::Configuration(format!("invalid cluster TLS settings: {e}"))
+        }),
+        None => Ok(server),
+    }
 }
 
 /// Binds a gRPC server's listening socket, for use with tonic's

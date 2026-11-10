@@ -1,17 +1,34 @@
 use std::convert::Infallible;
 use std::future::Future;
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::codegen::http::Request;
 use tonic::server::NamedService;
+use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::{Router, TcpIncoming};
 use tonic_health::server::HealthReporter;
 use tower::ServiceBuilder;
 use tower::layer::util::{Identity, Stack};
 
+use super::auth::BearerTokenLayer;
 use crate::telemetry::TracingServerLayer;
+
+/// Who may call a server, and over what.
+#[derive(Clone, Default)]
+pub struct ServerSecurity {
+    /// Serve TLS with these settings (server certificate, and optionally a CA
+    /// that client certificates must chain to).
+    pub tls: Option<ServerTlsConfig>,
+    /// Require `authorization: Bearer <token>` on every call except health
+    /// checks (Spark's `spark.connect.authenticate.token`).
+    pub bearer_token: Option<Arc<str>>,
+}
+
+type ServerLayers =
+    Stack<Stack<BearerTokenLayer, Stack<TracingServerLayer, Identity>>, Identity>;
 
 pub struct ServerBuilderOptions {
     pub nodelay: bool,
@@ -41,11 +58,33 @@ pub struct ServerBuilder<'b> {
     health_reporter: HealthReporter,
     reflection_server_builder: tonic_reflection::server::Builder<'b>,
     // The router type has to change accordingly when layers are added.
-    router: Router<Stack<Stack<TracingServerLayer, Identity>, Identity>>,
+    router: Router<ServerLayers>,
 }
 
 impl<'b> ServerBuilder<'b> {
     pub fn new(name: &'static str, options: ServerBuilderOptions) -> Self {
+        Self::build(name, options, tonic::transport::Server::builder(), None)
+    }
+
+    /// A server with TLS and/or token authentication.
+    pub fn try_new_secure(
+        name: &'static str,
+        options: ServerBuilderOptions,
+        security: ServerSecurity,
+    ) -> Result<Self, tonic::transport::Error> {
+        let mut server = tonic::transport::Server::builder();
+        if let Some(tls) = security.tls {
+            server = server.tls_config(tls)?;
+        }
+        Ok(Self::build(name, options, server, security.bearer_token))
+    }
+
+    fn build(
+        name: &'static str,
+        options: ServerBuilderOptions,
+        server: tonic::transport::Server,
+        bearer_token: Option<Arc<str>>,
+    ) -> Self {
         let (health_reporter, health_server) = tonic_health::server::health_reporter();
 
         // TODO: We may want to turn off reflection in production if it affects performance.
@@ -59,9 +98,10 @@ impl<'b> ServerBuilder<'b> {
             //     CompressionLayer::new().gzip(true).zstd(true),
             // )
             .layer(TracingServerLayer)
+            .layer(BearerTokenLayer::new(bearer_token))
             .into_inner();
 
-        let router = tonic::transport::Server::builder()
+        let router = server
             .tcp_nodelay(options.nodelay)
             .tcp_keepalive(options.keepalive)
             .http2_keepalive_interval(options.http2_keepalive_interval)

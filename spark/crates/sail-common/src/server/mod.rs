@@ -1,3 +1,5 @@
+mod auth;
 mod builder;
 
-pub use builder::{ServerBuilder, ServerBuilderOptions};
+pub use auth::{BearerTokenLayer, BearerTokenService};
+pub use builder::{ServerBuilder, ServerBuilderOptions, ServerSecurity};

@@ -54,7 +54,7 @@ use ballista_core::serde::scheduler::from_proto::{
     get_task_definition, get_task_definition_vec,
 };
 use ballista_core::utils::{
-    create_grpc_client_endpoint, create_grpc_server, create_grpc_server_incoming,
+    create_grpc_client_endpoint, create_grpc_server_incoming, create_secure_grpc_server,
 };
 
 use dashmap::DashMap;
@@ -183,7 +183,8 @@ pub(crate) async fn startup_with_incoming<
         let mut grpc_shutdown = shutdown_noti.subscribe_for_shutdown();
         tokio::spawn(async move {
             let shutdown_signal = grpc_shutdown.recv();
-            let grpc_server_future = create_grpc_server(&grpc_server_config)
+            // Task launch and cancellation: mutual TLS when the cluster has it.
+            let grpc_server_future = create_secure_grpc_server(&grpc_server_config)?
                 .add_service(server)
                 .serve_with_incoming_shutdown(incoming, shutdown_signal);
             grpc_server_future.await.map_err(|e| {

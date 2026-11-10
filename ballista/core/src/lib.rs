@@ -98,6 +98,8 @@ pub mod planner;
 pub mod registry;
 /// Serialization and deserialization for Ballista messages and plans.
 pub mod serde;
+/// Mutual TLS between cluster processes and the web UI / REST API token.
+pub mod security;
 /// Serves partition fetches over Arrow Flight.
 pub mod serving;
 /// Graceful shutdown coordination for long-running server components.

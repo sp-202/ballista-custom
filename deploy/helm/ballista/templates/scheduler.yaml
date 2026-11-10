@@ -43,16 +43,27 @@ spec:
             {{- range $s.extraArgs }}
             - {{ . | quote }}
             {{- end }}
-          {{- include "ballista.env" (list . $s.env) | nindent 10 }}
+          {{- include "ballista.env" (list . $s.env "ui") | nindent 10 }}
           ports:
             - {name: grpc, containerPort: {{ $s.port }}}
             - {name: ui, containerPort: {{ $s.uiPort }}}
+          {{- if .Values.security.enabled }}
+          # The gRPC port takes cluster members only (mutual TLS): probe the UI
+          # port, whose health routes need no token.
+          readinessProbe:
+            httpGet: {path: /readyz, port: ui, scheme: {{ include "ballista.uiScheme" . | upper }}}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: ui, scheme: {{ include "ballista.uiScheme" . | upper }}}
+            initialDelaySeconds: 10
+          {{- else }}
           readinessProbe:
             httpGet: {path: /api/version, port: grpc}
             periodSeconds: 5
           livenessProbe:
             httpGet: {path: /api/version, port: grpc}
             initialDelaySeconds: 10
+          {{- end }}
             periodSeconds: 20
             failureThreshold: 6
           {{- with .Values.securityContext }}
@@ -63,11 +74,13 @@ spec:
             {{- toYaml $s.resources | nindent 12 }}
           volumeMounts:
             {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- include "ballista.securityMount" . | nindent 12 }}
             {{- if .Values.history.enabled }}
             - {name: event-log, mountPath: /history}
             {{- end }}
       volumes:
         {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- include "ballista.securityVolume" (list . "ui") | nindent 8 }}
         {{- if .Values.history.enabled }}
         - name: event-log
           persistentVolumeClaim:

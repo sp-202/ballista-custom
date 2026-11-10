@@ -43,9 +43,33 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(config: Settings) -> TuiResult<Self> {
-        let builder = Client::builder();
+        let mut builder = Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder.timeout(Duration::from_millis(config.http.timeout));
+        {
+            builder = builder.timeout(Duration::from_millis(config.http.timeout));
+            // A scheduler with cluster security: its UI token, and its CA for HTTPS.
+            if let Some(token) = std::env::var("BALLISTA_UI_TOKEN")
+                .ok()
+                .filter(|t| !t.trim().is_empty())
+            {
+                let mut headers = reqwest::header::HeaderMap::new();
+                let mut value =
+                    reqwest::header::HeaderValue::from_str(token.trim()).map_err(|e| {
+                        TuiError::IO(std::io::Error::other(format!("BALLISTA_UI_TOKEN: {e}")))
+                    })?;
+                value.set_sensitive(true);
+                headers.insert("x-ballista-token", value);
+                builder = builder.default_headers(headers);
+            }
+            if let Ok(ca) = std::env::var("BALLISTA_TLS_CA") {
+                let pem = std::fs::read(&ca).map_err(|e| {
+                    TuiError::IO(std::io::Error::other(format!("BALLISTA_TLS_CA {ca}: {e}")))
+                })?;
+                for cert in reqwest::Certificate::from_pem_bundle(&pem)? {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+        }
         Ok(Self {
             client: builder.build()?,
             config,

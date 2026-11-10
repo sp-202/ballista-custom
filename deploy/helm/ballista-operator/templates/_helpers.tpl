@@ -55,4 +55,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 - apiGroups: [""]
   resources: [services/proxy]
   verbs: [get]
+# Each cluster's <cluster>-security Secret (CA, certificate, tokens): created once,
+# then read for the UI token. Not list/watch, so other Secrets stay unseen.
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, create]
 {{- end -}}

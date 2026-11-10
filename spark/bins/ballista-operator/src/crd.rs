@@ -96,6 +96,38 @@ pub struct BallistaClusterSpec {
     pub connect: ConnectSpec,
     #[serde(default)]
     pub history: HistorySpec,
+    #[serde(default)]
+    pub security: SecuritySpec,
+}
+
+/// Authentication and encryption, on by default: Spark's `spark.authenticate`
+/// with `spark.network.crypto.enabled` (mutual TLS between all components),
+/// `spark.ssl.ui` with a UI filter (HTTPS and a token on the web UI and REST
+/// API), and `spark.connect.authenticate.token` (a token for Spark Connect).
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SecuritySpec {
+    pub enabled: bool,
+    /// Secret to use instead of the generated `<cluster>-security`, with keys
+    /// ca.crt, tls.crt, tls.key (a certificate for both server and client auth
+    /// whose names include "ballista-internal"), ui-token and connect-token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// Serve Spark Connect over TLS with the cluster certificate. PySpark sends
+    /// a token only to localhost or over TLS, so clients in other pods need
+    /// this (`sc://<cluster>-connect.<ns>.svc:15002/;use_ssl=true;token=...`,
+    /// with GRPC_DEFAULT_SSL_ROOTS_FILE_PATH pointing at ca.crt).
+    pub connect_tls: bool,
+}
+
+impl Default for SecuritySpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            secret_name: None,
+            connect_tls: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -228,6 +260,9 @@ pub struct BallistaClusterStatus {
     /// Spark Connect address of the shared connect server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_url: Option<String>,
+    /// Secret with the cluster CA, certificate, UI token and Spark Connect token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_secret: Option<String>,
     #[serde(default)]
     pub executors: ExecutorCounts,
     /// When tasks started waiting with no free slot (autoscaler state).

@@ -2390,6 +2390,35 @@ spec:
                       type: object
                     type: array
                 type: object
+              security:
+                default:
+                  enabled: true
+                  connectTls: false
+                description: |-
+                  Authentication and encryption, on by default: Spark's `spark.authenticate`
+                  with `spark.network.crypto.enabled` (mutual TLS between all components),
+                  `spark.ssl.ui` with a UI filter (HTTPS and a token on the web UI and REST
+                  API), and `spark.connect.authenticate.token` (a token for Spark Connect).
+                properties:
+                  connectTls:
+                    default: false
+                    description: |-
+                      Serve Spark Connect over TLS with the cluster certificate. PySpark sends
+                      a token only to localhost or over TLS, so clients in other pods need
+                      this (`sc://<cluster>-connect.<ns>.svc:15002/;use_ssl=true;token=...`,
+                      with GRPC_DEFAULT_SSL_ROOTS_FILE_PATH pointing at ca.crt).
+                    type: boolean
+                  enabled:
+                    default: true
+                    type: boolean
+                  secretName:
+                    description: |-
+                      Secret to use instead of the generated `<cluster>-security`, with keys
+                      ca.crt, tls.crt, tls.key (a certificate for both server and client auth
+                      whose names include "ballista-internal"), ui-token and connect-token.
+                    nullable: true
+                    type: string
+                type: object
               securityContext:
                 description: |-
                   Container security context of every container. Default: no privilege
@@ -3852,6 +3881,10 @@ spec:
                 type: string
               schedulerUrl:
                 description: gRPC address of the scheduler.
+                nullable: true
+                type: string
+              securitySecret:
+                description: Secret with the cluster CA, certificate, UI token and Spark Connect token.
                 nullable: true
                 type: string
             type: object
@@ -6261,6 +6294,35 @@ spec:
                               type: string
                           type: object
                         type: array
+                    type: object
+                  security:
+                    default:
+                      enabled: true
+                      connectTls: false
+                    description: |-
+                      Authentication and encryption, on by default: Spark's `spark.authenticate`
+                      with `spark.network.crypto.enabled` (mutual TLS between all components),
+                      `spark.ssl.ui` with a UI filter (HTTPS and a token on the web UI and REST
+                      API), and `spark.connect.authenticate.token` (a token for Spark Connect).
+                    properties:
+                      connectTls:
+                        default: false
+                        description: |-
+                          Serve Spark Connect over TLS with the cluster certificate. PySpark sends
+                          a token only to localhost or over TLS, so clients in other pods need
+                          this (`sc://<cluster>-connect.<ns>.svc:15002/;use_ssl=true;token=...`,
+                          with GRPC_DEFAULT_SSL_ROOTS_FILE_PATH pointing at ca.crt).
+                        type: boolean
+                      enabled:
+                        default: true
+                        type: boolean
+                      secretName:
+                        description: |-
+                          Secret to use instead of the generated `<cluster>-security`, with keys
+                          ca.crt, tls.crt, tls.key (a certificate for both server and client auth
+                          whose names include "ballista-internal"), ui-token and connect-token.
+                        nullable: true
+                        type: string
                     type: object
                   securityContext:
                     description: |-

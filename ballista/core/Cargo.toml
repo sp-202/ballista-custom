@@ -46,6 +46,7 @@ utoipa = ["dep:utoipa"]
 [dependencies]
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
+base64 = "0.22"
 chrono = { workspace = true }
 clap = { workspace = true, optional = true }
 datafusion = { workspace = true }
@@ -59,16 +60,20 @@ parking_lot = { workspace = true }
 pastey = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
+# Cluster TLS (`security` module). ring is the provider tonic's `tls-ring` uses.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { workspace = true, features = ["derive"] }
+subtle = "2.6"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
 tonic-prost = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+rcgen = "0.14"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 

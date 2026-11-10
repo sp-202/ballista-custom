@@ -60,7 +60,7 @@ spec:
             - --bind-host=0.0.0.0
             - --bind-port={{ $h.port }}
             - --update-interval-seconds={{ $h.updateIntervalSeconds }}
-          {{- include "ballista.env" (list . $h.env) | nindent 10 }}
+          {{- include "ballista.env" (list . $h.env "ui") | nindent 10 }}
           ports:
             - {name: http, containerPort: {{ $h.port }}}
           readinessProbe:
@@ -75,8 +75,10 @@ spec:
           volumeMounts:
             - {name: event-log, mountPath: /history, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            {{- include "ballista.securityMount" . | nindent 12 }}
       volumes:
         - {name: tmp, emptyDir: {}}
+        {{- include "ballista.securityVolume" (list . "ui") | nindent 8 }}
         - name: event-log
           persistentVolumeClaim:
             claimName: {{ include "ballista.historyClaim" . }}

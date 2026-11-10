@@ -54,8 +54,31 @@ securityContext:
   runAsNonRoot: true
   capabilities: {drop: [ALL]}
 
-# Ballista's ports have no authentication yet (roadmap step 10), like Spark without
-# spark.authenticate: keep services ClusterIP and restrict who reaches them.
+# Authentication and encryption, the counterpart of Spark's spark.authenticate with
+# spark.network.crypto.enabled / spark.ssl.rpc (mutual TLS between all components,
+# so only pods holding the cluster certificate can register executors, submit jobs,
+# launch tasks or read shuffle data), spark.ssl.ui + ui.filters (HTTPS and a token on
+# the web UIs and REST API) and spark.connect.authenticate.token (Spark Connect).
+security:
+  enabled: true
+  # Your own Secret instead of the generated <release>-security. Keys: ca.crt,
+  # tls.crt, tls.key (one certificate for server and client auth, whose names include
+  # "ballista-internal"), ui-token (16+ characters) and connect-token.
+  existingSecret: ""
+  # Serve Spark Connect over TLS with the cluster certificate. PySpark sends a token
+  # only to localhost or over TLS, so clients in other pods need it:
+  # sc://<release>-connect.<ns>.svc:15002/;use_ssl=true;token=... with
+  # GRPC_DEFAULT_SSL_ROOTS_FILE_PATH pointing at ca.crt. Port-forwarded clients
+  # (sc://localhost) work without it.
+  connectTls: false
+  # HTTPS on the web UI and history server (the token is required either way). Set
+  # false when an ingress terminates TLS and talks plain HTTP to the pods.
+  uiTls: true
+  # Validity of the generated CA and certificate. Rotate by deleting the Secret and
+  # upgrading the release (then restart the pods).
+  certValidityDays: 3650
+
+# Services are ClusterIP; this also limits which pods reach them.
 networkPolicy:
   enabled: false
   # Pods allowed to reach Spark Connect (15002), e.g. Airflow workers or notebooks.
@@ -177,6 +200,8 @@ history:
     size: 5Gi
 
 ingress:
+  # With security.uiTls the backends speak HTTPS: set your controller's annotation,
+  # e.g. nginx.ingress.kubernetes.io/backend-protocol: HTTPS.
   enabled: false
   className: ""
   annotations: {}

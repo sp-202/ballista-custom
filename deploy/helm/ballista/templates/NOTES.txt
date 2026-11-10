@@ -1,22 +1,46 @@
 Ballista {{ .Chart.AppVersion }} is deploying in namespace {{ .Release.Namespace }}.
 
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- $ns := .Release.Namespace }}
+{{- $secret := include "ballista.securitySecret" . }}
+{{- $scheme := include "ballista.uiScheme" . }}
+{{- if .Values.security.enabled }}
 
+Security is on: components talk mutual TLS, and clients need tokens from Secret {{ $secret }}:
+  CONNECT_TOKEN=$(kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.connect-token}' | base64 -d)
+  UI_TOKEN=$(kubectl -n {{ $ns }} get secret {{ $secret }} -o jsonpath='{.data.ui-token}' | base64 -d)
+{{- end }}
 {{- if .Values.connect.enabled }}
 
 PySpark (Spark Connect):
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.fullname" . }}-connect {{ .Values.connect.port }}
+  kubectl -n {{ $ns }} port-forward svc/{{ include "ballista.fullname" . }}-connect {{ .Values.connect.port }}
+{{- if .Values.security.enabled }}
+  SparkSession.builder.remote(f"sc://localhost:{{ .Values.connect.port }}/;token={CONNECT_TOKEN}").getOrCreate()
+{{- if .Values.security.connectTls }}
+  In the cluster: sc://{{ include "ballista.fullname" . }}-connect.{{ $ns }}.svc:{{ .Values.connect.port }}/;use_ssl=true;token=...
+    with GRPC_DEFAULT_SSL_ROOTS_FILE_PATH set to the Secret's ca.crt
+{{- else }}
+  In the cluster, PySpark sends a token only over TLS: set security.connectTls=true.
+{{- end }}
+{{- else }}
   SparkSession.builder.remote("sc://localhost:{{ .Values.connect.port }}").getOrCreate()
-  In the cluster: sc://{{ include "ballista.fullname" . }}-connect.{{ .Release.Namespace }}.svc:{{ .Values.connect.port }}
+  In the cluster: sc://{{ include "ballista.fullname" . }}-connect.{{ $ns }}.svc:{{ .Values.connect.port }}
+{{- end }}
 {{- end }}
 
 Web UI:
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.schedulerHost" . }} {{ .Values.scheduler.uiPort }}
-  http://localhost:{{ .Values.scheduler.uiPort }}
+  kubectl -n {{ $ns }} port-forward svc/{{ include "ballista.schedulerHost" . }} {{ .Values.scheduler.uiPort }}
+  {{ $scheme }}://localhost:{{ .Values.scheduler.uiPort }}
+{{- if .Values.security.enabled }}
+  Browsers ask for a login: any user name, password $UI_TOKEN. Tools send
+  "Authorization: Bearer $UI_TOKEN" or "X-Ballista-Token: $UI_TOKEN".
+  The certificate is signed by the cluster CA (ca.crt in the Secret).
+{{- end }}
 {{- if .Values.history.enabled }}
 
 History server:
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ballista.fullname" . }}-history {{ .Values.history.port }}
+  kubectl -n {{ $ns }} port-forward svc/{{ include "ballista.fullname" . }}-history {{ .Values.history.port }}
+  {{ $scheme }}://localhost:{{ .Values.history.port }}
 {{- end }}
 
 Data paths in Spark code are opened by the connect server, scheduler and executors:

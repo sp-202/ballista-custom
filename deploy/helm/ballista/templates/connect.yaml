@@ -40,7 +40,7 @@ spec:
             {{- range $c.extraArgs }}
             - {{ . | quote }}
             {{- end }}
-          {{- include "ballista.env" (list . $c.env) | nindent 10 }}
+          {{- include "ballista.env" (list . $c.env "connect") | nindent 10 }}
           ports:
             - {name: spark-connect, containerPort: {{ $c.port }}}
           readinessProbe:
@@ -58,11 +58,13 @@ spec:
             {{- toYaml $c.resources | nindent 12 }}
           volumeMounts:
             {{- include "ballista.dataVolumeMounts" . | nindent 12 }}
+            {{- include "ballista.securityMount" . | nindent 12 }}
             {{- if .Values.warehouse.persistence.enabled }}
             - {name: warehouse, mountPath: {{ .Values.warehouse.persistence.mountPath }}}
             {{- end }}
       volumes:
         {{- include "ballista.dataVolumes" . | nindent 8 }}
+        {{- include "ballista.securityVolume" (list . "member") | nindent 8 }}
         {{- if .Values.warehouse.persistence.enabled }}
         - name: warehouse
           persistentVolumeClaim:

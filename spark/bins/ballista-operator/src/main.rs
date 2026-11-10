@@ -11,6 +11,7 @@ mod autoscale;
 mod cluster;
 mod crd;
 mod resources;
+mod security;
 
 use std::sync::Arc;
 

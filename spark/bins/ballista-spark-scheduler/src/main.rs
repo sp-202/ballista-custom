@@ -39,6 +39,9 @@ async fn run() -> ballista_core::error::Result<()> {
         .with_ansi(false)
         .with_env_filter(log_filter)
         .init();
+    // Mutual TLS on the gRPC port, HTTPS and a token on the web UI (BALLISTA_TLS_*,
+    // BALLISTA_UI_TOKEN).
+    ballista_core::security::init_from_env()?;
 
     let addr = format!("{}:{}", opt.bind_host, opt.bind_port)
         .parse()

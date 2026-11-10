@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sail_common::actor::ActorSystem;
 use sail_common::config::{AppConfig, GRPC_MAX_MESSAGE_LENGTH_DEFAULT};
 use sail_common::runtime::RuntimeHandle;
-use sail_common::server::ServerBuilder;
+use sail_common::server::{ServerBuilder, ServerSecurity};
 pub use sail_session::session_factory::{
     SessionJobRunner, SessionJobRunnerFactory, SessionJobRunnerInfo,
 };
@@ -55,7 +55,7 @@ where
     let session_manager =
         create_spark_session_manager_with_factory(config, runtime, &mut system, session_factory_fn)
             .await?;
-    serve_session_manager(listener, signal, session_manager, system).await
+    serve_session_manager(listener, signal, session_manager, system, None).await
 }
 
 /// The same as [`serve_with_session_factory`], with the job runner factory
@@ -80,7 +80,33 @@ where
         job_runner_factory,
     )
     .await?;
-    serve_session_manager(listener, signal, session_manager, system).await
+    serve_session_manager(listener, signal, session_manager, system, None).await
+}
+
+/// The same as [`serve_with_factories`], with TLS and/or token authentication
+/// for Spark Connect clients.
+pub async fn serve_with_factories_secure<F>(
+    listener: TcpListener,
+    signal: F,
+    config: Arc<AppConfig>,
+    runtime: RuntimeHandle,
+    session_factory_fn: ServerSessionFactoryFn,
+    job_runner_factory: Box<dyn SessionJobRunnerFactory>,
+    security: ServerSecurity,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Future<Output = ()>,
+{
+    let mut system = ActorSystem::new();
+    let session_manager = create_spark_session_manager_with_factories(
+        config,
+        runtime,
+        &mut system,
+        session_factory_fn,
+        job_runner_factory,
+    )
+    .await?;
+    serve_session_manager(listener, signal, session_manager, system, Some(security)).await
 }
 
 async fn serve_session_manager<F>(
@@ -88,6 +114,7 @@ async fn serve_session_manager<F>(
     signal: F,
     session_manager: SessionManager,
     mut system: ActorSystem,
+    security: Option<ServerSecurity>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     F: Future<Output = ()>,
@@ -102,12 +129,24 @@ where
             .accept_compressed(CompressionEncoding::Zstd)
             .send_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Zstd);
-        ServerBuilder::new("sail_spark_connect", Default::default())
-            .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
-            .await
-            .serve(listener, signal)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        let builder = match security {
+            Some(security) => ServerBuilder::try_new_secure(
+                "sail_spark_connect",
+                Default::default(),
+                security,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string())),
+            None => Ok(ServerBuilder::new("sail_spark_connect", Default::default())),
+        };
+        match builder {
+            Ok(builder) => builder
+                .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
+                .await
+                .serve(listener, signal)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string())),
+            Err(e) => Err(e),
+        }
     };
     session_manager.shutdown().await?;
     system.join().await;

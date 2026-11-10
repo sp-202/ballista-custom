@@ -97,6 +97,8 @@ async fn main() -> ballista_core::error::Result<()> {
     } else {
         tracing.init();
     }
+    // Mutual TLS for task launch, shuffle reads and scheduler calls.
+    ballista_core::security::init_from_env()?;
 
     let memory_metrics = ExecutorMemoryMetrics::default();
     // This binary installs `AccountingAllocator` as its global allocator, so

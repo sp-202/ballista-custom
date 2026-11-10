@@ -35,6 +35,8 @@ mod flight_sql;
 /// Standalone history server: serves `/api/*` from stored event logs.
 #[cfg(feature = "rest-api")]
 pub mod history;
+/// TLS and token authentication for the scheduler's HTTP ports.
+pub mod http_security;
 /// Metrics collection and reporting.
 pub mod metrics;
 /// Physical query plan optimizers.

@@ -81,6 +81,8 @@ async fn inner() -> ballista_core::error::Result<()> {
     } else {
         tracing.init();
     }
+    // Mutual TLS on the gRPC port, HTTPS and a token on the web UI and REST API.
+    ballista_core::security::init_from_env()?;
     let addr = format!("{}:{}", opt.bind_host, opt.bind_port);
     let addr = addr.parse().map_err(|e: std::net::AddrParseError| {
         BallistaError::Configuration(e.to_string())

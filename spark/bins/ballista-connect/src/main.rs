@@ -5,6 +5,14 @@
 //! and every physical plan is executed as a job on the Ballista scheduler given
 //! by `--scheduler-url`.
 //!
+//! Security, as in Spark Connect: with `SPARK_CONNECT_AUTHENTICATE_TOKEN` (or
+//! `--conf spark.connect.authenticate.token=...`) set, clients must send
+//! `authorization: Bearer <token>` (PySpark: `sc://host:15002/;token=...`).
+//! `--tls` serves TLS with the cluster certificate, which PySpark requires
+//! before it sends a token to any host but localhost. The server's own calls
+//! to the scheduler and executors use the cluster's mutual TLS when
+//! `BALLISTA_TLS_*` is set.
+//!
 //! Sail settings (`SAIL_*` environment variables) still apply to planning,
 //! except the execution mode, which is always `local` here: Ballista, not
 //! Sail, owns the cluster, so no Sail driver or workers are started.
@@ -18,7 +26,8 @@ use clap::Parser;
 use log::{info, warn};
 use sail_common::config::{AppConfig, ExecutionMode};
 use sail_common::runtime::RuntimeManager;
-use sail_spark_connect::entrypoint::serve_with_factories;
+use sail_common::server::ServerSecurity;
+use sail_spark_connect::entrypoint::serve_with_factories_secure;
 use sail_telemetry::telemetry::{init_telemetry, shutdown_telemetry};
 use sail_telemetry::{ResourceKind, ResourceOptions};
 use tokio::net::TcpListener;
@@ -40,6 +49,73 @@ struct Args {
     /// the server and every executor share.
     #[arg(long = "conf", value_parser = parse_conf)]
     conf: Vec<(String, String)>,
+    /// Serve TLS with the cluster certificate (`BALLISTA_TLS_CERT`,
+    /// `BALLISTA_TLS_KEY`); clients verify it with the cluster CA. Also enabled
+    /// by `BALLISTA_CONNECT_TLS=true`.
+    #[arg(long)]
+    tls: bool,
+}
+
+/// Spark's setting for the Spark Connect token, and its environment variable.
+const TOKEN_CONF: &str = "spark.connect.authenticate.token";
+const TOKEN_ENV: &str = "SPARK_CONNECT_AUTHENTICATE_TOKEN";
+
+/// Takes the token out of the session settings, so no session can read it back
+/// with `spark.conf.get`. The environment variable wins over `--conf`.
+fn take_token(conf: &mut Vec<(String, String)>) -> Option<String> {
+    let from_conf = conf
+        .iter()
+        .rev()
+        .find(|(key, _)| key == TOKEN_CONF)
+        .map(|(_, value)| value.clone());
+    conf.retain(|(key, _)| key != TOKEN_CONF);
+    std::env::var(TOKEN_ENV)
+        .ok()
+        .or(from_conf)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// What Spark Connect clients must present, and over what.
+fn client_security(
+    args: &Args,
+    token: Option<String>,
+) -> Result<ServerSecurity, Box<dyn std::error::Error>> {
+    let cluster = ballista_core::security::init_from_env()?;
+    let tls = if args.tls || env_flag("BALLISTA_CONNECT_TLS") {
+        Some(cluster.public_server_tls_config().ok_or(
+            "--tls needs the cluster certificate: set BALLISTA_TLS_CERT, \
+             BALLISTA_TLS_KEY and BALLISTA_TLS_CA",
+        )?)
+    } else {
+        None
+    };
+    match &token {
+        Some(token) if token.len() < 16 => {
+            warn!("The Spark Connect token is shorter than 16 characters: use a random one")
+        }
+        Some(_) => info!("Spark Connect clients must present the authentication token"),
+        None if !args.ip.is_loopback() => warn!(
+            "Spark Connect on {} accepts any client: set {TOKEN_ENV} to require a token",
+            args.ip
+        ),
+        None => {}
+    }
+    if tls.is_none() && token.is_some() && !args.ip.is_loopback() {
+        info!(
+            "Spark Connect is not using TLS: tokens cross the network in clear text, and \
+             PySpark sends a token only to localhost or over TLS (--tls)"
+        );
+    }
+    Ok(ServerSecurity {
+        tls,
+        bearer_token: token.map(Arc::from),
+    })
 }
 
 fn parse_conf(s: &str) -> Result<(String, String), String> {
@@ -103,7 +179,8 @@ async fn shutdown() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before any threads exist: the Spark front end calls into Python.
     ballista_spark_python::bootstrap()?;
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let token = take_token(&mut args.conf);
     ballista_spark_session::set_server_spark_conf(args.conf.clone());
 
     let mut config = AppConfig::load()?;
@@ -115,6 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _telemetry = primary.block_on(async { TelemetryGuard::try_new(&config) })?;
 
     check_warehouse(&args.conf);
+    let security = client_security(&args, token)?;
 
     let job_runner_factory = Box::new(BallistaJobRunnerFactory::new(
         BallistaClusterOptions::new(args.scheduler_url.clone()),
@@ -123,17 +201,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     primary.block_on(async move {
         let listener = TcpListener::bind((args.ip, args.port)).await?;
         info!(
-            "Starting the Spark Connect server on {} (Ballista scheduler: {})",
+            "Starting the Spark Connect server on {}{} (Ballista scheduler: {})",
             listener.local_addr()?,
+            if security.tls.is_some() { " with TLS" } else { "" },
             args.scheduler_url
         );
-        serve_with_factories(
+        serve_with_factories_secure(
             listener,
             shutdown(),
             config,
             handle,
             spark_session_factory,
             job_runner_factory,
+            security,
         )
         .await
     })

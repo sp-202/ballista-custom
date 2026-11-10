@@ -8,7 +8,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Pod, Service};
+use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::controller::Action;
 use kube::{Client, Resource, ResourceExt};
@@ -19,6 +19,7 @@ use serde_json::json;
 use crate::autoscale::{self, ExecutorPod, Scaling};
 use crate::crd::{BallistaCluster, BallistaClusterStatus, ExecutorCounts};
 use crate::resources as r;
+use crate::security;
 use crate::{Ctx, Error};
 
 pub async fn reconcile(bc: Arc<BallistaCluster>, ctx: Arc<Ctx>) -> Result<Action, Error> {
@@ -34,6 +35,10 @@ pub async fn reconcile(bc: Arc<BallistaCluster>, ctx: Arc<Ctx>) -> Result<Action
     let deploys: Api<Deployment> = Api::namespaced(client.clone(), &ns);
     let services: Api<Service> = Api::namespaced(client.clone(), &ns);
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), &ns);
+
+    // Certificates and tokens first: every pod mounts them.
+    let ui_token = security::ensure(&secrets, &name, &ns, spec, &owner).await?;
 
     // Control plane.
     let (d, s) = r::scheduler(&name, &ns, spec, &owner);
@@ -84,7 +89,7 @@ pub async fn reconcile(bc: Arc<BallistaCluster>, ctx: Arc<Ctx>) -> Result<Action
     }
 
     let scaling = if scheduler_ready {
-        match fetch_scaling(client, &ns, &name).await {
+        match fetch_scaling(client, &ns, &name, ui_token.as_deref()).await {
             Ok(s) => Some(s),
             Err(e) => {
                 log::warn!("{ns}/{name}: scheduler /api/scaling: {e}");
@@ -186,6 +191,7 @@ pub async fn reconcile(bc: Arc<BallistaCluster>, ctx: Arc<Ctx>) -> Result<Action
                 r::CONNECT_PORT
             )
         }),
+        security_secret: security::secret_name(&name, spec),
         executors: ExecutorCounts {
             desired,
             current,
@@ -236,17 +242,27 @@ pub fn error_policy(bc: Arc<BallistaCluster>, err: &Error, _: Arc<Ctx>) -> Actio
     Action::requeue(StdDuration::from_secs(10))
 }
 
-/// `GET /api/scaling` through the API server's service proxy, so the operator
-/// reaches the scheduler both in the cluster and from a laptop.
-async fn fetch_scaling(client: &Client, ns: &str, cluster: &str) -> Result<Scaling, Error> {
+/// `GET /api/scaling` on the scheduler's web UI port, through the API server's
+/// service proxy, so the operator reaches the scheduler both in the cluster and
+/// from a laptop. With security on the port is HTTPS and needs the UI token,
+/// sent as `X-Ballista-Token` because the proxy consumes `Authorization`.
+async fn fetch_scaling(
+    client: &Client,
+    ns: &str,
+    cluster: &str,
+    ui_token: Option<&str>,
+) -> Result<Scaling, Error> {
+    let scheme = if ui_token.is_some() { "https" } else { "http" };
     let path = format!(
-        "/api/v1/namespaces/{ns}/services/{}:{}/proxy/api/scaling",
+        "/api/v1/namespaces/{ns}/services/{scheme}:{}:{}/proxy/api/scaling",
         r::scheduler_name(cluster),
-        r::SCHEDULER_PORT
+        r::UI_PORT
     );
-    let req = http::Request::get(path)
-        .body(vec![])
-        .map_err(|e| Error::Invalid(e.to_string()))?;
+    let mut req = http::Request::get(path);
+    if let Some(token) = ui_token {
+        req = req.header("X-Ballista-Token", token);
+    }
+    let req = req.body(vec![]).map_err(|e| Error::Invalid(e.to_string()))?;
     Ok(client.request::<Scaling>(req).await?)
 }
 
