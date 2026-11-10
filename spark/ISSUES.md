@@ -679,4 +679,4 @@ recognisable. Roadmap steps refer to `~/Documents/ballista/roadmap/ROADMAP.md`.
   the CLI depends on the scheduler without the `rest-api` feature. rust-analyzer reported it as errors in
   `ballista-cli/src/tui` (`JobResponse` fields).
 - **Cause:** `web_ui_assets` (added with the history server, `01db572`) uses the `rest-api`-only `ui` module.
-- **Fix:** `#[cfg(feature = "rest-api")]` on `web_ui_assets`; `ballista-cli` compiles.
+- **Fix:** `#[cfg(feature = "rest-api")]` on `web_ui_assets`; `ballista-cli` compiles — `a497551`.
