@@ -33,6 +33,7 @@ pub use routes::{get_routes, get_web_ui_routes};
 ///
 /// For a server that already serves the `/api` routes the UI reads and has no use for the
 /// scheduler's state, such as the history server.
+#[cfg(feature = "rest-api")]
 pub fn web_ui_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
     ui::routes("/")
 }

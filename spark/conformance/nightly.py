@@ -39,7 +39,7 @@ def suites(args):
     return [
         {
             "name": "tpch",
-            "title": "TPC-H SF10",
+            "title": f"TPC-H {args.scale}",
             "data": args.tpch_data,
             "queries": args.tpch_queries,
             "reference": Path(args.answers) / "spark",
@@ -47,7 +47,7 @@ def suites(args):
         },
         {
             "name": "tpcds",
-            "title": "TPC-DS SF10",
+            "title": f"TPC-DS {args.scale}",
             "data": args.tpcds_data,
             "queries": str(HERE / "queries" / "tpcds"),
             "reference": Path(args.answers) / "tpcds" / "spark",
@@ -155,6 +155,7 @@ def main():
     p.add_argument("--reports", default=str(HOME / "Documents/ballista/conformance-reports"))
     p.add_argument("--timeout", type=int, default=7200, help="per suite, seconds")
     p.add_argument("--only", choices=["tpch", "tpcds"])
+    p.add_argument("--scale", default="SF10", help="scale label used in report titles, e.g. SF1")
     args = p.parse_args()
 
     today = datetime.date.today().isoformat()
